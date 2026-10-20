@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "crates/dougong-abi",
     "crates/dougong",
+    "crates/dougong-dylib",
+    "crates/greeter-plugin",
 ]
 
 [workspace.package]

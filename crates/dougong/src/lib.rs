@@ -52,6 +52,7 @@ mod context;
 mod error;
 mod events;
 mod fiber;
+mod invoke;
 mod logger;
 mod plugin;
 mod registry;
@@ -65,6 +66,7 @@ pub use fiber::{
     Disposer, EPOCH_INACTIVE, EffectGuard, Fiber, FiberHandle, FiberState, ProviderSnapshot,
     Runtime,
 };
+pub use invoke::{Invoke, Invoker};
 pub use logger::{LogLevel, Logger, LoggerHandle, StderrLogger};
 pub use plugin::{BoxFuture, Injection, Plugin, plugin};
 pub use scope::{DEFAULT_LABEL, ScopeNode};

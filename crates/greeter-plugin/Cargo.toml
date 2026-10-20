@@ -1,0 +1,16 @@
+[package]
+name = "greeter-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Example dougong plugin built as a pure C-ABI cdylib"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+dougong-abi = { path = "../dougong-abi" }

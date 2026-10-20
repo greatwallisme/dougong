@@ -38,13 +38,18 @@
 //!     if unsafe { write_out(b"greeter", out, cap, len) } { 0 } else { -1 }
 //! }
 //!
-//! unsafe extern "C" fn setup() -> *mut usize {
+//! extern "C" fn descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+//!     // SAFETY: same host buffer contract as `name`.
+//!     if unsafe { write_out(br#"{"provide":[]}"#, out, cap, len) } { 0 } else { -1 }
+//! }
+//!
+//! unsafe extern "C" fn setup() -> *mut std::os::raw::c_void {
 //!     // Returning null signals initialization failure.
 //!     std::ptr::null_mut()
 //! }
 //!
 //! unsafe extern "C" fn call(
-//!     _handle: *mut usize,
+//!     _handle: *mut std::os::raw::c_void,
 //!     _method: u32,
 //!     _data: *const u8,
 //!     _len: usize,
@@ -56,7 +61,7 @@
 //! }
 //!
 //! unsafe extern "C" fn on_event(
-//!     _handle: *mut usize,
+//!     _handle: *mut std::os::raw::c_void,
 //!     _event: u32,
 //!     _mode: u32,
 //!     _data: *const u8,
@@ -70,12 +75,13 @@
 //!     -2
 //! }
 //!
-//! unsafe extern "C" fn teardown(_handle: *mut usize) {}
+//! unsafe extern "C" fn teardown(_handle: *mut std::os::raw::c_void) {}
 //!
 //! #[unsafe(no_mangle)]
 //! static DOUGONG_PLUGIN_EXPORTS: PluginExports = PluginExports {
 //!     abi_version: ABI_VERSION,
 //!     name,
+//!     descriptor,
 //!     setup,
 //!     call,
 //!     on_event,
@@ -205,11 +211,14 @@ pub struct PluginExports {
     pub abi_version: u32,
     /// Writes the plugin display name (UTF-8) into the output buffer.
     pub name: unsafe extern "C" fn(out_buf: *mut u8, cap: usize, out_len: *mut usize) -> i32,
+    /// Writes the plugin descriptor (UTF-8 JSON: name, version, provide,
+    /// inject) into the output buffer.
+    pub descriptor: unsafe extern "C" fn(out_buf: *mut u8, cap: usize, out_len: *mut usize) -> i32,
     /// Allocates plugin-private state; null signals initialization failure.
-    pub setup: unsafe extern "C" fn() -> *mut usize,
+    pub setup: unsafe extern "C" fn() -> *mut std::os::raw::c_void,
     /// Serves one provided-service method invocation.
     pub call: unsafe extern "C" fn(
-        handle: *mut usize,
+        handle: *mut std::os::raw::c_void,
         method: u32,
         in_data: *const u8,
         in_len: usize,
@@ -219,7 +228,7 @@ pub struct PluginExports {
     ) -> i32,
     /// Receives one dispatched event in the given mode.
     pub on_event: unsafe extern "C" fn(
-        handle: *mut usize,
+        handle: *mut std::os::raw::c_void,
         event: u32,
         mode: u32,
         in_data: *const u8,
@@ -231,7 +240,7 @@ pub struct PluginExports {
         out_len: *mut usize,
     ) -> i32,
     /// Releases plugin-private state; called exactly once per live handle.
-    pub teardown: unsafe extern "C" fn(handle: *mut usize),
+    pub teardown: unsafe extern "C" fn(handle: *mut std::ffi::c_void),
 }
 
 impl std::fmt::Debug for PluginExports {

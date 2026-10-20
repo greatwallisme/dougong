@@ -635,7 +635,6 @@ impl Fiber {
     }
 
     async fn load_once(self: &Arc<Self>, target: &str) {
-        eprintln!("[probe] {} load_once {}", self.name(), target);
         self.publish_state();
         let Some(runtime) = self.runtime.as_ref().map(Arc::clone) else {
             *self.loaded.lock() = target.to_string();

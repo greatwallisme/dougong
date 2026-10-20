@@ -8,10 +8,10 @@ doc/research/dougong-design.md v2（D4-D13 决策 + R1-R3 裁决）：tokio；�
 验收：论文 §15 十场景 + jincdream 163 场景矩阵映射选集；cargo test/clippy/fmt 全绿。
 
 ## Next Step
-Phase 2：实现 dougong 内核（error/context+scope/registry/service+反向索引/events/fiber/reconcile）。
+Phase 4：dylib 宿主（libloading + ABI 门 + ForeignPlugin 适配器）+ greeter cdylib 示例。
 
 ## Current Phase
-Phase 2
+Phase 4
 
 ## Phases
 
@@ -21,14 +21,15 @@ Phase 2
 - **Status:** complete
 
 ### Phase 2: dougong 内核
-- [ ] error / context+scope 链 / registry / service store+反向索引 / events 五模式 / fiber（epoch+driver+级联）/ reconcile
-- [ ] 单元测试随模块走
-- **Status:** pending
+- [x] error / context+scope 链 / registry / service store+双索引 / events 五模式 / fiber（epoch+driver+级联+ω 提交/panic 包容）
+- [x] commit 0da4357 + 3530199（amend）；内核 ~3.1k 行
+- **Status:** complete
 
 ### Phase 3: 语义验收测试
-- [ ] 论文 §15 十场景
-- [ ] jincdream 163 矩阵映射选集（events/dispose/fiber/isolate/service/plugin/reflect）
-- **Status:** pending
+- [x] tests/kernel_semantics.rs 7 项（dispose/events/isolate/update/cascade 等）
+- [x] tests/acceptance.rs 7 项（论文 §15 映射：响应式接线/身份语义/drain 排序/独立性/realm/capability 面/失败恢复）
+- [x] 测试驱动修出 5 个真缺陷（ω 提交时序、初始 check_impl、restart force、panic 包容、get 解析语义）
+- **Status:** complete
 
 ### Phase 4: dylib 宿主 + 示例
 - [ ] dyn-host 适配器（libloading + ABI 门 + ForeignPlugin）

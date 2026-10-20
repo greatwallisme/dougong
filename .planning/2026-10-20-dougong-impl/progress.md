@@ -33,3 +33,11 @@
   拦截合并、配置热更、父级联）；tests/acceptance.rs（论文 §15 映射：响应式接线、提供者身份语义、
   drain 排序、独立性、realm、capability 拒绝、失败恢复）编译中
 - 捕获纪律教训：plugin() 的 Fn 闭包内不得移出捕获的 Arc —— 一律 clone-before-move
+
+## Session: 2026-10-20（实现 Phase 2-3 完成）
+- 内核 3149 行全绿提交（0da4357 → amend 3530199）
+- 测试 24 项全绿：3 scope 单测 + 7 kernel_semantics + 7 acceptance + 1 doctest + abi 6
+- 测试驱动修出 5 个真缺陷：ω 提交时序（TS _reload 前置）、初始 check_impl 缺失（晚生消费者永久 Pending）、
+  restart force 三次激活、插件体 panic 杀死 driver（join 挂死→包容为 fail_load）、get 解析语义对齐 TS Alg6
+- 质量门：fmt/clippy(-D warnings, pedantic+nursery+restriction)/test/doc 全 PASS
+- 工程教训：管道 `cmd | tail` 吞退出码导致带病提交过一次（已 amend 修复）；Fn 闭包捕获 Arc 必须 clone-before-move

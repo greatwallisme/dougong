@@ -1,0 +1,20 @@
+[package]
+name = "dougong-dylib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "dylib/so plugin host for the dougong kernel"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+greeter-plugin = { path = "../greeter-plugin" }
+
+[dependencies]
+dougong = { path = "../dougong" }
+dougong-abi = { path = "../dougong-abi" }
+libloading = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
