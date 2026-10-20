@@ -264,6 +264,15 @@ impl Fiber {
         *self.uid.lock()
     }
 
+    /// The committed epoch string; [`EPOCH_INACTIVE`] while the fiber is not
+    /// loaded.
+    ///
+    /// [`EPOCH_INACTIVE`]: crate::EPOCH_INACTIVE
+    #[must_use]
+    pub fn epoch(&self) -> String {
+        self.loaded.lock().clone()
+    }
+
     /// Names of the declared service dependencies.
     #[must_use]
     pub fn inject_names(&self) -> Vec<String> {
@@ -545,27 +554,20 @@ impl Fiber {
     }
 
     fn request_epoch(self: &Arc<Self>, desired: String) {
-        let loaded_now = self.loaded.lock().clone();
-        eprintln!(
-            "[probe] {} request_epoch {desired:?} (loaded {loaded_now:?}) {}",
-            self.name(),
-            self.uid_value().unwrap_or(0)
-        );
-        {
-            let mut driver = self.driver.lock();
-            if driver.desired == desired && !driver.dirty {
-                return;
-            }
-            driver.desired = desired;
-            driver.dirty = true;
-            if driver
-                .task
-                .as_ref()
-                .is_none_or(tokio::task::JoinHandle::is_finished)
-            {
-                driver.task = Some(tokio::spawn(Self::drive_loop(Arc::clone(self))));
-            }
+        let mut driver = self.driver.lock();
+        if driver.desired == desired && !driver.dirty {
+            return;
         }
+        driver.desired = desired;
+        driver.dirty = true;
+        if driver
+            .task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            driver.task = Some(tokio::spawn(Self::drive_loop(Arc::clone(self))));
+        }
+        drop(driver);
         self.cache_state();
         self.bump_settle();
         self.publish_state();

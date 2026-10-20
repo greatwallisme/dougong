@@ -564,6 +564,22 @@ impl Context {
         self.fiber().map(|fiber| fiber.state())
     }
 
+    /// The uid of the owning fiber, when bound; boundary adapters report it
+    /// as the activation-site identity.
+    #[must_use]
+    pub fn fiber_uid(&self) -> Option<u64> {
+        self.fiber().and_then(|fiber| fiber.uid_value())
+    }
+
+    /// The committed epoch of the owning fiber ([`EPOCH_INACTIVE`] while not
+    /// loaded).
+    ///
+    /// [`EPOCH_INACTIVE`]: crate::EPOCH_INACTIVE
+    #[must_use]
+    pub fn fiber_epoch(&self) -> Option<String> {
+        self.fiber().map(|fiber| fiber.epoch())
+    }
+
     /// The resolved runtime for a plugin, if registered.
     #[must_use]
     pub fn plugin_runtime(&self, plugin: &Arc<dyn Plugin>) -> Option<Arc<Runtime>> {
