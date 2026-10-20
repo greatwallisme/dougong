@@ -21,7 +21,7 @@ cordis 的 Rust 实现：时间可组合 × 空间可组合的通用插件基座
 
 ## 快速开始
 
-要求：Rust 1.85+（edition 2024）；wasm 示例另需 `rustup target add wasm32-wasip2`。
+要求：Rust（edition 2024）；开发与验证以 `rust-toolchain.toml` 钉定的工具链为准，不另行宣称兼容下限；wasm 示例另需 `rustup target add wasm32-wasip2`。
 
 ```sh
 # 宿主侧全量构建 + 测试

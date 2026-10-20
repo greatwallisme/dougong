@@ -4,17 +4,17 @@
 
 ### E1 - dougong's own manifests are publish-ready except two known gaps
 - Root `Cargo.toml` `[workspace.package]`: version 0.1.0, edition 2024,
-  rust-version 1.85, license MIT OR Apache-2.0, readme, keywords, categories -
-  all populated. `publish = false` with the comment: "Local workspace: not yet
+  license MIT OR Apache-2.0, readme, keywords, categories - all populated. `publish = false` with the comment: "Local workspace: not yet
   published. Fill `repository` and flip this to `true` per crate when
   publishing."
 - The `cargo_common_metadata = "allow"` lint comment names the same single
   blocker: "`repository` is pending until the project gets its canonical
   remote; all other metadata fields are populated. Revisit before publishing."
-- MSRV story is consumer-safe: `rust-version = "1.85"` is the declared MSRV;
-  the 1.99.1 toolchain pin is dev/CI-only (rust-toolchain.toml says so
-  explicitly). R2 (musl) already provisioned: `x86_64-unknown-linux-musl`
-  target in the toolchain file.
+- MSRV: none. The `rust-version = "1.85"` declaration was removed everywhere
+  on 2026-10-21 by user ruling - it was never compiled against, so claiming
+  it was unevidenced. Only the pinned 1.99.1 toolchain is verified. R2
+  (musl) already provisioned: `x86_64-unknown-linux-musl` target in the
+  toolchain file.
 
 ### E2 - dependency layering already gives per-consumer minimality
 - `dougong` (kernel): parking_lot, tokio, serde, serde_json, thiserror. No

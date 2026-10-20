@@ -29,7 +29,7 @@ cargo run -p dougong-wasm   --example wasm_demo     # needs the wasm32-wasip2 gu
 cargo run -p dougong-loader --example loader_demo   # needs the dylib artifact
 ```
 
-The toolchain is pinned patch-level in `rust-toolchain.toml` (1.99.1) because clippy/rustdoc lints drift between releases; `rust-version = "1.85"` in Cargo.toml is the independent MSRV. rustup auto-installs the pinned toolchain and targets on first entry.
+The toolchain is pinned patch-level in `rust-toolchain.toml` (1.99.1) because clippy/rustdoc lints drift between releases. No MSRV is declared or claimed anywhere in the manifests - the pinned toolchain is the only verified one (ruling R4). rustup auto-installs the pinned toolchain and targets on first entry.
 
 ## Architecture
 

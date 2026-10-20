@@ -2,7 +2,6 @@
 name = "dougong-loader"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 description = "declarative config and reconciliation for dougong plugin sets"
 

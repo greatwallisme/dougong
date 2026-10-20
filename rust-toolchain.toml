@@ -4,8 +4,9 @@
 # lints drift between compiler releases, so the zero-warning gates are only
 # reproducible on the exact compiler the workspace was verified with.
 #
-# This pin is the development/CI toolchain; `rust-version = "1.85"` in
-# Cargo.toml stays the supported MSRV and is independent of it.
+# This pin is the only toolchain this workspace builds and verifies with.
+# No MSRV is declared: never claim a compatibility floor that was not
+# compiled against (ruling R4).
 #
 # Targets: `wasm32-wasip2` builds the greeter-wasm guest component;
 # `x86_64-unknown-linux-musl` covers the static-link deployment ruling (R2).

@@ -25,3 +25,13 @@
 - R4 recorded in doc/research/dougong-design.md section 6; Phase 3 item 6
   rewritten: MSRV is declared-only; local cross-toolchain verification
   removed from the plan (isolated CI only, if ever).
+
+## Session 2026-10-21 (R4 amendment: MSRV declaration removed)
+- User ruled the 1.85 wording is an unevidenced claim (never compiled on
+  that toolchain) and ordered it deleted. Removed `rust-version` from the
+  root `[workspace.package]`, `rust-version.workspace = true` from all 7
+  member manifests, the MSRV references in rust-toolchain.toml comments,
+  CLAUDE.md, README, and the R4 record; planning evidence updated to match.
+  study-3's "MSRV 1.85" line is a third-party project's own README quote -
+  research record, kept.
+- Verified: `cargo build --workspace` exit 0 (manifest parse intact).

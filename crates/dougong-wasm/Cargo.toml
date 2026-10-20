@@ -2,7 +2,6 @@
 name = "dougong-wasm"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
 description = "wasm component plugin host for the dougong kernel"
 

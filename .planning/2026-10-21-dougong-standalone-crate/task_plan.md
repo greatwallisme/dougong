@@ -28,10 +28,9 @@ version. Rationale and gap list in findings.md.
    repository lands; the lint must pass for real.
 5. All four quality gates green; `cargo package --list` per publishable crate
    (offline) to confirm no stray files ship.
-6. MSRV: `rust-version = "1.85"` is declared metadata, not locally verified -
-   per user ruling R4 (2026-10-21, dougong-design.md section 6) the pinned
-   toolchain builds everything in this tree and no other toolchain may run
-   here; an MSRV proof belongs to isolated CI, if ever needed.
+6. MSRV: no compatibility floor is declared anywhere (removed 2026-10-21 by
+   user ruling - the 1.85 claim was never compiled against). If a floor is
+   ever needed, prove it in isolated CI first, then declare it.
 
 ### Phase 4: Record + docs (blocked on Phase 3) - **Status:** pending
 1. Record the decision as **D14** in `doc/research/dougong-design.md`
