@@ -545,6 +545,12 @@ impl Fiber {
     }
 
     fn request_epoch(self: &Arc<Self>, desired: String) {
+        let loaded_now = self.loaded.lock().clone();
+        eprintln!(
+            "[probe] {} request_epoch {desired:?} (loaded {loaded_now:?}) {}",
+            self.name(),
+            self.uid_value().unwrap_or(0)
+        );
         {
             let mut driver = self.driver.lock();
             if driver.desired == desired && !driver.dirty {
@@ -629,6 +635,7 @@ impl Fiber {
     }
 
     async fn load_once(self: &Arc<Self>, target: &str) {
+        eprintln!("[probe] {} load_once {}", self.name(), target);
         self.publish_state();
         let Some(runtime) = self.runtime.as_ref().map(Arc::clone) else {
             *self.loaded.lock() = target.to_string();
@@ -658,29 +665,39 @@ impl Fiber {
         };
         *self.config.lock() = config.clone();
 
-        match runtime.plugin.apply(self.ctx(), config).await {
-            Ok(()) => {
+        // Commit the candidate snapshots as the new committed view ω BEFORE
+        // the body runs: the plugin reads its dependencies through this view
+        // during activation (TS `_reload` snapshots `this.store = {...this._store}`
+        // before executing the callback).
+        let committed: HashMap<String, ProviderSnapshot> = self.candidates.lock().clone();
+        {
+            let root = self.ctx().root;
+            let mut edges: HashMap<String, (u64, u64)> = HashMap::new();
+            let mut providers = Vec::new();
+            let scope = Arc::clone(&self.scope);
+            for (name, snapshot) in &committed {
+                let label = ScopeNode::effective_label(Some(&scope), name);
+                edges.insert(name.clone(), (label, snapshot.provider_uid));
+                providers.push(snapshot.provider_uid);
+            }
+            {
+                let mut index = root.index.lock();
+                index.commit_edges(self.uid_value().unwrap_or(0), &edges);
+            }
+            *self.store.lock() = committed;
+            *self.committed_providers.lock() = providers;
+        }
+
+        // A panicking plugin body must not kill the driver task (that would
+        // hang every `join`): the body runs on its own task, and a panic is
+        // reported through the JoinHandle as a startup failure so the rollback
+        // path runs (self-evolving runtimes host generated code, paper §1.2).
+        let body_ctx = self.ctx();
+        let body = runtime.plugin.apply(body_ctx.clone(), config.clone());
+        let apply_outcome = tokio::spawn(body).await;
+        match apply_outcome {
+            Ok(Ok(())) => {
                 self.error.lock().take();
-                // Commit the candidate snapshots as the new committed view ω.
-                let committed: HashMap<String, ProviderSnapshot> = self.candidates.lock().clone();
-                let scope = Arc::clone(&self.scope);
-                let uid = self.uid_value().unwrap_or(0);
-                {
-                    let root = self.ctx().root;
-                    let mut edges: HashMap<String, (u64, u64)> = HashMap::new();
-                    let mut providers = Vec::new();
-                    for (name, snapshot) in &committed {
-                        let label = ScopeNode::effective_label(Some(&scope), name);
-                        edges.insert(name.clone(), (label, snapshot.provider_uid));
-                        providers.push(snapshot.provider_uid);
-                    }
-                    {
-                        let mut index = root.index.lock();
-                        index.commit_edges(uid, &edges);
-                    }
-                    *self.committed_providers.lock() = providers;
-                };
-                *self.store.lock() = committed;
                 *self.loaded.lock() = target.to_string();
                 // Republish state BEFORE notifying dependents: their
                 // `check_impl` consults provider liveness.
@@ -694,10 +711,40 @@ impl Fiber {
                 self.bump_settle();
                 self.publish_state();
             }
-            Err(err) => {
-                // Transactional activation: roll back what the body collected.
+            Ok(Err(err)) => {
+                // Transactional activation: roll back what the body collected
+                // and what was committed above.
                 self.unload_effects().await;
+                {
+                    let root = self.ctx().root;
+                    let mut index = root.index.lock();
+                    index.uncommit(self.uid_value().unwrap_or(0));
+                }
+                self.store.lock().clear();
+                self.committed_providers.lock().clear();
                 self.fail_load(err);
+            }
+            Err(join_error) => {
+                let message = if join_error.is_panic() {
+                    let payload = join_error.into_panic();
+                    let text = payload
+                        .downcast_ref::<&str>()
+                        .map(|slice| (*slice).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "plugin body panicked".to_string());
+                    format!("plugin panicked: {text}")
+                } else {
+                    "plugin task was cancelled".to_string()
+                };
+                self.unload_effects().await;
+                {
+                    let root = self.ctx().root;
+                    let mut index = root.index.lock();
+                    index.uncommit(self.uid_value().unwrap_or(0));
+                }
+                self.store.lock().clear();
+                self.committed_providers.lock().clear();
+                self.fail_load(Error::msg(format!("plugin panicked: {message}")));
             }
         }
     }
@@ -799,7 +846,9 @@ impl Fiber {
         self.error.lock().take();
         {
             let mut driver = self.driver.lock();
-            driver.force = true;
+            // A fresh unload->load round trip is only needed when something is
+            // currently loaded; a Failed/Pending fiber just loads directly.
+            driver.force = self.loaded.lock().as_str() != EPOCH_INACTIVE;
             driver.dirty = true;
             if driver
                 .task

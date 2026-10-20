@@ -98,6 +98,13 @@ pub fn plugin(
         }
     }
 
+    // Initial dependency resolution: publish checks every declared injection
+    // BEFORE the first refresh (TS `_checkImpl` loop at publication). Without
+    // this, a consumer spawned after its provider never sees the existing
+    // implementation.
+    for name in child.inject_names() {
+        child.check_impl(&name);
+    }
     child.refresh();
     Ok(FiberHandle(child))
 }
