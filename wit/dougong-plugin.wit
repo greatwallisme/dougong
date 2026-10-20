@@ -1,0 +1,164 @@
+// Rust guideline compliant 2026-10-21
+//! dougong WIT contract (design decision D7, refined during Phase 5).
+//!
+//! The world is the single source of truth for the wasm plugin boundary. The
+//! kernel keeps all framework semantics (effects, reactive resolution, LIFO
+//! teardown); a component only computes through these two interfaces.
+//!
+//! Refinements against the v0 sketch in `doc/research/dougong-design.md`:
+//! - `method` is `u32` (matches the kernel dynamic channel and dougong-abi).
+//! - Event `mode` moved from `register-listener` to `dispatch`: mode is a
+//!   property of dispatch in cordis, and the kernel listener callback does
+//!   not observe it.
+//! - Event and config payloads are `list<u8>`; event payload bytes are the
+//!   JSON serialization of the kernel value (JSON `null` is the kernel null).
+//! - `effect-handle` `0` is reserved for plugin teardown; `effect-collect`
+//!   allocates from `1`.
+//! - Dropping a `registration` withdraws nothing: reversal stays declarative
+//!   and is driven by fiber disposal (cordis LIFO effects).
+
+package dougong:kernel@0.1.0;
+
+interface types {
+    /// Identity of a cross-boundary service: kernel-side name plus the
+    /// contract hash covering interface and payload encoding (decision D6).
+    record service-key {
+        name: string,
+        abi-hash: list<u8>,
+    }
+
+    /// Identity of an event contract: kernel-side event name plus the
+    /// payload-encoding hash.
+    record event-key {
+        name: string,
+        abi-hash: list<u8>,
+    }
+
+    /// The five cordis dispatch modes (decision D8).
+    enum event-mode {
+        emit,
+        parallel,
+        serial,
+        bail,
+        waterfall,
+    }
+
+    /// Diagnostic severity for [`log`].
+    ///
+    /// [`log`]: host.log
+    enum log-level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Activation-site identity handed to the plugin body.
+    record call-context {
+        fiber: string,
+        epoch: string,
+    }
+
+    /// What the plugin declares: consumed services and provided services.
+    record plugin-descriptor {
+        name: string,
+        version: string,
+        inject: list<service-key>,
+        provide: list<service-key>,
+    }
+
+    /// Two-level resolution errors (TS Algorithm 6) plus sandbox diagnostics.
+    variant kernel-error {
+        inactive-context,
+        inactive-dependency(service-key),
+        undeclared-dependency(service-key),
+        capability-denied(string),
+        internal(string),
+    }
+}
+
+/// Capabilities the kernel grants to a running component.
+///
+/// The world imports nothing else: a component can reach exactly these
+/// operations and nothing more (Component Model guarantee).
+interface host {
+    use types.{event-key, event-mode, kernel-error, log-level, service-key};
+
+    /// Reversibility token allocated by the host for guest-registered
+    /// disposers; `0` is the reserved plugin teardown handle.
+    type effect-handle = u64;
+
+    /// Token identifying one remaining waterfall chain segment. The host
+    /// owns the chain; the guest pulls one step through [`waterfall-next`].
+    ///
+    /// [`waterfall-next`]: host.waterfall-next
+    type next-token = u64;
+
+    /// Opaque proof that a registration was accepted. Dropping it withdraws
+    /// nothing: withdrawal stays declarative (fiber disposal drives the LIFO
+    /// reversal).
+    resource registration;
+
+    /// Structured diagnostic logging into the kernel logger.
+    log: func(level: log-level, msg: string);
+
+    /// Invokes one method of another plugin's service through the dynamic
+    /// channel. The service must be declared in the component's descriptor
+    /// (`inject`), mirroring the kernel capability check.
+    call-service: func(key: service-key, method: u32, payload: list<u8>)
+        -> result<list<u8>, kernel-error>;
+
+    /// Registers the component as the provider of one declared service.
+    /// Consumers call back into `handle-service-call` (plugin export).
+    provide-service: func(key: service-key) -> result<registration, kernel-error>;
+
+    /// Registers one guest listener for an event. The kernel removes the
+    /// listener when the plugin fiber is disposed.
+    register-listener: func(ev: event-key, listener: u64)
+        -> result<registration, kernel-error>;
+
+    /// Dispatches an event into the kernel with an explicit mode. The final
+    /// payload is returned; `emit` reports JSON `null`.
+    dispatch: func(ev: event-key, mode: event-mode, payload: list<u8>)
+        -> result<list<u8>, kernel-error>;
+
+    /// Advances the remaining waterfall chain during `handle-event`.
+    /// Dropping the token instead vetoes the rest of the chain.
+    waterfall-next: func(token: next-token, payload: list<u8>)
+        -> result<list<u8>, kernel-error>;
+
+    /// Opens a reversible collection: the host registers a disposer that
+    /// later calls `run-disposer` with the returned handle.
+    effect-collect: func(label: string) -> result<effect-handle, kernel-error>;
+}
+
+/// Obligations of a dougong wasm plugin component.
+interface plugin {
+    use types.{call-context, event-key, kernel-error, plugin-descriptor, service-key};
+    use host.{effect-handle, next-token};
+
+    /// Static declaration: consumed and provided services.
+    descriptor: func() -> plugin-descriptor;
+
+    /// Plugin body. Host imports `provide-service`, `register-listener`, and
+    /// `effect-collect` attach to this activation; the kernel reverses them
+    /// LIFO on withdrawal.
+    apply: func(site: call-context, config: list<u8>) -> result<_, kernel-error>;
+
+    /// Handles one dynamic-channel invocation of a provided service.
+    handle-service-call: func(key: service-key, method: u32, payload: list<u8>)
+        -> result<list<u8>, kernel-error>;
+
+    /// Handles one dispatched event. `next` carries the waterfall
+    /// continuation token; pulling it advances the rest of the chain.
+    handle-event: func(ev: event-key, listener: u64, payload: list<u8>, next: option<next-token>)
+        -> result<list<u8>, kernel-error>;
+
+    /// Runs one collected disposer (`0` = plugin teardown).
+    run-disposer: func(handle: effect-handle) -> result<_, kernel-error>;
+}
+
+world dougong-plugin {
+    import host;
+    export plugin;
+}

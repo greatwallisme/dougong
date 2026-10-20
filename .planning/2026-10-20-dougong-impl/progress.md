@@ -50,3 +50,18 @@
 - dougong-abi 增 descriptor 导出；doctest 同步
 - 质量门全绿：fmt/clippy(-D warnings)/34+ tests/doc；commit a7f3193
 - 过程坑：ABI 结构体加字段后需同步 doctest 静态表与 fake 表；Fn 闭包捕获纪律再次生效
+
+## Session: 2026-10-21（实现 Phase 5）
+- WIT 契约落盘 wit/dougong-plugin.wit（dougong:kernel@0.1.0）；D7 落定差异记入设计文档：
+  method→u32、mode 移到 dispatch、handle-event 带 next-token、载荷统一 bytes(JSON)、handle 0=teardown
+- greeter-wasm guest：wit-bindgen 0.61 宏 + `cargo build --target wasm32-wasip2` 直构建（免装 cargo-component）
+- dougong-wasm 宿主：bindgen!（imports/exports default:async，wasmtime48 已废顶层 async 选项）
+  + fuel/epoch/StoreLimits 三重沙箱 + 最小 WASI（空 WasiCtx，wasip2 guest 运行时必声明 wasi:io）
+- 实证 API 差异（勿凭记忆）：instantiate_async 返回单值非元组；根 Linker 是 core 模块用（组件须 component::Linker）；
+  add_to_linker 需 HasSelf<T>；导入 trait 签名是扁平 WIT result（无 wasmtime::Result 外壳）；
+  资源 Host trait 需实现 drop；ResourceTable 删除方法是 delete 不是 remove；WasiView::ctx 返回 WasiCtxView
+- 真语义问题一枚：provider apply 持锁期间消费者被通知唤醒并调用服务 → try_lock 快速失败会永久 Failed。
+  修复为「跨任务等待、同任务拒绝」（executing 标记记录持锁任务 id）
+- wasm_demo 端到端全通：加载→apply→provide→消费者反应式接线→跨界调用→serial 事件→waterfall 拉链变换→
+  drain→collected disposer→teardown（LIFO 顺序与 dylib 一致）
+- 内核顺带修复：清掉 request_epoch 里已提交的 [probe] eprintln 调试残留；新增 fiber uid/epoch 观测 API

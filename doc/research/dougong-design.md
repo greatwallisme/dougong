@@ -60,6 +60,14 @@ interface plugin {
 world dougong-plugin { import host; export plugin; }
 ```
 - 相对 cordis_wasm 的差异点：effect 句柄进契约（论文 effect 迭代器跨边界）、abi-hash 进 key、waterfall-next 显式化。
+- **D7 落定（2026-10-21，Phase 5，以 `wit/dougong-plugin.wit` 为准）**，对 v0 草图的修正：
+  - `method: string → u32`：与内核动态通道、dougong-abi 的方法选择子统一为一个约定。
+  - `mode` 从 `register-listener` 移到 `dispatch`：cordis 语义里模式是**派发时**属性（TS events.ts 的 emitter 侧），内核监听器回调不感知模式；五模式经 guest 侧 `dispatch(ev, mode, payload)` 全量进契约，waterfall 派发的 fallback 为恒等。
+  - `handle-event` 去掉 `mode`/`listener` 语义负担：签名定为 `(ev, listener, payload, next: option<next-token>)`；宿主每次派发分配 next-token，guest 拉 `waterfall-next` 推进剩余链，不拉即否决（D8 不变）。
+  - 事件与配置载荷统一 `list<u8>`：事件载荷 = 内核 JSON Value 的序列化（JSON null ⇔ 内核 Null）；`event-reply` 类型取消（就是 bytes）。
+  - `effect-handle` 编号 0 保留为插件 teardown；`effect-collect` 从 1 起。`registration` 为宿主持表的 capability 证物，guest 侧 drop 不撤回任何东西——撤回仍是声明式的（fiber dispose 驱动 LIFO）。
+  - 可重入约束：wasm 实例是单线程沙箱，实例执行中再调它自己提供的服务返回 `kernel-error::capability-denied`（wasmtime 禁止并发进入同一 store）；跨插件调用环会互等死锁——这与进程内内核对 dylib 的行为一致，属内核级属性，非 wasm 特有。
+  - 版本锚：wasmtime 48 / wit-bindgen 0.61（cordis_wasm@127e1dd 实证线，rsproxy 当前稳定版）；guest 直接 `cargo build --target wasm32-wasip2`（wit-bindgen 宏），不依赖 cargo-component。
 
 ### D8 事件五模式全量进契约（不延后）
 waterfall 跨边界 = 宿主持剩余链 + next-token（cordis_wasm 已建模；nucleus 的"guest 拿不到 handle"难题由此解）。emit/parallel/serial/bail/waterfall 一并规范；沙箱侧并发预算由 fuel/epoch 约束（[S1]）。

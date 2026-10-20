@@ -4,7 +4,9 @@ members = [
     "crates/dougong-abi",
     "crates/dougong",
     "crates/dougong-dylib",
+    "crates/dougong-wasm",
     "crates/greeter-plugin",
+    "crates/greeter-wasm",
 ]
 
 [workspace.package]
@@ -26,6 +28,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 libloading = "0.8"
+wasmtime = "48"
+wasmtime-wasi = "48"
+wit-bindgen = "0.61"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"
@@ -68,4 +73,8 @@ unnecessary_safety_comment = "warn"
 unnecessary_safety_doc = "warn"
 unneeded_field_pattern = "warn"
 unused_result_ok = "warn"
+# `wasmtime 48` (via async-trait) resolves syn 3 while `wit-bindgen 0.61`
+# pins syn 2; the duplicate is transitive and unfixable locally without
+# patching upstream. Revisit when wit-bindgen moves to syn 3.
+multiple_crate_versions = "allow"
 literal_string_with_formatting_args = "allow"

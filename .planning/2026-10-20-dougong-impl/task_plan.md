@@ -32,14 +32,17 @@ Phase 5
 - **Status:** complete
 
 ### Phase 4: dylib 宿主 + 示例
-- [ ] dyn-host 适配器（libloading + ABI 门 + ForeignPlugin）
-- [ ] greeter cdylib 示例 + 进程内插件示例
-- **Status:** pending
+- [x] dyn-host 适配器（libloading + ABI 门 + DynPlugin）
+- [x] greeter cdylib 示例 + dylib_demo 端到端验证
+- **Status:** complete（commit a7f3193）
 
 ### Phase 5: dougong-wasm
-- [ ] WIT world（dougong:kernel@0.1.0）落盘 + bindgen 宿主 + 沙箱限额（fuel/epoch/limits）
-- [ ] wasm 插件示例（cargo-component 构建）
-- **Status:** pending
+- [x] WIT world `wit/dougong-plugin.wit`（dougong:kernel@0.1.0，D7 落定）落盘，wit-bindgen 0.61.1 校验通过
+- [x] greeter-wasm guest 组件（wit-bindgen 宏 + wasm32-wasip2 直构建，无需 cargo-component）
+- [x] dougong-wasm 宿主（bindgen! async + fuel/epoch/StoreLimits + 最小 WASI + DynPlugin 同构适配器）
+- [x] wasm_demo 端到端验证（服务调用 + serial 事件 + waterfall 拉链 + drain + teardown）
+- [x] 质量门终验（fmt/clippy -D warnings/test 全量/doc -D warnings）+ 提交
+- **Status:** complete
 
 ### Phase 6: dougong-loader
 - [ ] 声明式配置（JSON）+ diff reconcile（insert/update/retire/isolate）
