@@ -1,0 +1,1 @@
+/home/greatwallisme/project/claude_profile/.claude/agents/rust-expert.md

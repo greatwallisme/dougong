@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/tmp/clone_cordis.sh)",
+      "Bash(echo \"script exited rc=$?\")",
+      "Bash(rg -oN 'https?://[^\\\\s\\)\\\\]\"`]+' README.md)",
+      "Bash(mv *)",
+      "Bash(git init *)",
+      "Bash(cargo check *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo test *)"
+    ]
+  }
+}
