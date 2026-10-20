@@ -41,3 +41,12 @@
   restart force 三次激活、插件体 panic 杀死 driver（join 挂死→包容为 fail_load）、get 解析语义对齐 TS Alg6
 - 质量门：fmt/clippy(-D warnings, pedantic+nursery+restriction)/test/doc 全 PASS
 - 工程教训：管道 `cmd | tail` 吞退出码导致带病提交过一次（已 amend 修复）；Fn 闭包捕获 Arc 必须 clone-before-move
+
+## Session: 2026-10-20（实现 Phase 4）
+- dougong-dylib 完成：libloading + ABI 门 + descriptor(JSON) 解析 + DynPlugin 适配器
+  - provide 服务以 Invoker（Invoke trait 动态通道，D6）暴露；teardown effect 先注册 → LIFO 在 provide 后运行
+  - 句柄类型改 *mut c_void（C 惯例）；DylibInvoke unsafe Send/Sync 附内核串行化论证
+- greeter-plugin cdylib 示例（纯 dougong-abi 依赖）+ dylib_demo 端到端验证通过
+- dougong-abi 增 descriptor 导出；doctest 同步
+- 质量门全绿：fmt/clippy(-D warnings)/34+ tests/doc；commit a7f3193
+- 过程坑：ABI 结构体加字段后需同步 doctest 静态表与 fake 表；Fn 闭包捕获纪律再次生效

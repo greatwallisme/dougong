@@ -8,10 +8,10 @@ doc/research/dougong-design.md v2（D4-D13 决策 + R1-R3 裁决）：tokio；�
 验收：论文 §15 十场景 + jincdream 163 场景矩阵映射选集；cargo test/clippy/fmt 全绿。
 
 ## Next Step
-Phase 4：dylib 宿主（libloading + ABI 门 + ForeignPlugin 适配器）+ greeter cdylib 示例。
+Phase 5：dougong-wasm（WIT world 落盘 + wasmtime bindgen 宿主 + 沙箱限额 + wasm 插件示例）。
 
 ## Current Phase
-Phase 4
+Phase 5
 
 ## Phases
 
