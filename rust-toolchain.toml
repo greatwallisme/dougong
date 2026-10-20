@@ -1,0 +1,16 @@
+# Toolchain pin for reproducible quality gates.
+#
+# Patch-level pin: clippy (pedantic + nursery + restriction) and rustdoc
+# lints drift between compiler releases, so the zero-warning gates are only
+# reproducible on the exact compiler the workspace was verified with.
+#
+# This pin is the development/CI toolchain; `rust-version = "1.85"` in
+# Cargo.toml stays the supported MSRV and is independent of it.
+#
+# Targets: `wasm32-wasip2` builds the greeter-wasm guest component;
+# `x86_64-unknown-linux-musl` covers the static-link deployment ruling (R2).
+# The host target is always available and needs no entry.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip2", "x86_64-unknown-linux-musl"]
