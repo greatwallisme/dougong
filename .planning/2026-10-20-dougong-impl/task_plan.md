@@ -45,8 +45,10 @@ Phase 5
 - **Status:** complete
 
 ### Phase 6: dougong-loader
-- [ ] 声明式配置（JSON）+ diff reconcile（insert/update/retire/isolate）
-- **Status:** pending
+- [x] 声明式配置（JSON 期望态）+ diff reconcile（insert/update/retire/isolate 迁移）
+- [x] scope→label 映射（同 realm 共 label）+ builtin source + 内核补 Context::fresh_label
+- [x] 行为测试 4+1 项 + loader_demo 端到端 + 四门全绿
+- **Status:** complete
 
 ### Phase 7: 全量验证
 - [ ] cargo test / clippy -D warnings / fmt 全绿；README；示例可运行验证

@@ -203,6 +203,14 @@ impl Context {
         }
     }
 
+    /// Allocates a fresh isolation label; pair with
+    /// [`isolate_with_label`](Self::isolate_with_label) when several starts
+    /// must join one realm by name (declarative hosts do exactly this).
+    #[must_use]
+    pub fn fresh_label(&self) -> u64 {
+        self.root.fresh_label()
+    }
+
     /// Adds an intercept-config layer for `name` on a child scope.
     #[must_use]
     pub fn intercept(&self, name: &str, config: Value) -> Self {

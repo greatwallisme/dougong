@@ -5,6 +5,7 @@ members = [
     "crates/dougong",
     "crates/dougong-dylib",
     "crates/dougong-wasm",
+    "crates/dougong-loader",
     "crates/greeter-plugin",
     "crates/greeter-wasm",
 ]

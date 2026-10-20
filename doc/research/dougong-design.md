@@ -73,6 +73,13 @@ world dougong-plugin { import host; export plugin; }
 waterfall 跨边界 = 宿主持剩余链 + next-token（cordis_wasm 已建模；nucleus 的"guest 拿不到 handle"难题由此解）。emit/parallel/serial/bail/waterfall 一并规范；沙箱侧并发预算由 fuel/epoch 约束（[S1]）。
 
 ### D9 声明式配置与 loader 的真实切分
+- **D9 落定（2026-10-21，Phase 6，`crates/dougong-loader`）**：
+  - 文档 = 完整期望态（非增量补丁）；`plugins[]` 每槽 `{name, source{kind: dylib|wasm|builtin, path/name}, config, isolate}`；name 为 reconcile 键（唯一非空校验）。
+  - reconcile = diff 收敛：insert / config-fingerprint 变化走 `FiberHandle::update`（internal/update waterfall，重启式热更）/ 缺席 retire / 全同 unchanged；isolate 变更 = retire+insert（作用域在 fiber 启动时烘进 ctx，不可迁移——Thm73 保证最终态收敛）。
+  - **scope→label 映射在 loader**：`ctx.isolate(name)` 每次 mint 新 label，同名 isolate 不会自动同 realm；loader 自持 `scopes: name→label`（`ctx.fresh_label()` 分配），同文档同 scope 的插件共用一个 label。
+  - `builtin` source：基座自带插件（harness 自己的进程内插件）与外部 artifact 走同一套声明式管理（TS cordis 场景即如此）；从 Reconciler 构造时注册的注册表解析。
+  - **文件监视不在 loader**：watcher 是事件源而非收敛逻辑；任何触发器（inotify/configmap/REPL）把新文档喂给 `replace + apply` 即复用同一条收敛路径——可分性论证成立，非功能回避。
+  - fingerprint：serde_json Map 为有序结构，`to_string` 即规范序（键序不敏感，有单测）。
 - 语义不可分部分 = 内核意图面：insert(plugin, config, scope) / update-config / retire / isolate 声明——已含于内核 API（ctx.plugin/update/dispose/isolate），随内核一并交付。
 - 可分部分 = 文件格式层（yaml/json、include/patch、文件监视）= 独立 crate **dougong-loader**，与内核同一代码库一并交付。可分性论证：Thm73 合流性保证 loader 正确性只依赖最终配置，内核不因 loader 缺位而改契约。
 - llmharness 若先行需要，loader 与内核并行开发亦无耦合。

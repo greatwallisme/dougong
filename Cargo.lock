@@ -434,6 +434,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dougong-loader"
+version = "0.1.0"
+dependencies = [
+ "dougong",
+ "dougong-dylib",
+ "dougong-wasm",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "dougong-wasm"
 version = "0.1.0"
 dependencies = [
