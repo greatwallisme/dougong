@@ -8,17 +8,17 @@ doc/research/dougong-design.md v2（D4-D13 决策 + R1-R3 裁决）：tokio；�
 验收：论文 §15 十场景 + jincdream 163 场景矩阵映射选集；cargo test/clippy/fmt 全绿。
 
 ## Next Step
-Phase 1：调用 rust-guidelines 技能，搭建 workspace 脚手架与 dougong-abi。
+Phase 2：实现 dougong 内核（error/context+scope/registry/service+反向索引/events/fiber/reconcile）。
 
 ## Current Phase
-Phase 1
+Phase 2
 
 ## Phases
 
 ### Phase 1: 脚手架 + dougong-abi
-- [ ] 调用 Skill(rust-guidelines)；workspace Cargo.toml + 5 crate 骨架
-- [ ] dougong-abi：#[repr(C)] 导出表 + ABI_VERSION + 缓冲区协议（零依赖）
-- **Status:** in_progress
+- [x] 调用 Skill(rust-guidelines)；workspace Cargo.toml（含严格 lints）
+- [x] dougong-abi：#[repr(C)] 导出表 + ABI_VERSION + 缓冲区协议 + 五模式常量（零依赖，fmt/clippy/test/doc 全绿）
+- **Status:** complete
 
 ### Phase 2: dougong 内核
 - [ ] error / context+scope 链 / registry / service store+反向索引 / events 五模式 / fiber（epoch+driver+级联）/ reconcile
