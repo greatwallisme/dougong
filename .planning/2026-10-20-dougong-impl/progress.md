@@ -65,3 +65,13 @@
 - wasm_demo 端到端全通：加载→apply→provide→消费者反应式接线→跨界调用→serial 事件→waterfall 拉链变换→
   drain→collected disposer→teardown（LIFO 顺序与 dylib 一致）
 - 内核顺带修复：清掉 request_epoch 里已提交的 [probe] eprintln 调试残留；新增 fiber uid/epoch 观测 API
+
+## Session: 2026-10-21（实现 Phase 6-7，交付完成）
+- Phase 6 dougong-loader：JSON 期望态 + diff reconcile（insert/update/retire；isolate 变更=retire+insert）
+  - 语义发现：ctx.isolate 每次 mint 新 label → loader 自持 scope→label 映射（同 realm 共 label）；
+    内核补公共 Context::fresh_label 与 isolate_with_label 配套
+  - builtin source：基座自带插件与外部 artifact 同一套声明式管理；文件监视=事件源，不在 loader（D9 论证）
+  - 行为测试 4 项 + fingerprint 单测；loader_demo 三遍迭代（boot 热更 + greeter dylib + retire）
+- Phase 7：README 完整化；终验 fmt/clippy(-D)/test(16 ok)/doc(-D) 全绿 + 三 demo exit 0
+- 交付 commits：6ee6698(kernel fix) → 5475e7f(wasm) → a210731(loader) → 本提交(README+plan)
+- 遗留可选项（应用层，非内核缺口）：能力衰减策略库、llmharness 本体、配置 include/patch 语法糖

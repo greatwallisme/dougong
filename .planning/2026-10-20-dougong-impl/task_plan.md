@@ -11,7 +11,7 @@ doc/research/dougong-design.md v2（D4-D13 决策 + R1-R3 裁决）：tokio；�
 Phase 5：dougong-wasm（WIT world 落盘 + wasmtime bindgen 宿主 + 沙箱限额 + wasm 插件示例）。
 
 ## Current Phase
-Phase 5
+complete（v0 全量交付）
 
 ## Phases
 
@@ -51,8 +51,10 @@ Phase 5
 - **Status:** complete
 
 ### Phase 7: 全量验证
-- [ ] cargo test / clippy -D warnings / fmt 全绿；README；示例可运行验证
-- **Status:** pending
+- [x] 四门全绿：fmt / clippy --workspace --all-targets -D warnings / cargo test / RUSTDOCFLAGS=-D warnings doc
+- [x] 三个 demo 可运行验证全过（dylib_demo / wasm_demo / loader_demo）
+- [x] README 完整化（crate 表、快速开始、信任边界、质量门、版本锚）
+- **Status:** complete
 
 ## Decisions Made
 | Decision | Reason |
