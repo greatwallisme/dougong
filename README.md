@@ -42,6 +42,10 @@ cargo run -p dougong-loader --example harness_demo  # 9 槽混合来源（builti
                                                     # 策略 guard 经 waterfall 否决、 Failure 隔离
 ```
 
+## AI Coding 开发插件
+
+本仓库自带面向 AI 编码工具的项目级技能 [`.claude/skills/dougong-plugin-dev/`](.claude/skills/dougong-plugin-dev/)（Claude Code 等工具会自动发现并按需加载）。它把三种插件形态的完整开发知识打包成一份可执行指南：形态选型、dylib 导出表与描述符、v2 CPS 事件协议、wasm 沙箱约束、验证命令与常见陷阱——让 AI 按本仓库的真实契约开发插件，而不是凭通用知识猜 API。
+
 ## 内核一句话
 
 插件声明依赖（`inject`）并在激活体（`apply`）里只经 `ctx.effect`/`ctx.provide` 修改环境；
