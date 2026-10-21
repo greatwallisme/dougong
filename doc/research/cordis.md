@@ -12,9 +12,11 @@
 > Spatiotemporal Composability*，arXiv:2608.25512（2026-08-26；官方仓库
 > [cordiverse/paper](https://github.com/cordiverse/paper)，参考实现
 > [cordiverse/cordis](https://github.com/cordiverse/cordis)）。**本文件并非
-> dougong 项目作品**：它是第三方撰写的全文二次分析，经第三方仓库获取后仅作
-> 研究参考存档于此；文中 ACRYL 等提法属原分析者的项目语境，与 dougong 无关；
-> 权利归原作者所有。
+> dougong 项目作品**：它是第三方撰写的全文二次分析，获取自 GitHub 仓库
+> [acryldev/cordis-meta-framework-spatiotemporal-composability](https://github.com/acryldev/cordis-meta-framework-spatiotemporal-composability)
+> （文件 `paper-A-Programming-Paradigm-for-Spatiotemporal-Composability-Yifan-Shi-Wei-Zhang-Tianyi-Cui-Peking University-DeepSeek-AI.md`），
+> 仅作研究参考存档于此；文中 ACRYL 等提法属该仓库项目的语境，与 dougong
+> 无关；权利归原作者所有。
 
 ---
 
