@@ -88,6 +88,9 @@ impl RootState {
     /// Removes a disposed fiber: fiber table plus dependency indexes.
     pub(crate) fn remove_fiber(&self, uid: u64, inject_names: &[String]) {
         self.fibers.lock().remove(&uid);
+        // The disposed fiber cannot refresh its own mirror any more (its uid
+        // is cleared first), so drop the active-set entry here.
+        self.active.lock().remove(&uid);
         self.index.lock().remove_fiber(uid, inject_names);
     }
 

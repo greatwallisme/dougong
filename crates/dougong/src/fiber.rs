@@ -136,9 +136,6 @@ pub struct Fiber {
         tokio::sync::watch::Receiver<u64>,
     ),
     state_cache: AtomicU8,
-    /// Provider uids referenced by the current committed view (for index
-    /// cleanup).
-    committed_providers: Mutex<Vec<u64>>,
 }
 
 impl std::fmt::Debug for Fiber {
@@ -176,7 +173,6 @@ impl Fiber {
             }),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Active as u8),
-            committed_providers: Mutex::new(Vec::new()),
         })
     }
 
@@ -211,7 +207,6 @@ impl Fiber {
             }),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Pending as u8),
-            committed_providers: Mutex::new(Vec::new()),
         })
     }
 
@@ -629,7 +624,6 @@ impl Fiber {
         };
         self.unload_effects().await;
         self.store.lock().clear();
-        self.committed_providers.lock().clear();
         *self.loaded.lock() = EPOCH_INACTIVE.to_string();
         self.cache_state();
         self.bump_settle();
@@ -674,19 +668,16 @@ impl Fiber {
         {
             let root = self.ctx().root;
             let mut edges: HashMap<String, (u64, u64)> = HashMap::new();
-            let mut providers = Vec::new();
             let scope = Arc::clone(&self.scope);
             for (name, snapshot) in &committed {
                 let label = ScopeNode::effective_label(Some(&scope), name);
                 edges.insert(name.clone(), (label, snapshot.provider_uid));
-                providers.push(snapshot.provider_uid);
             }
             {
                 let mut index = root.index.lock();
                 index.commit_edges(self.uid_value().unwrap_or(0), &edges);
             }
             *self.store.lock() = committed;
-            *self.committed_providers.lock() = providers;
         }
 
         // A panicking plugin body must not kill the driver task (that would
@@ -722,7 +713,6 @@ impl Fiber {
                     index.uncommit(self.uid_value().unwrap_or(0));
                 }
                 self.store.lock().clear();
-                self.committed_providers.lock().clear();
                 self.fail_load(err);
             }
             Err(join_error) => {
@@ -744,7 +734,6 @@ impl Fiber {
                     index.uncommit(self.uid_value().unwrap_or(0));
                 }
                 self.store.lock().clear();
-                self.committed_providers.lock().clear();
                 self.fail_load(Error::msg(format!("plugin panicked: {message}")));
             }
         }
@@ -874,9 +863,9 @@ impl Fiber {
     /// Fails on disposed fibers, waterfall failures, or startup errors.
     pub async fn update(self: &Arc<Self>, config: Value) -> Result<Value> {
         self.assert_active()?;
-        *self.raw_config.lock() = config.clone();
         if self.state() != FiberState::Active {
             self.error.lock().take();
+            *self.raw_config.lock() = config;
             self.request_epoch(crate::fiber::EPOCH_INACTIVE.to_string());
             self.refresh();
             return Ok(Value::Null);
@@ -887,9 +876,13 @@ impl Fiber {
             "internal/update",
             Some(Arc::clone(self)),
             config,
-            move |_config| {
+            move |config| {
                 let fiber = Arc::clone(&fiber);
                 Box::pin(async move {
+                    // Persist the config only in the tail: a hook that vetoes
+                    // (never pulls `next`) must leave the previous config live
+                    // for the next restart.
+                    *fiber.raw_config.lock() = config;
                     fiber.restart().await?;
                     Ok(Value::Null)
                 })

@@ -272,3 +272,43 @@ async fn parent_dispose_cascades_to_children() {
     parent_handle.dispose().await;
     assert_eq!(ctx.live_fibers(), 1, "child cascaded away with the parent");
 }
+
+#[tokio::test]
+async fn update_veto_keeps_the_previous_config_live() {
+    let ctx = Context::new();
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // A vetoing internal/update hook: it never pulls `next`, so the
+    // waterfall tail (the restart) must not run.
+    ctx.on(
+        "internal/update",
+        Arc::new(|_ctx, payload, _next| Box::pin(async move { Ok(payload) })),
+    )
+    .await
+    .expect("register veto hook");
+
+    let seen_in_plugin = Arc::clone(&seen);
+    let plugin = plugin("vetoed", vec![], move |_ctx, config| {
+        let seen = Arc::clone(&seen_in_plugin);
+        Box::pin(async move {
+            seen.lock().unwrap().push(config);
+            Ok(())
+        })
+    });
+    let handle = ctx.plugin(plugin, Some(json!({ "v": 1 }))).expect("spawn");
+    handle.join().await.expect("active");
+
+    // The vetoed update succeeds as an API call (the hook decided), but the
+    // rejected config must not leak into a later restart.
+    handle
+        .update(json!({ "v": 2 }))
+        .await
+        .expect("vetoed update");
+    handle.restart().await.expect("restart with live config");
+    handle.join().await.expect("re-active");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![json!({ "v": 1 }), json!({ "v": 1 })],
+        "the rejected config must not load on the next restart"
+    );
+}

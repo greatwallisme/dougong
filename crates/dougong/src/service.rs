@@ -415,8 +415,6 @@ pub fn notify(ctx: &Context, names: &[String]) -> Vec<Arc<Fiber>> {
             if let Some(weak) = fibers.get(&uid)
                 && let Some(fiber) = weak.upgrade()
             {
-                let label = ctx.effective_label(&fiber.inject_names()[0]);
-                let _ = label;
                 let mut changed = false;
                 for name in names {
                     if fiber.declares(name) {

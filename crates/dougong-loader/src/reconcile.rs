@@ -78,7 +78,7 @@ pub struct Report {
 impl Report {
     /// True when the pass made no changes and recorded no failures.
     #[must_use]
-    pub fn converged(&self) -> bool {
+    pub const fn converged(&self) -> bool {
         self.inserted.is_empty()
             && self.updated.is_empty()
             && self.retired.is_empty()

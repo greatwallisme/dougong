@@ -22,7 +22,7 @@ pub struct WasmLimits {
     /// Cadence of the epoch ticker backing cooperative yields.
     pub epoch_tick: Duration,
     /// Epoch increments a guest may run between yields.
-    pub epoch_ticks_per_yield: u32,
+    pub epoch_ticks_per_yield: u64,
 }
 
 impl Default for WasmLimits {

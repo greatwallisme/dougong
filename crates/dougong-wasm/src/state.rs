@@ -33,6 +33,7 @@ pub struct PluginState {
     /// `provide-service`.
     provide: Vec<String>,
     fuel_per_call: u64,
+    ticks_per_yield: u64,
     limits: StoreLimits,
     table: ResourceTable,
     channel: Arc<GuestChannel>,
@@ -57,6 +58,7 @@ impl PluginState {
             bound: false,
             provide: Vec::new(),
             fuel_per_call: limits.fuel_per_call,
+            ticks_per_yield: limits.epoch_ticks_per_yield,
             // The wasip2 adapter instantiates several core modules per
             // component (guest plus import shims); the cap still bounds
             // runaway instantiation.
@@ -74,6 +76,12 @@ impl PluginState {
     /// The per-call fuel budget (read by the arming helper).
     pub const fn fuel_per_call(&self) -> u64 {
         self.fuel_per_call
+    }
+
+    /// The cooperative-yield cadence in epoch ticks (read by the arming
+    /// helper).
+    pub const fn epoch_ticks_per_yield(&self) -> u64 {
+        self.ticks_per_yield
     }
 
     /// The `StoreLimits` view installed as the store's resource limiter.

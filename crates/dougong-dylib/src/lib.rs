@@ -59,6 +59,40 @@ impl std::fmt::Debug for Exports {
 }
 
 impl Exports {
+    /// Upper bound for one output payload; a plugin needing more is a
+    /// contract failure, not a reason to grow without end.
+    const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Runs one export with a growable out-buffer, retrying on
+    /// `STATUS_CAPACITY` (the buffer protocol's documented signal to retry
+    /// with more room) until the payload fits or the bound is hit.
+    fn growable_call(
+        op: &str,
+        mut invoke: impl FnMut(*mut u8, usize, *mut usize) -> i32,
+    ) -> Result<Vec<u8>> {
+        let mut cap = 4096_usize;
+        loop {
+            let mut buf = vec![0_u8; cap];
+            let mut len = 0_usize;
+            let status = invoke(buf.as_mut_ptr(), buf.len(), &raw mut len);
+            match status {
+                dougong_abi::STATUS_OK => return Ok(buf[..len].to_vec()),
+                dougong_abi::STATUS_CAPACITY => {
+                    cap = cap.saturating_mul(2);
+                    if cap > Self::MAX_OUTPUT_BYTES {
+                        return Err(Error::msg(format!(
+                            "dylib {op} output exceeds {} bytes",
+                            Self::MAX_OUTPUT_BYTES
+                        )));
+                    }
+                }
+                other => {
+                    return Err(Error::msg(format!("dylib {op} failed with status {other}")));
+                }
+            }
+        }
+    }
+
     const fn abi_version(&self) -> u32 {
         // SAFETY: the table pointer is valid for reads for the process
         // lifetime (see the struct contract).
@@ -66,29 +100,25 @@ impl Exports {
     }
 
     fn name(&self) -> String {
-        let mut buf = [0_u8; 256];
-        let mut len = 0_usize;
+        let table = self.table;
         // SAFETY: buffer contract of the export table; the callee writes at
         // most `cap` bytes and reports the used length.
-        let status = unsafe { ((*self.table).name)(buf.as_mut_ptr(), buf.len(), &raw mut len) };
-        if status != dougong_abi::STATUS_OK {
-            return "unnamed-dylib-plugin".to_string();
-        }
-        String::from_utf8_lossy(&buf[..len]).into_owned()
+        let outcome = Self::growable_call("name()", move |out, cap, len| unsafe {
+            ((*table).name)(out, cap, len)
+        });
+        outcome.map_or_else(
+            |_| "unnamed-dylib-plugin".to_string(),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        )
     }
 
     fn descriptor(&self) -> Result<Value> {
-        let mut buf = vec![0_u8; 4096];
-        let mut len = 0_usize;
-        // SAFETY: see `Exports` struct contract; buffer sized above.
-        let status =
-            unsafe { ((*self.table).descriptor)(buf.as_mut_ptr(), buf.len(), &raw mut len) };
-        if status != dougong_abi::STATUS_OK {
-            return Err(Error::msg(format!(
-                "dylib descriptor() failed with status {status}"
-            )));
-        }
-        serde_json::from_slice(&buf[..len])
+        let table = self.table;
+        // SAFETY: see `growable_call` and the `Exports` struct contract.
+        let bytes = Self::growable_call("descriptor()", move |out, cap, len| unsafe {
+            ((*table).descriptor)(out, cap, len)
+        })?;
+        serde_json::from_slice(&bytes)
             .map_err(|err| Error::msg(format!("dylib descriptor is not valid JSON: {err}")))
     }
 
@@ -103,27 +133,22 @@ impl Exports {
     }
 
     fn call(&self, handle: &Handle, method: u32, payload: &[u8]) -> Result<Vec<u8>> {
-        let mut buf = vec![0_u8; 4096];
-        let mut len = 0_usize;
+        let table = self.table;
+        let handle = handle.0;
+        let op = format!("call(method={method})");
         // SAFETY: handle came from `setup` and was not yet torn down; buffer
         // contract as above.
-        let status = unsafe {
-            ((*self.table).call)(
-                handle.0,
+        Self::growable_call(&op, move |out, cap, len| unsafe {
+            ((*table).call)(
+                handle,
                 method,
                 payload.as_ptr(),
                 payload.len(),
-                buf.as_mut_ptr(),
-                buf.len(),
-                &raw mut len,
+                out,
+                cap,
+                len,
             )
-        };
-        if status != dougong_abi::STATUS_OK {
-            return Err(Error::msg(format!(
-                "dylib call(method={method}) failed with status {status}"
-            )));
-        }
-        Ok(buf[..len].to_vec())
+        })
     }
 
     fn teardown(&self, handle: &Handle) {
@@ -420,5 +445,46 @@ mod tests {
         let plugin = from_static(&GOOD_VERSION).expect("adapter builds");
         let outcome = plugin.exports.call(&Handle(std::ptr::null_mut()), 0, b"hi");
         assert_eq!(outcome.expect("call ok"), b"echo");
+    }
+
+    /// Yields `STATUS_CAPACITY` exactly once, then succeeds: the host must
+    /// retry with a larger buffer instead of failing the call.
+    static CAPACITY_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    unsafe extern "C" fn capacity_then_ok_call(
+        _handle: *mut std::os::raw::c_void,
+        _method: u32,
+        _data: *const u8,
+        _len: usize,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32 {
+        if CAPACITY_ARM.swap(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return dougong_abi::STATUS_CAPACITY;
+        }
+        // SAFETY: host buffer contract.
+        if unsafe { write_out(b"second", out, cap, out_len) } {
+            STATUS_OK
+        } else {
+            dougong_abi::STATUS_CAPACITY
+        }
+    }
+
+    static RETRY_TABLE: PluginExports = PluginExports {
+        abi_version: ABI_VERSION,
+        name: fake_name,
+        descriptor: fake_descriptor,
+        setup: fake_setup,
+        call: capacity_then_ok_call,
+        on_event: fake_on_event,
+        teardown: fake_teardown,
+    };
+
+    #[test]
+    fn call_retries_after_status_capacity() {
+        let plugin = from_static(&RETRY_TABLE).expect("adapter builds");
+        let outcome = plugin.exports.call(&Handle(std::ptr::null_mut()), 0, b"");
+        assert_eq!(outcome.expect("retry succeeds"), b"second");
     }
 }

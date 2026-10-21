@@ -29,7 +29,8 @@ pub fn arm_budget(store: &mut Store<PluginState>) -> Result<()> {
     store
         .set_fuel(fuel)
         .map_err(|err| Error::msg(format!("set fuel: {err}")))?;
-    store.epoch_deadline_async_yield_and_update(1);
+    let ticks = store.data().epoch_ticks_per_yield();
+    store.epoch_deadline_async_yield_and_update(ticks);
     Ok(())
 }
 
