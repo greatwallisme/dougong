@@ -161,6 +161,16 @@ must share a scope need `ctx.isolate_with_label(name, label)` with a
 caller-held mapping allocated via `ctx.fresh_label()` (see `Reconciler`'s
 `scopes` map for the reference pattern).
 
+Loader `isolate` rows are **realms** (D15): `Reconciler` starts each row in
+`ctx.isolate_realm(label)` - one label per scope name, shared by all rows
+with the same `isolate` value. A realm member's provides land in the realm
+label; its injections prefer realm-local providers and fall back to the
+global default for names the realm lacks. Practical consequence: the SAME
+service name can exist once per realm with different implementations
+(per-session capability sets), realm services never leak to the global
+default, and a global provider (registered outside any realm) stays visible
+to every realm through the fallback.
+
 ## Logging
 
 `ctx.logger() -> Arc<dyn Logger>` resolves the `logger` service with a
