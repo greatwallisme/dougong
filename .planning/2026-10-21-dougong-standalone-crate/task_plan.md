@@ -15,22 +15,32 @@ sections 3/4/6. Evidence in findings.md.
 YES - standalone crate set, one workspace, per-crate publish, unified 0.x
 version. Rationale and gap list in findings.md.
 
-### Phase 3: Publishing readiness (blocked on user adoption + canonical repo URL) - **Status:** pending
-1. Fill `repository` in `[workspace.package]`.
-2. Flip workspace `publish = false` to per-crate: `true` for dougong-abi /
-   dougong / dougong-dylib / dougong-wasm / dougong-loader; `false` stays for
-   greeter-plugin / greeter-wasm (examples; greeter-plugin is a path
-   dev-dep of dougong-dylib, which is publish-legal).
-3. Add `version` next to `path` on all intra-workspace deps
-   (`dougong = { path = "../dougong", version = "0.1.0" }` pattern) - the
-   cargo requirement for publishing workspace members that inter-depend.
-4. Remove the `cargo_common_metadata = "allow"` (and its comment) once
-   repository lands; the lint must pass for real.
-5. All four quality gates green; `cargo package --list` per publishable crate
-   (offline) to confirm no stray files ship.
-6. MSRV: no compatibility floor is declared anywhere (removed 2026-10-21 by
-   user ruling - the 1.85 claim was never compiled against). If a floor is
-   ever needed, prove it in isolated CI first, then declare it.
+### Phase 3: Publishing readiness + publication - **Status:** complete (2026-10-21)
+User supplied the canonical remote (github.com/greatwallisme/dougong) and the
+crates.io token. Executed:
+1. `repository` filled in [workspace.package]; per-member
+   repository/readme/keywords/categories inheritance lines added.
+2. Workspace publish flag lifted; greeter-plugin / greeter-wasm stay
+   `publish = false` (examples).
+3. Intra-workspace path deps carry `version = "0.1.0"`.
+4. `cargo_common_metadata` allow removed - the lint passes for real.
+5. Fix discovered during publishing: workspace-inherited `readme` resolves
+   verbatim per member (../../README.md nonexistent) -> field removed;
+   cargo_common_metadata then required a readme on publishable crates ->
+   five short per-crate READMEs written (real content, not stubs).
+   Second fix: the packaged dougong-wasm tarball lacked ../../wit ->
+   the WIT single source (D7) physically relocated into
+   crates/dougong-wasm/wit/, root wit/ is a symlink to it.
+6. ALL FIVE CRATES PUBLISHED to crates.io at v0.1.0 (dougong-abi, dougong,
+   dougong-dylib, dougong-wasm, dougong-loader) via
+   `cargo publish --registry crates-io` in dependency order (the local
+   cargo replaces crates-io with the read-only rsproxy mirror, so the
+   --registry flag is mandatory here).
+7. Pushed to github.com/greatwallisme/dougong (master), tag v0.1.0.
+
+### Phase 3b: Gates during publication - **Status:** complete
+clippy/test/fmt/doc exit 0 with zero warnings at every step; the two
+packaging fixes (readme, WIT relocation) were gate-verified before retry.
 
 ### Phase 4: Record + docs (blocked on Phase 3) - **Status:** pending
 1. Record the decision as **D14** in `doc/research/dougong-design.md`

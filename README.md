@@ -21,6 +21,17 @@ cordis 的 Rust 实现：时间可组合 × 空间可组合的通用插件基座
 
 ## 快速开始
 
+宿主项目直接从 crates.io 引入：
+
+```toml
+[dependencies]
+dougong = "0.1"          # 内核（进程内插件形态）
+# 按形态按需追加边界 crate：
+# dougong-dylib = "0.1"  # dylib 插件宿主
+# dougong-wasm = "0.1"   # wasm 插件宿主
+# dougong-loader = "0.1" # 声明式配置 + reconcile
+```
+
 要求：Rust（edition 2024）；开发与验证以 `rust-toolchain.toml` 钉定的工具链为准，不另行宣称兼容下限；wasm 示例另需 `rustup target add wasm32-wasip2`。
 
 ```sh
