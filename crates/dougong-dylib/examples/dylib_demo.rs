@@ -67,6 +67,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         greeter_fiber.join().await?;
         consumer_fiber.join().await?;
 
+        // ABI v2 event surface: the dylib greeter listens to `ping` (echo)
+        // and `upper` (waterfall pull through STATUS_DEFERRED -> on_next).
+        let pong = ctx.serial("ping", serde_json::json!("ping")).await?;
+        assert_eq!(pong, serde_json::json!("pong from greeter-dylib"));
+        log("-- event ping echoed through the dylib bridge --".to_string());
+
+        let loud = ctx
+            .waterfall("upper", serde_json::json!("make me loud"), |payload| {
+                Box::pin(async move { Ok(payload) })
+            })
+            .await?;
+        assert_eq!(loud, serde_json::json!("MAKE ME LOUD"));
+        log("-- waterfall pulled through on_next --".to_string());
+
         // Withdrawal drains the consumer before the provider teardown runs.
         greeter_fiber.dispose().await;
         assert_eq!(consumer_fiber.state(), dougong::FiberState::Pending);

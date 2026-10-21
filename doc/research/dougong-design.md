@@ -99,6 +99,9 @@ waterfall 跨边界 = 宿主持剩余链 + next-token（cordis_wasm 已建模；
 ### D13 wasm async 路线 = 同步 WIT + wasmtime async 传输
 cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucleus 的 WASI 0.3 路线）在钉定 wasmtime 版本时复核——若当版稳定则平移，契约不变。
 
+### D14 dylib 事件全量接通 = ABI v2 CPS（DEFERRED / on_next 拆分拉链）
+2026-10-21，用户裁决（方案 b，"不接受分期和延后"）。评审实证 v1 缺陷：`on_event` 导出从未被宿主调度（描述符无 listen 声明通道），且同步 `NextFn` 原理上不可行——内核续链是 `BoxFuture`，同步 C 函数无法 await，跨线程 block_on 会破坏 dylib 边界"导出仅在 fiber driver 上调用"的安全论证。修复 = `ABI_VERSION` 1→2：`on_event` 以 `STATUS_DEFERRED` 声明拉链（DEFERRED 期输出为续链 payload，空 = 原样续传），宿主解析后续后经新增 `on_next` 导出回注（`chain_status` = OK/FAILED）；`NextFn`/`next_ctx` 删除；描述符新增 `listen`（事件名 → u32 id）；宿主新增**每实例锁**串行全部跨界调用——修正 v1 的错误安全论证（消费者 fiber 各持 task，内核并不排序跨 fiber 调用）。内核配套：`DispatchMode`/`DispatchListener`/`Context::on_dispatch`（模式于派发时下传桥接；`internal/*` 禁桥）。旧 v1 .so 由加载门硬拒，须按 v2 重编译（当前仅 greeter 样例，未发布故破坏成本最低）。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

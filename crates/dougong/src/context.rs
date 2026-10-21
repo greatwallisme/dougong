@@ -476,6 +476,22 @@ impl Context {
         events::on(self, name, listener, true).await
     }
 
+    /// Registers a mode-aware bridge listener (boundary adapters). Bridges
+    /// observe the dispatch mode of every invocation; `internal/*` names are
+    /// rejected.
+    ///
+    /// # Errors
+    ///
+    /// Fails on `internal/*` names or when the current fiber cannot accept
+    /// effects.
+    pub async fn on_dispatch(
+        &self,
+        name: &str,
+        listener: crate::events::DispatchListener,
+    ) -> Result<EffectGuard> {
+        events::on_bridge(self, name, listener).await
+    }
+
     /// Registers a self-disposing one-shot listener.
     ///
     /// # Errors

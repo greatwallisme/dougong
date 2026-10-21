@@ -1,25 +1,25 @@
 # Review findings (running notes)
 
-## F6 - DEFERRED with justification (dylib event dispatch gap)
+## F6 - RESOLVED by user ruling (option b): ABI v2 CPS, implemented
 
-The `on_event` export exists in the C-ABI table (D8 put all five modes into
-the contract), but `dougong-dylib` never dispatches it: `DynPlugin::apply`
-only wires `setup`/`provide`, and the descriptor JSON has no `listen`
-declaration, so the host cannot know what to register. The wasm boundary has
-the full event surface (register_listener/handle_event/waterfall_next).
-
-Why not fixed in this pass: wiring it is a contract-design change, not a
-bug fix - it needs (a) a descriptor `listen` element (name -> u32 event id
-mapping, descriptor is contract data), and (b) a design for the waterfall
-continuation across a SYNC C callback (the kernel `Next` is async; a
-sync `NextFn` trampoline cannot faithfully drive it without new re-entrancy
-infrastructure - emit/parallel/serial/bail are straightforward, waterfall
-is the hard part). That is D8-governed contract surface; inventing it
-unilaterally inside a review would bypass the landing-record rule.
-Recommendation for a follow-up ruling: accept "listen declaration + sync
-modes now, waterfall veto-only (next always None, documented)" OR extend
-the ABI async-capable (bump ABI_VERSION). Semantics are separable from the
-kernel core, which is complete.
+The user rejected phasing/deferral and chose option (b): ABI_VERSION 1->2
+with a continuation-passing event protocol. Implemented this session:
+- `on_event` gained `next_available` + `STATUS_DEFERRED` (deferred output =
+  the continuation payload, empty = original payload continues).
+- New `on_next` export delivers the chain result (chain_status OK/FAILED);
+  the unusable synchronous `NextFn`/`next_ctx` were removed outright.
+- Descriptor gained `listen` (event name -> u32 id); the host registers a
+  mode-aware bridge per entry via the new kernel surface
+  (`DispatchMode`/`DispatchListener`/`Context::on_dispatch`), which threads
+  the dispatch mode to listeners (v1 had no mode visibility).
+- Per-instance lock serializes every foreign call: v1's "the kernel
+  serializes per fiber" safety argument was WRONG for events/services
+  called from consumer fibers (each consumer runs its own task). This was a
+  latent soundness hole in v1, fixed as part of the v2 contract.
+- greeter-plugin shows the full surface (ping echo + waterfall pull with
+  post-processing); dylib_demo exercises both end-to-end. D14 landing
+  record added; skill SKILL.md anchors + references/dylib-plugin.md
+  rewritten for v2.
 
 ## Confirmed fixes applied (Phase 6)
 

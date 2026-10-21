@@ -30,7 +30,9 @@
 //! A minimal plugin export table:
 //!
 //! ```
-//! use dougong_abi::{write_out, PluginExports, ABI_VERSION, MODE_EMIT};
+//! use dougong_abi::{
+//!     write_out, PluginExports, ABI_VERSION, MODE_EMIT, STATUS_FAILED, STATUS_OK,
+//! };
 //!
 //! extern "C" fn name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
 //!     // SAFETY: the host provides a valid `cap`-sized buffer and a writable
@@ -66,13 +68,29 @@
 //!     _mode: u32,
 //!     _data: *const u8,
 //!     _len: usize,
-//!     _next: Option<dougong_abi::NextFn>,
-//!     _next_ctx: *mut usize,
+//!     _next_available: u32,
 //!     _out: *mut u8,
 //!     _cap: usize,
 //!     _out_len: *mut usize,
 //! ) -> i32 {
 //!     -2
+//! }
+//!
+//! unsafe extern "C" fn on_next(
+//!     _handle: *mut std::os::raw::c_void,
+//!     _event: u32,
+//!     chain_status: i32,
+//!     _data: *const u8,
+//!     _len: usize,
+//!     _out: *mut u8,
+//!     _cap: usize,
+//!     _out_len: *mut usize,
+//! ) -> i32 {
+//!     if chain_status == STATUS_OK {
+//!         STATUS_OK
+//!     } else {
+//!         STATUS_FAILED
+//!     }
 //! }
 //!
 //! unsafe extern "C" fn teardown(_handle: *mut std::os::raw::c_void) {}
@@ -85,6 +103,7 @@
 //!     setup,
 //!     call,
 //!     on_event,
+//!     on_next,
 //!     teardown,
 //! };
 //!
@@ -110,6 +129,14 @@ pub const STATUS_OK: i32 = 0;
 /// value and the dispatch chain stops (mirrors cordis `isBailed`).
 pub const STATUS_BAILED: i32 = 1;
 
+/// Status code for waterfall event dispatch: the callee wants the rest of
+/// the chain.
+///
+/// The host resolves the continuation asynchronously and delivers its result
+/// through the `on_next` export; the callee's post-processed reply becomes
+/// the chain value at this listener.
+pub const STATUS_DEFERRED: i32 = 2;
+
 /// Status code: the provided output buffer is too small for the payload.
 pub const STATUS_CAPACITY: i32 = -1;
 
@@ -120,7 +147,12 @@ pub const STATUS_FAILED: i32 = -2;
 
 /// ABI revision of this contract. Hosts reject plugins whose
 /// [`PluginExports::abi_version`] differs from their own value.
-pub const ABI_VERSION: u32 = 1;
+///
+/// v2 (2026-10-21): event dispatch became CPS-capable — `on_event` reports
+/// `STATUS_DEFERRED` to pull the waterfall continuation, the host delivers it
+/// through the new `on_next` export, and the unusable synchronous `NextFn`
+/// was removed (design decision D14).
+pub const ABI_VERSION: u32 = 2;
 
 /// Event dispatch mode: run listeners without waiting for returned values.
 pub const MODE_EMIT: u32 = 0;
@@ -164,27 +196,6 @@ pub unsafe fn write_out(src: &[u8], out_buf: *mut u8, cap: usize, out_len: *mut 
     true
 }
 
-/// Continuation callback for [`MODE_WATERFALL`] dispatch.
-///
-/// The host passes a continuation that invokes the rest of the listener chain
-/// and finally the built-in behavior. A plugin that never calls `next` vetoes
-/// the chain. `payload` is the (possibly transformed) event payload; output
-/// follows the shared buffer protocol.
-///
-/// # Safety
-///
-/// `next_ctx` is an opaque host-owned token that must be passed back to this
-/// exact function; `payload` is valid for `len` readable bytes; output
-/// buffers follow the [`PluginExports`] contract.
-pub type NextFn = unsafe extern "C" fn(
-    next_ctx: *mut usize,
-    payload: *const u8,
-    len: usize,
-    out_buf: *mut u8,
-    cap: usize,
-    out_len: *mut usize,
-) -> i32;
-
 /// The complete export table a plugin library must expose as
 /// `#[unsafe(no_mangle)] pub static DOUGONG_PLUGIN_EXPORTS: PluginExports`.
 ///
@@ -200,11 +211,24 @@ pub type NextFn = unsafe extern "C" fn(
 ///   identifiers are constants of the service contract (WIT-derived), not
 ///   global values.
 /// - `on_event` receives one dispatched event. `mode` is one of the
-///   [`MODE_*`](MODE_EMIT) constants. `next` is `Some` only for
-///   [`MODE_WATERFALL`].
+///   [`MODE_*`](MODE_EMIT) constants; `next_available` is `1` only for
+///   [`MODE_WATERFALL`]. Returning [`STATUS_DEFERRED`] in waterfall pulls the
+///   rest of the chain: any output written before deferring is the payload
+///   the chain continues with (empty output continues with the original), the
+///   host later calls `on_next` with the continuation result, and this
+///   export's post-processed output becomes the chain value here. Any other
+///   status vetoes the chain with the produced output.
+/// - `on_next` delivers the deferred waterfall continuation. `chain_status`
+///   is [`STATUS_OK`] when `data`/`len` carry the continuation reply and
+///   [`STATUS_FAILED`] when the chain errored. Returning [`STATUS_DEFERRED`]
+///   is a contract violation; the host treats it as [`STATUS_FAILED`].
 /// - `teardown` releases the handle returned by `setup`. The host calls it
 ///   exactly once per successful `setup`, after all disposers referencing the
 ///   handle have been drained.
+///
+/// The host serializes every foreign call that shares one `handle` through a
+/// per-instance lock, so plugin-private state needs no internal locking even
+/// when several consumer fibers call concurrently.
 #[repr(C)]
 pub struct PluginExports {
     /// ABI revision; must equal [`ABI_VERSION`] at load time.
@@ -212,7 +236,7 @@ pub struct PluginExports {
     /// Writes the plugin display name (UTF-8) into the output buffer.
     pub name: unsafe extern "C" fn(out_buf: *mut u8, cap: usize, out_len: *mut usize) -> i32,
     /// Writes the plugin descriptor (UTF-8 JSON: name, version, provide,
-    /// inject) into the output buffer.
+    /// inject, listen) into the output buffer.
     pub descriptor: unsafe extern "C" fn(out_buf: *mut u8, cap: usize, out_len: *mut usize) -> i32,
     /// Allocates plugin-private state; null signals initialization failure.
     pub setup: unsafe extern "C" fn() -> *mut std::os::raw::c_void,
@@ -233,8 +257,19 @@ pub struct PluginExports {
         mode: u32,
         in_data: *const u8,
         in_len: usize,
-        next: Option<NextFn>,
-        next_ctx: *mut usize,
+        next_available: u32,
+        out_buf: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32,
+    /// Delivers the deferred waterfall continuation requested through
+    /// [`STATUS_DEFERRED`] (design decision D14).
+    pub on_next: unsafe extern "C" fn(
+        handle: *mut std::os::raw::c_void,
+        event: u32,
+        chain_status: i32,
+        data: *const u8,
+        len: usize,
         out_buf: *mut u8,
         cap: usize,
         out_len: *mut usize,
@@ -300,6 +335,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(ABI_VERSION, 1);
+        assert_eq!(ABI_VERSION, 2);
+        assert_eq!(STATUS_DEFERRED, 2);
     }
 }

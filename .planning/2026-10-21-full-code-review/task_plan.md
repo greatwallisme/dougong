@@ -34,12 +34,22 @@ new descriptor contract element plus a sync-ABI async-continuation design
 (D8-governed); semantics separable from the kernel core, deferred with
 justification for a user ruling.
 
-### Phase 6: Fix application + gates + commit - **Status:** in_progress
+### Phase 6: Fix application + gates + commit - **Status:** complete
 Applied: F1 (update veto config leak + regression test), F3 (dead probe in
 notify), F4 (active-set cleanup on dispose), F5 (committed_providers dead
 field removal), F7 (STATUS_CAPACITY grow-retry + test), F10
 (epoch_ticks_per_yield dead knob now honored, widened to u64 per wasmtime
-48 API). Gates running.
+48 API). All four gates exit 0 with zero warnings; dylib/wasm/loader demos
+exit 0. Committed as 380090d.
+
+### Phase 7: F6 resolution - ABI v2 CPS (user ruling, option b) - **Status:** complete
+User rejected deferral and chose the ABI v2 continuation-passing design.
+Implemented: dougong-abi v2 (STATUS_DEFERRED, on_next, NextFn removed),
+kernel mode-aware bridges (DispatchMode/DispatchListener/on_dispatch),
+dylib host listen descriptor + per-instance lock + CPS wiring, greeter
+event demo, dylib_demo e2e, D14 landing record, skill docs rewritten.
+Verification: clippy/test/doc/fmt exit 0, zero warnings; all three demos
+exit 0.
 
 ## Decisions Made
 | Decision | Rationale |

@@ -61,7 +61,7 @@ mod service;
 
 pub use context::Context;
 pub use error::{Error, Result};
-pub use events::{Listener, Next, is_bailed};
+pub use events::{DispatchListener, DispatchMode, Listener, Next, is_bailed};
 pub use fiber::{
     Disposer, EPOCH_INACTIVE, EffectGuard, Fiber, FiberHandle, FiberState, ProviderSnapshot,
     Runtime,

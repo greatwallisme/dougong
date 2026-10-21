@@ -12,8 +12,8 @@ providers come and go). A plugin never hand-writes teardown - it declares and
 registers, and the kernel derives reversal from registration.
 
 All plugin forms implement **one semantic contract**. Version anchors for the
-current code: ABI_VERSION 1 (`dougong-abi`), WIT world
-`dougong:kernel@0.1.0` (`wit/dougong-plugin.wit`), contract hash
+current code: ABI_VERSION 2 (`dougong-abi`, v2 CPS event protocol per D14),
+WIT world `dougong:kernel@0.1.0` (`wit/dougong-plugin.wit`), contract hash
 `dougong-dynamic-channel-v1`, wasmtime 48 / wit-bindgen 0.61, toolchain pinned
 in `rust-toolchain.toml`.
 

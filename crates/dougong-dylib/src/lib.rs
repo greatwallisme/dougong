@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-20
+// Rust guideline compliant 2026-10-21
 //! dylib/so plugin host for the dougong kernel.
 //!
 //! Loads a [`dougong_abi::PluginExports`] table from a shared library and
@@ -13,6 +13,23 @@
 //! registers a [`dougong::Invoker`] service so any consumer can call the
 //! plugin through the dynamic channel (`method` selector + byte payload).
 //!
+//! # Event surface (ABI v2, design decision D14)
+//!
+//! The descriptor declares `listen` as an object mapping event names to u32
+//! event ids; the host registers a mode-aware bridge per entry. In
+//! waterfall, the plugin returns [`dougong_abi::STATUS_DEFERRED`] to pull
+//! the rest of the chain: the host resolves the asynchronous continuation
+//! and re-enters through the `on_next` export, whose post-processed output
+//! becomes the chain value at this listener.
+//!
+//! # Instance serialization
+//!
+//! Consumer fibers run on their own tasks, so the kernel's per-fiber driver
+//! alone does not order cross-fiber calls into one handle. The host holds a
+//! per-instance lock across every foreign entry (service calls, event
+//! dispatches including deferred continuations, and teardown), so
+//! plugin-private state needs no internal locking.
+//!
 //! # Lifetime
 //!
 //! Loading is trusted-code territory (design decision D5, user ruling R1):
@@ -23,20 +40,26 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use dougong::BoxFuture;
-use dougong::{Error, Plugin, Result};
-use dougong_abi::{ABI_VERSION, PluginExports};
+use dougong::{BoxFuture, DispatchListener, DispatchMode, Error, Plugin, Result};
+use dougong_abi::{
+    ABI_VERSION, MODE_BAIL, MODE_EMIT, MODE_PARALLEL, MODE_SERIAL, MODE_WATERFALL, PluginExports,
+};
 use libloading::Library;
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Serializes every foreign call into one plugin instance (see the crate
+/// documentation: cross-fiber callers are not ordered by the kernel).
+type InstanceLock = Arc<AsyncMutex<()>>;
 
 /// Resolved export table plus the mapped library that backs it.
 ///
 /// # Safety contract
 ///
 /// The table points at immutable code/data in the mapped library. Clones
-/// share one `Arc<Library>`, so the mapping outlives every use; calls are
-/// externally synchronized by the kernel (each fiber drives its own plugin
-/// body and effects).
+/// share one `Arc<Library>`, so the mapping outlives every use; call
+/// ordering across fibers is provided by the per-instance lock held by the
+/// adapters that carry the table.
 #[derive(Clone)]
 pub struct Exports {
     table: *const PluginExports,
@@ -45,7 +68,7 @@ pub struct Exports {
 
 // SAFETY: the raw pointer targets a `static` export table inside the mapped
 // library; the `Arc<Library>` keeps that mapping alive for as long as this
-// value lives. Accesses are serialized by the kernel's per-fiber driver.
+// value lives. The table itself is immutable after load.
 unsafe impl Send for Exports {}
 // SAFETY: same reasoning as `Send` — the table is immutable after load.
 unsafe impl Sync for Exports {}
@@ -151,6 +174,104 @@ impl Exports {
         })
     }
 
+    /// One event dispatch result: the plugin's status plus its output.
+    fn dispatch_event(
+        &self,
+        handle: &Handle,
+        event: u32,
+        mode: u32,
+        payload: &[u8],
+        next_available: u32,
+    ) -> Result<(i32, Vec<u8>)> {
+        let table = self.table;
+        let handle = handle.0;
+        let mut cap = 4096_usize;
+        loop {
+            let mut buf = vec![0_u8; cap];
+            let mut len = 0_usize;
+            // SAFETY: handle came from `setup` and was not yet torn down;
+            // buffer contract as above.
+            let status = unsafe {
+                ((*table).on_event)(
+                    handle,
+                    event,
+                    mode,
+                    payload.as_ptr(),
+                    payload.len(),
+                    next_available,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &raw mut len,
+                )
+            };
+            match status {
+                dougong_abi::STATUS_CAPACITY => {
+                    cap = cap.saturating_mul(2);
+                    if cap > Self::MAX_OUTPUT_BYTES {
+                        return Err(Error::msg(format!(
+                            "dylib on_event(event={event}) output exceeds {} bytes",
+                            Self::MAX_OUTPUT_BYTES
+                        )));
+                    }
+                }
+                other => return Ok((other, buf[..len].to_vec())),
+            }
+        }
+    }
+
+    fn deliver_next(
+        &self,
+        handle: &Handle,
+        event: u32,
+        chain_status: i32,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let table = self.table;
+        let handle = handle.0;
+        let mut cap = 4096_usize;
+        loop {
+            let mut buf = vec![0_u8; cap];
+            let mut len = 0_usize;
+            // SAFETY: handle came from `setup`; the deferred continuation is
+            // still open (see the instance-lock contract); buffer protocol
+            // as above.
+            let status = unsafe {
+                ((*table).on_next)(
+                    handle,
+                    event,
+                    chain_status,
+                    data.as_ptr(),
+                    data.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &raw mut len,
+                )
+            };
+            match status {
+                dougong_abi::STATUS_CAPACITY => {
+                    cap = cap.saturating_mul(2);
+                    if cap > Self::MAX_OUTPUT_BYTES {
+                        return Err(Error::msg(format!(
+                            "dylib on_next(event={event}) output exceeds {} bytes",
+                            Self::MAX_OUTPUT_BYTES
+                        )));
+                    }
+                }
+                dougong_abi::STATUS_OK => return Ok(buf[..len].to_vec()),
+                dougong_abi::STATUS_DEFERRED => {
+                    return Err(Error::msg(
+                        "dylib on_next returned STATUS_DEFERRED, which is a contract violation",
+                    ));
+                }
+                other => {
+                    return Err(Error::msg(format!(
+                        "dylib on_next(event={event}) failed with status {other}"
+                    )));
+                }
+            }
+        }
+    }
+
     fn teardown(&self, handle: &Handle) {
         // SAFETY: called exactly once per successful `setup`, per the
         // export-table contract.
@@ -162,29 +283,47 @@ impl Exports {
 #[derive(Clone)]
 struct Handle(*mut std::ffi::c_void);
 
-// SAFETY: the handle is plugin-private state accessed only from host calls
-// that the kernel serializes per fiber.
+// SAFETY: the handle is plugin-private state; every access funnels through
+// the per-instance lock held by the adapters.
 unsafe impl Send for Handle {}
+// SAFETY: sharing the handle across threads is safe because dereferences
+// happen only under the same per-instance lock (bridge closures hold it).
+unsafe impl Sync for Handle {}
+
+/// Maps a kernel dispatch mode onto its ABI constant.
+const fn abi_mode(mode: DispatchMode) -> u32 {
+    match mode {
+        DispatchMode::Emit => MODE_EMIT,
+        DispatchMode::Parallel => MODE_PARALLEL,
+        DispatchMode::Serial => MODE_SERIAL,
+        DispatchMode::Bail => MODE_BAIL,
+        DispatchMode::Waterfall => MODE_WATERFALL,
+    }
+}
 
 /// Dynamic-channel adapter forwarding `Invoke` calls into the dylib exports.
 struct DylibInvoke {
     exports: Exports,
     handle: Handle,
+    lock: InstanceLock,
 }
 
-// SAFETY: the raw handle targets plugin-private state that the kernel's
-// per-fiber driver serializes; `Exports` carries the same contract for the
-// mapped table.
+// SAFETY: the raw handle targets plugin-private state; every access is
+// ordered by the per-instance lock this adapter holds across each foreign
+// call, so no two threads can enter the instance concurrently.
 unsafe impl Send for DylibInvoke {}
-// SAFETY: same contract as `Send` — all accessor calls are externally
-// synchronized per fiber.
+// SAFETY: same contract as `Send`.
 unsafe impl Sync for DylibInvoke {}
 
 impl dougong::Invoke for DylibInvoke {
     fn call(&self, method: u32, payload: Vec<u8>) -> BoxFuture<Result<Vec<u8>>> {
         let exports = self.exports.clone();
         let handle = self.handle.clone();
-        Box::pin(async move { exports.call(&handle, method, &payload) })
+        let lock = Arc::clone(&self.lock);
+        Box::pin(async move {
+            let _instance = lock.lock().await;
+            exports.call(&handle, method, &payload)
+        })
     }
 }
 
@@ -194,6 +333,7 @@ pub struct DynPlugin {
     name: String,
     inject: Vec<dougong::Injection>,
     provide: Vec<String>,
+    listen: Vec<(String, u32)>,
 }
 
 impl std::fmt::Debug for DynPlugin {
@@ -201,6 +341,7 @@ impl std::fmt::Debug for DynPlugin {
         f.debug_struct("DynPlugin")
             .field("name", &self.name)
             .field("provide", &self.provide)
+            .field("listen", &self.listen)
             .finish_non_exhaustive()
     }
 }
@@ -217,6 +358,7 @@ impl Plugin for DynPlugin {
     fn apply(&self, ctx: dougong::Context, _config: Value) -> BoxFuture<Result<()>> {
         let exports = self.exports.clone();
         let provide = self.provide.clone();
+        let listen = self.listen.clone();
         let plugin_name = self.name.clone();
         Box::pin(async move {
             let Some(handle) = exports.setup() else {
@@ -224,20 +366,89 @@ impl Plugin for DynPlugin {
                     "dylib plugin \"{plugin_name}\" setup returned null"
                 )));
             };
+            let instance: InstanceLock = Arc::new(AsyncMutex::new(()));
 
             // Teardown runs exactly once per successful setup, after every
-            // other effect (provide disposers) has drained — LIFO places it
-            // first in the queue because it is registered here, before the
-            // provide effects below.
+            // other effect (provide disposers, bridges) has drained — LIFO
+            // places it first in the queue because it is registered here,
+            // before the effects below.
             let teardown_exports = exports.clone();
             let teardown_handle = Handle(handle.0);
+            let teardown_lock = Arc::clone(&instance);
             let disposer: dougong::Disposer = Box::new(move || {
                 Box::pin(async move {
+                    let _instance = teardown_lock.lock().await;
                     teardown_exports.teardown(&teardown_handle);
                 })
             });
             ctx.effect("dylib.teardown", async move { Ok(Some(disposer)) })
                 .await?;
+
+            // Mode-aware bridges: one per declared listened event. The lock
+            // spans the whole invocation, including a deferred waterfall
+            // continuation, so plugin state cannot observe interleaving.
+            for (event_name, event_id) in &listen {
+                let bridge_exports = exports.clone();
+                let bridge_handle = Handle(handle.0);
+                let bridge_lock = Arc::clone(&instance);
+                let event_id = *event_id;
+                let bridge: DispatchListener = Arc::new(move |_ctx, payload, next, mode| {
+                    let exports = bridge_exports.clone();
+                    let handle = bridge_handle.clone();
+                    let lock = Arc::clone(&bridge_lock);
+                    Box::pin(async move {
+                        let _instance = lock.lock().await;
+                        let bytes = serde_json::to_vec(&payload)
+                            .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
+                        let waterfall = mode == DispatchMode::Waterfall;
+                        let (status, reply) = exports.dispatch_event(
+                            &handle,
+                            event_id,
+                            abi_mode(mode),
+                            &bytes,
+                            u32::from(waterfall),
+                        )?;
+                        match status {
+                            dougong_abi::STATUS_DEFERRED => {
+                                if !waterfall {
+                                    return Err(Error::msg(format!(
+                                        "dylib plugin deferred event {event_id} outside waterfall"
+                                    )));
+                                }
+                                // DEFERRED output, when present, is the
+                                // payload the chain continues with; empty
+                                // output continues with the original.
+                                let value: Value = if reply.is_empty() {
+                                    serde_json::from_slice(&bytes).map_err(|err| {
+                                        Error::msg(format!("decode payload: {err}"))
+                                    })?
+                                } else {
+                                    serde_json::from_slice(&reply).map_err(|err| {
+                                        Error::msg(format!("decode payload: {err}"))
+                                    })?
+                                };
+                                let continued = next.call(value).await?;
+                                let chain_bytes = serde_json::to_vec(&continued)
+                                    .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
+                                let processed = exports.deliver_next(
+                                    &handle,
+                                    event_id,
+                                    dougong_abi::STATUS_OK,
+                                    &chain_bytes,
+                                )?;
+                                serde_json::from_slice(&processed)
+                                    .map_err(|err| Error::msg(format!("decode payload: {err}")))
+                            }
+                            dougong_abi::STATUS_FAILED => Err(Error::msg(format!(
+                                "dylib on_event(event={event_id}) failed"
+                            ))),
+                            _ => serde_json::from_slice(&reply)
+                                .map_err(|err| Error::msg(format!("decode payload: {err}"))),
+                        }
+                    })
+                });
+                ctx.on_dispatch(event_name, bridge).await?;
+            }
 
             for service in &provide {
                 let invoker_exports = exports.clone();
@@ -245,6 +456,7 @@ impl Plugin for DynPlugin {
                 let invoker = dougong::Invoker::new(Arc::new(DylibInvoke {
                     exports: invoker_exports,
                     handle: Handle(invoker_handle),
+                    lock: Arc::clone(&instance),
                 }));
                 ctx.provide(service, invoker).await?;
             }
@@ -287,7 +499,7 @@ pub fn load(path: &Path) -> Result<Arc<dyn Plugin>> {
 ///
 /// # Errors
 ///
-/// Fails when the ABI version mismatches.
+/// Fails when the ABI version mismatches or the descriptor is malformed.
 pub fn from_exports(exports: Exports) -> Result<DynPlugin> {
     if exports.abi_version() != ABI_VERSION {
         return Err(Error::msg(format!(
@@ -297,36 +509,55 @@ pub fn from_exports(exports: Exports) -> Result<DynPlugin> {
     }
     let name = exports.name();
     let descriptor: Value = exports.descriptor()?;
-    let (provide, inject) = {
-        let provide = descriptor
-            .get("provide")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let inject = descriptor
-            .get("inject")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|name| dougong::Injection::new(name.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        (provide, inject)
+    let provide = descriptor
+        .get("provide")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let inject = descriptor
+        .get("inject")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| dougong::Injection::new(name.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let listen = match descriptor.get("listen") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Object(map)) => {
+            let mut listen = Vec::with_capacity(map.len());
+            for (event_name, id) in map {
+                let Ok(id) = u32::try_from(id.as_u64().unwrap_or_else(|| u64::from(u32::MAX) + 1))
+                else {
+                    return Err(Error::msg(format!(
+                        "descriptor listen[\"{event_name}\"] must be a u32 event id"
+                    )));
+                };
+                listen.push((event_name.clone(), id));
+            }
+            listen
+        }
+        Some(_) => {
+            return Err(Error::msg(
+                "descriptor listen must be an object of event name to u32 id",
+            ));
+        }
     };
     Ok(DynPlugin {
         exports,
         name,
         inject,
         provide,
+        listen,
     })
 }
 
@@ -339,7 +570,9 @@ pub(crate) fn from_static(table: &'static PluginExports) -> Result<DynPlugin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dougong_abi::{STATUS_OK, write_out};
+    use dougong::Context;
+    use dougong_abi::{STATUS_DEFERRED, STATUS_OK, write_out};
+    use serde_json::json;
 
     const FAKE_NAME: &[u8] = b"fake-plugin";
 
@@ -356,7 +589,7 @@ mod tests {
         // SAFETY: host buffer contract.
         if unsafe {
             write_out(
-                br#"{"name":"fake-plugin","provide":["greeting"],"inject":[]}"#,
+                br#"{"name":"fake-plugin","provide":["greeting"],"inject":[],"listen":{"ping":1}}"#,
                 out,
                 cap,
                 len,
@@ -369,7 +602,9 @@ mod tests {
     }
 
     unsafe extern "C" fn fake_setup() -> *mut std::os::raw::c_void {
-        std::ptr::null_mut()
+        // One live byte per activation; `fake_teardown` releases it, so the
+        // full apply/unload cycle runs against a non-null handle.
+        Box::into_raw(Box::new(0_u8)).cast::<std::os::raw::c_void>()
     }
 
     unsafe extern "C" fn fake_call(
@@ -395,16 +630,58 @@ mod tests {
         _mode: u32,
         _data: *const u8,
         _len: usize,
-        _next: Option<dougong_abi::NextFn>,
-        _next_ctx: *mut usize,
-        _out: *mut u8,
-        _cap: usize,
-        _out_len: *mut usize,
+        next_available: u32,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
     ) -> i32 {
-        STATUS_OK
+        // Waterfall pulls through the CPS protocol: defer, and the host
+        // re-enters via `on_next`.
+        if next_available == 1 {
+            return STATUS_DEFERRED;
+        }
+        // SAFETY: host buffer contract.
+        if unsafe { write_out(b"\"pong\"", out, cap, out_len) } {
+            STATUS_OK
+        } else {
+            dougong_abi::STATUS_CAPACITY
+        }
     }
 
-    unsafe extern "C" fn fake_teardown(_handle: *mut std::os::raw::c_void) {}
+    unsafe extern "C" fn fake_on_next(
+        _handle: *mut std::os::raw::c_void,
+        _event: u32,
+        chain_status: i32,
+        data: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32 {
+        if chain_status != dougong_abi::STATUS_OK {
+            return dougong_abi::STATUS_FAILED;
+        }
+        // SAFETY: host buffer contract; uppercase the chain reply as a
+        // visible post-processing step.
+        let slice = unsafe { std::slice::from_raw_parts(data, len) };
+        let mut upper = slice.to_vec();
+        upper.make_ascii_uppercase();
+        // SAFETY: host buffer contract.
+        if unsafe { write_out(&upper, out, cap, out_len) } {
+            STATUS_OK
+        } else {
+            dougong_abi::STATUS_CAPACITY
+        }
+    }
+
+    unsafe extern "C" fn fake_teardown(handle: *mut std::os::raw::c_void) {
+        if handle.is_null() {
+            return;
+        }
+        // SAFETY: the handle was produced by `fake_setup` and torn down
+        // exactly once per activation.
+        drop(unsafe { Box::from_raw(handle.cast::<u8>()) });
+    }
 
     static WRONG_VERSION: PluginExports = PluginExports {
         abi_version: ABI_VERSION + 1,
@@ -413,6 +690,7 @@ mod tests {
         setup: fake_setup,
         call: fake_call,
         on_event: fake_on_event,
+        on_next: fake_on_next,
         teardown: fake_teardown,
     };
 
@@ -423,6 +701,7 @@ mod tests {
         setup: fake_setup,
         call: fake_call,
         on_event: fake_on_event,
+        on_next: fake_on_next,
         teardown: fake_teardown,
     };
 
@@ -438,6 +717,40 @@ mod tests {
         assert_eq!(plugin.name, "fake-plugin");
         assert_eq!(plugin.provide, vec!["greeting".to_string()]);
         assert!(plugin.inject.is_empty());
+        assert_eq!(plugin.listen, vec![("ping".to_string(), 1_u32)]);
+    }
+
+    unsafe extern "C" fn bad_listen_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+        // SAFETY: host buffer contract.
+        if unsafe {
+            write_out(
+                br#"{"name":"fake","provide":[],"inject":[],"listen":{"ping":"x"}}"#,
+                out,
+                cap,
+                len,
+            )
+        } {
+            STATUS_OK
+        } else {
+            dougong_abi::STATUS_CAPACITY
+        }
+    }
+
+    static BAD_LISTEN_TABLE: PluginExports = PluginExports {
+        abi_version: ABI_VERSION,
+        name: fake_name,
+        descriptor: bad_listen_descriptor,
+        setup: fake_setup,
+        call: fake_call,
+        on_event: fake_on_event,
+        on_next: fake_on_next,
+        teardown: fake_teardown,
+    };
+
+    #[test]
+    fn malformed_listen_is_a_load_error() {
+        let err = from_static(&BAD_LISTEN_TABLE).expect_err("malformed listen must fail load");
+        assert!(err.to_string().contains("must be a u32 event id"));
     }
 
     #[tokio::test]
@@ -445,6 +758,29 @@ mod tests {
         let plugin = from_static(&GOOD_VERSION).expect("adapter builds");
         let outcome = plugin.exports.call(&Handle(std::ptr::null_mut()), 0, b"hi");
         assert_eq!(outcome.expect("call ok"), b"echo");
+    }
+
+    #[tokio::test]
+    async fn bridges_forward_mode_and_deferred_continuation() {
+        let plugin: Arc<dyn Plugin> = Arc::new(from_static(&GOOD_VERSION).expect("adapter builds"));
+        let ctx = Context::new();
+        let handle = ctx.plugin(plugin, None).expect("spawn");
+        handle.join().await.expect("active");
+
+        // Serial mode: the plain reply path.
+        let pong = ctx.serial("ping", json!("ping")).await.expect("serial");
+        assert_eq!(pong, json!("pong"));
+
+        // Waterfall with a DEFERRED pull: the plugin uppercases the chain
+        // reply through `on_next`.
+        let upper = ctx
+            .waterfall("ping", json!("make-loud"), |payload| {
+                Box::pin(async move { Ok(payload) })
+            })
+            .await
+            .expect("waterfall");
+        assert_eq!(upper, json!("MAKE-LOUD"));
+        handle.dispose().await;
     }
 
     /// Yields `STATUS_CAPACITY` exactly once, then succeeds: the host must
@@ -478,6 +814,7 @@ mod tests {
         setup: fake_setup,
         call: capacity_then_ok_call,
         on_event: fake_on_event,
+        on_next: fake_on_next,
         teardown: fake_teardown,
     };
 
