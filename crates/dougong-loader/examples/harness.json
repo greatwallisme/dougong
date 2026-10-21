@@ -4,9 +4,10 @@
     { "name": "telemetry", "source": { "kind": "builtin", "name": "telemetry" }, "config": null, "isolate": null },
     { "name": "tools", "source": { "kind": "builtin", "name": "tools" }, "config": null, "isolate": null },
     { "name": "guard", "source": { "kind": "builtin", "name": "guard" }, "config": null, "isolate": null },
-    { "name": "llm", "source": { "kind": "builtin", "name": "llm" }, "config": { "adapter": "echo" }, "isolate": null },
-    { "name": "agent-a", "source": { "kind": "builtin", "name": "agent" }, "config": { "label": "A" }, "isolate": null },
-    { "name": "agent-b", "source": { "kind": "builtin", "name": "agent" }, "config": { "label": "B" }, "isolate": null },
+    { "name": "llm-a", "source": { "kind": "builtin", "name": "llm" }, "config": { "adapter": "echo" }, "isolate": "session-a" },
+    { "name": "llm-b", "source": { "kind": "builtin", "name": "llm" }, "config": { "adapter": "upper" }, "isolate": "session-b" },
+    { "name": "agent-a", "source": { "kind": "builtin", "name": "agent" }, "config": { "label": "A" }, "isolate": "session-a" },
+    { "name": "agent-b", "source": { "kind": "builtin", "name": "agent" }, "config": { "label": "B" }, "isolate": "session-b" },
     { "name": "greeter-dylib", "source": { "kind": "dylib", "path": "target/debug/libgreeter_plugin.so" }, "config": null, "isolate": null },
     { "name": "greeter-wasm", "source": { "kind": "wasm", "path": "target/wasm32-wasip2/debug/greeter_wasm.wasm" }, "config": null, "isolate": null }
   ]

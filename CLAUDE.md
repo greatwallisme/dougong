@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 dougong (斗拱) is a Rust implementation of the cordis composition kernel: time composability (every environmental mutation is a revertible effect, undone LIFO) meets spatial composability (declared dependencies resolve reactively as providers come and go). Plugins come in three forms sharing one semantic: in-process Rust (`dougong::Plugin`), dylib/so via C-ABI (trusted code), and wasm components (sandboxed).
 
-`doc/research/` is the semantic source of truth: `cordis.md` (the paper), `study-1..4` (evidence), `dougong-design.md` (decisions D4–D14 plus user rulings R1–R4). When changing behavior that a D-decision governs, update its landing record there.
+`doc/research/` is the semantic source of truth: `cordis.md` (the paper), `study-1..4` (evidence), `dougong-design.md` (decisions D4–D15 plus user rulings R1–R4). When changing behavior that a D-decision governs, update its landing record there.
 
 ## Commands
 
@@ -45,7 +45,7 @@ Cross-cutting semantics that span files:
 - **Boundary adapters are isomorphic**: `dougong-dylib`'s `DynPlugin` and `dougong-wasm`'s `WasmPlugin` follow the identical ordering — register the teardown effect *first* (LIFO runs it last), then let the guest/exports provide; and both serialize every foreign call per instance (dylib's `InstanceLock`, wasm's store mutex) — consumer fibers call from their own tasks, so the kernel does not order those calls for you. Keep them in sync.
 - **Event modes live at dispatch**: emit/parallel/serial/bail/waterfall are chosen by the dispatcher (`events.rs`), not at registration. `internal/*` events are framework extension points with scope filtering. In waterfall, a listener pulls `Next` to advance; dropping it vetoes the chain. Mode-aware bridges (`Context::on_dispatch`) receive the dispatch mode — boundary adapters use them, and `internal/*` names reject bridges.
 - **Dylib events are CPS (D14, ABI v2)**: the descriptor's `listen` map registers bridges; in waterfall the plugin returns `STATUS_DEFERRED` from `on_event` (output = continuation payload, empty = original) and the host re-enters through `on_next` with the chain result. The v1 synchronous `NextFn` was removed — do not reintroduce sync continuations across the C boundary.
-- **Isolation labels**: `Context::isolate(name)` mints a *fresh* label on every call. Realms that must share a label need `isolate_with_label` with a caller-held mapping (`dougong-loader`'s `scopes` map is the reference pattern; it allocates via `Context::fresh_label`).
+- **Isolation labels (D15)**: `Context::isolate(name)` mints a *fresh* label on every call; per-name overrides via `isolate_with_label` need a caller-held mapping (`dougong-loader`'s `scopes` map). Loader `isolate` rows are **realms** (`Context::isolate_realm`, D15): member provides land in the realm label, member injections prefer realm-local providers then fall back to the global default; realm services never leak to the default label.
 - **WIT is the wasm contract's single source** (`wit/dougong-plugin.wit`, package `dougong:kernel@0.1.0`). Contract changes go through `dougong-design.md` D7's landing record.
 - **Sandbox split (D5/D11)**: dylib = trusted, teardown-only (never `dlclose`; R1 accepted). wasm = untrusted: fuel per call + epoch yielding + `StoreLimits` + capability-empty WASI. The world import surface is the whole authority.
 

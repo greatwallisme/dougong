@@ -22,6 +22,10 @@ pub struct ScopeNode {
     pub parent: Option<Arc<Self>>,
     /// Service name -> isolation label overrides introduced by this node.
     pub isolate: HashMap<String, u64>,
+    /// Realm-wide fallback label introduced by this node (D15): provides
+    /// from this scope land in the realm, and injections prefer realm-local
+    /// providers before falling back to the global default.
+    pub realm: Option<u64>,
     /// Service name -> intercept config layers (innermost first).
     pub intercept: HashMap<String, VecDeque<Value>>,
 }
@@ -41,6 +45,20 @@ impl ScopeNode {
         Arc::new(Self {
             parent: Some(Arc::clone(parent)),
             isolate,
+            realm: None,
+            intercept: HashMap::new(),
+        })
+    }
+
+    /// Derives a child scope carrying a realm-wide fallback label (D15):
+    /// provides from this scope land in the realm, and injections prefer
+    /// realm-local providers before falling back to the global default.
+    #[must_use]
+    pub fn realm_child(parent: &Arc<Self>, label: u64) -> Arc<Self> {
+        Arc::new(Self {
+            parent: Some(Arc::clone(parent)),
+            isolate: HashMap::new(),
+            realm: Some(label),
             intercept: HashMap::new(),
         })
     }
@@ -53,8 +71,50 @@ impl ScopeNode {
         Arc::new(Self {
             parent: Some(Arc::clone(parent)),
             isolate: HashMap::new(),
+            realm: None,
             intercept,
         })
+    }
+
+    /// The innermost realm label on the chain, if any.
+    #[must_use]
+    pub fn realm_label(node: Option<&Arc<Self>>) -> Option<u64> {
+        let mut cursor = node;
+        while let Some(current) = cursor {
+            if let Some(realm) = current.realm {
+                return Some(realm);
+            }
+            cursor = current.parent.as_ref();
+        }
+        None
+    }
+
+    /// Resolution candidates for `name`, innermost precedence first (D15):
+    /// an explicit per-name isolation mapping is strict (single candidate);
+    /// otherwise the innermost realm label (if any) precedes the global
+    /// default.
+    #[must_use]
+    pub fn label_candidates(node: Option<&Arc<Self>>, name: &str) -> Vec<u64> {
+        let mut cursor = node;
+        while let Some(current) = cursor {
+            if let Some(label) = current.isolate.get(name) {
+                return vec![*label];
+            }
+            cursor = current.parent.as_ref();
+        }
+        let mut candidates = Vec::new();
+        if let Some(realm) = Self::realm_label(node) {
+            candidates.push(realm);
+        }
+        candidates.push(DEFAULT_LABEL);
+        candidates
+    }
+
+    /// The label a provide from this scope lands in (D15): explicit per-name
+    /// isolation wins, else the realm, else the global default.
+    #[must_use]
+    pub fn primary_label(node: Option<&Arc<Self>>, name: &str) -> u64 {
+        Self::label_candidates(node, name)[0]
     }
 
     /// Resolves the isolation label for `name`, walking outward to the root.

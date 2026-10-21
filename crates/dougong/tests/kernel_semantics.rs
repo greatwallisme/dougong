@@ -312,3 +312,81 @@ async fn update_veto_keeps_the_previous_config_live() {
         "the rejected config must not load on the next restart"
     );
 }
+
+#[tokio::test]
+async fn realm_scope_namespaces_services_with_global_fallback() -> dougong::Result<()> {
+    let ctx = Context::new();
+
+    // A global provider exists BEFORE the realm: the realm must still prefer
+    // its own instance once it provides the same name.
+    let global = plugin("global-svc", vec![], |ctx, _| {
+        Box::pin(async move {
+            ctx.provide("svc", "global".to_string()).await?;
+            Ok(())
+        })
+    });
+    ctx.plugin(global, None)?.join().await?;
+
+    let realm = ctx.isolate_realm(7);
+    let realm_provider = plugin("realm-svc", vec![], |ctx, _| {
+        Box::pin(async move {
+            ctx.provide("svc", "in-realm".to_string()).await?;
+            Ok(())
+        })
+    });
+    realm.plugin(realm_provider, None)?.join().await?;
+
+    // The realm consumer prefers its realm instance AND falls back to the
+    // global default for names the realm does not provide (still Pending
+    // here: it converges when the global-only provider arrives).
+    let realm_consumer = plugin(
+        "realm-consumer",
+        vec![Injection::new("svc"), Injection::new("only-global")],
+        |ctx, _| {
+            Box::pin(async move {
+                let probe = ctx.get::<String>("svc");
+                let epoch = ctx.fiber_epoch();
+                ctx.logger().log(
+                    dougong::LogLevel::Info,
+                    "probe",
+                    &format!("realm consumer apply: svc={probe:?} epoch={epoch:?}"),
+                );
+                assert_eq!(&*ctx.require::<String>("svc")?, "in-realm");
+                assert_eq!(&*ctx.require::<String>("only-global")?, "only-global");
+                Ok(())
+            })
+        },
+    );
+    let realm_consumer_handle = realm.plugin(realm_consumer, None)?;
+    // Expected to time out: the consumer parks until its global-only
+    // dependency shows up.
+    let _ = realm_consumer_handle
+        .join_with_timeout(std::time::Duration::from_millis(200))
+        .await;
+    assert_eq!(
+        realm_consumer_handle.state(),
+        dougong::FiberState::Pending,
+        "waiting on the global-only dependency"
+    );
+
+    let only_global = plugin("only-global", vec![], |ctx, _| {
+        Box::pin(async move {
+            ctx.provide("only-global", "only-global".to_string())
+                .await?;
+            Ok(())
+        })
+    });
+    ctx.plugin(only_global, None)?.join().await?;
+    realm_consumer_handle.join().await?;
+
+    // A root-scope consumer only ever sees the global instance: realm
+    // services do not leak past the realm boundary.
+    let root_consumer = plugin("root-consumer", vec![Injection::new("svc")], |ctx, _| {
+        Box::pin(async move {
+            assert_eq!(&*ctx.require::<String>("svc")?, "global");
+            Ok(())
+        })
+    });
+    ctx.plugin(root_consumer, None)?.join().await?;
+    Ok(())
+}

@@ -16,8 +16,8 @@ workspace = true
 greeter-plugin = { path = "../greeter-plugin" }
 
 [dependencies]
-dougong = { path = "../dougong", version = "0.1.0" }
-dougong-abi = { path = "../dougong-abi", version = "0.1.0" }
+dougong = { path = "../dougong", version = "0.2.0" }
+dougong-abi = { path = "../dougong-abi", version = "0.2.0" }
 libloading = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

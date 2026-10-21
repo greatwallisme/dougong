@@ -206,6 +206,19 @@ impl Context {
         }
     }
 
+    /// Creates a child whose provides land in the realm `label` and whose
+    /// injections prefer realm-local providers before falling back to the
+    /// global default (D15). The same label joins one realm across many
+    /// plugin starts.
+    #[must_use]
+    pub fn isolate_realm(&self, label: u64) -> Self {
+        Self {
+            root: Arc::clone(&self.root),
+            scope: ScopeNode::realm_child(&self.scope, label),
+            fiber: Weak::clone(&self.fiber),
+        }
+    }
+
     /// Allocates a fresh isolation label; pair with
     /// [`isolate_with_label`](Self::isolate_with_label) when several starts
     /// must join one realm by name (declarative hosts do exactly this).

@@ -241,7 +241,7 @@ impl Reconciler {
                     .scopes
                     .entry(scope.clone())
                     .or_insert_with(|| ctx.fresh_label());
-                ctx.isolate_with_label(scope, label)
+                ctx.isolate_realm(label)
             }
             None => ctx.clone(),
         };

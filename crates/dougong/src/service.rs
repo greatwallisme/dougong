@@ -221,25 +221,32 @@ impl DependencyIndex {
 
 /// Resolves the implementation snapshot a fiber would commit for `name`.
 ///
-/// Returns `None` when the service is absent, the provider is inactive
-/// (strict), or the availability predicate fails.
+/// Labels are tried in D15 precedence order (explicit per-name isolation,
+/// then the innermost realm, then the global default); the first label with
+/// a live implementation wins. Returns `None` when no candidate resolves,
+/// the provider is inactive (strict), or the availability predicate fails.
 pub fn resolve_impl_for(ctx: &Context, dependent: &Fiber, name: &str) -> Option<ProviderSnapshot> {
     let root = &ctx.root;
-    let label = ScopeNode::effective_label(Some(dependent.scope_node()), name);
-    let provided = {
-        let store = root.reflect.lock();
-        store.get_impl(root, name, label, true)?
-    };
-    if provided.compute.is_some() {
-        // Accessor entries commit only liveness metadata; values are computed
-        // per read against the reading context.
-        return Some(ProviderSnapshot::dynamic(provided.provider_uid));
+    let candidates = ScopeNode::label_candidates(Some(dependent.scope_node()), name);
+    for label in candidates {
+        let provided = {
+            let store = root.reflect.lock();
+            store.get_impl(root, name, label, true)
+        };
+        if let Some(provided) = provided {
+            if provided.compute.is_some() {
+                // Accessor entries commit only liveness metadata; values are
+                // computed per read against the reading context.
+                return Some(ProviderSnapshot::dynamic(provided.provider_uid));
+            }
+            return Some(ProviderSnapshot {
+                provider_uid: provided.provider_uid,
+                value: Arc::clone(&provided.value),
+                dynamic: false,
+            });
+        }
     }
-    Some(ProviderSnapshot {
-        provider_uid: provided.provider_uid,
-        value: Arc::clone(&provided.value),
-        dynamic: false,
-    })
+    None
 }
 
 /// Registers a provided service owned by the current fiber.
@@ -259,7 +266,7 @@ pub async fn provide(
     check: Option<Check>,
 ) -> Result<crate::fiber::EffectGuard> {
     let fiber = ctx.require_fiber("provide")?;
-    let label = ctx.effective_label(name);
+    let label = ScopeNode::primary_label(Some(&ctx.scope), name);
     let owner = fiber.name();
     let uid = fiber.uid_value().ok_or_else(Error::inactive_effect)?;
     let self_value = Arc::clone(&value);
@@ -328,7 +335,7 @@ pub async fn accessor(
     compute: Compute,
 ) -> Result<crate::fiber::EffectGuard> {
     let fiber = ctx.require_fiber("accessor")?;
-    let label = ctx.effective_label(name);
+    let label = ScopeNode::primary_label(Some(&ctx.scope), name);
     let owner = fiber.name();
     let uid = fiber.uid_value().ok_or_else(Error::inactive_effect)?;
     let provided = Provided {
@@ -376,7 +383,7 @@ pub async fn accessor(
 /// Fails when the service is not provided by this fiber.
 pub fn set(ctx: &Context, name: &str, value: Arc<dyn Any + Send + Sync>) -> Result<()> {
     let fiber = ctx.fiber().ok_or_else(Error::inactive_effect)?;
-    let label = ctx.effective_label(name);
+    let label = ScopeNode::primary_label(Some(&ctx.scope), name);
     let uid = fiber.uid_value().ok_or_else(Error::inactive_effect)?;
     {
         let mut store = ctx.root.reflect.lock();
