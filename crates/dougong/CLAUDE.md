@@ -9,8 +9,8 @@ The composition kernel. Everything else in the workspace adapts to its semantics
 - **Panic containment**: the plugin body runs on its own tokio task; a panic becomes a JoinError and maps to `fail_load`. The driver task must always survive.
 - **Restart force**: `force = loaded != EPOCH_INACTIVE` — restarts of an inactive fiber must not trigger a spurious third activation.
 - **`get`/`require` semantics** mirror TS Algorithm 6 (see root CLAUDE.md); the two error kinds are load-bearing for the boundary hosts' error mapping.
-- **Drain ordering**: provider disposal drains consumers before its own effects unwind (`service.rs` disposer `join`s consumers). The reverse-dependency index (`relied`) is O(1) and must stay consistent across commit/refresh/dispose — the linear scan remains as a debug reconciliation path only.
-- **Events**: five modes at dispatch time; `internal/*` bypasses `internal/dispatch` recursion; `internal/update` may veto config updates (`Fiber::update`).
+- **Drain ordering**: the provide-disposer removes the impl, notifies dependents, and joins every touched fiber, so consumers converge before the provider finishes unwinding (`service.rs`). The reverse-dependency index (`relied`) is O(1) and must stay consistent across commit/uncommit/dispose.
+- **Events**: five modes at dispatch time, threaded to `DispatchListener` bridges (`Context::on_dispatch`; `internal/*` names reject bridges); `internal/*` bypasses `internal/dispatch` recursion; `internal/update` may veto config updates (`Fiber::update`) — the accepted config is persisted only in the waterfall tail, so a veto leaves the previous config live.
 - **Parking_lot everywhere**: std Mutex poisoning is deliberately absent; do not reintroduce `std::sync::Mutex`.
 
 ## Where things live

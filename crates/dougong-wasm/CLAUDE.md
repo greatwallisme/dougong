@@ -18,7 +18,7 @@ The `clippy::significant_drop_tightening` allowances on the store guards are int
 
 ## Contract
 
-`wit/dougong-plugin.wit` is the single source (`dougong:kernel@0.1.0`); the host-side mapping of kernel errors lives in `error.rs` (`to_wit`/`to_kernel` preserve the two-level resolution distinction). `CONTRACT_ABI_HASH` stamps every service/event key. Teardown handle `0` is reserved; `effect-collect` allocates from 1.
+`wit/dougong-plugin.wit` is the single source (`dougong:kernel@0.1.0`); the host-side mapping of kernel errors lives in `error.rs` (`to_wit`/`to_kernel` preserve the two-level resolution distinction). `CONTRACT_ABI_HASH` stamps every service/event key. Teardown handle `0` is reserved; `effect-collect` allocates from 1. `arm_budget` re-arms fuel and the epoch deadline (`delta = WasmLimits.epoch_ticks_per_yield`) before every guest entry.
 
 ## Testing
 
