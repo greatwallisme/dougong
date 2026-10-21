@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
 description = "declarative config and reconciliation for dougong plugin sets"
 
 [lints]

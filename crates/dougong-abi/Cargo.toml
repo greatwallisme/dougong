@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
 description = "Stable C-ABI contract between a dougong host and dynamically loaded plugins"
 
 [lints]

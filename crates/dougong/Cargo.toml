@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
 description = "Cordis-style composition kernel: reversible effects and reactive dependency injection"
 
 [lints]
