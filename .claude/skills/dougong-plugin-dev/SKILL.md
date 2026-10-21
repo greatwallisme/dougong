@@ -50,12 +50,18 @@ Five obligations, same shape in all three forms:
    waterfall) are chosen **at dispatch time**, never at registration. In
    waterfall, a listener that drops the `Next` token vetoes the rest of the
    chain. `internal/*` events are framework extension points with scope
-   filtering - do not collide with that prefix.
-5. **Dispose** - the kernel reverses registrations LIFO on withdrawal, and a
-   provider's consumers are drained *before* the provider's effects unwind
-   (drain protocol). Handle `0` (wasm `run-disposer`, dylib `teardown` export)
-   is the plugin teardown. To run code *last* at teardown, register it
-   **first** in `apply` - LIFO ordering does the rest.
+   filtering - do not collide with that prefix. Boundary adapters register
+   **mode-aware bridges** (`Context::on_dispatch`) that receive the dispatch
+   mode; the dylib form declares listened events in its descriptor and pulls
+   a waterfall continuation through the v2 CPS protocol (`STATUS_DEFERRED`
+   -> host resolves -> `on_next`).
+5. **Dispose** - the kernel reverses registrations LIFO on withdrawal; the
+   provide-disposer removes the implementation, notifies dependents, and
+   joins every touched consumer fiber, so consumers converge before the
+   provider finishes unwinding (drain protocol). Handle `0` (wasm
+   `run-disposer`, dylib `teardown` export) is the plugin teardown. To run
+   code *last* at teardown, register it **first** in `apply` - LIFO ordering
+   does the rest.
 
 Config arrives as `serde_json::Value` (in-process) or JSON bytes
 (dylib descriptor / wasm `apply`); validate it at the top of the body.
@@ -65,7 +71,7 @@ Config arrives as `serde_json::Value` (in-process) or JSON bytes
 | Reference | Read when |
 |-----------|-----------|
 | [kernel-model.md](references/kernel-model.md) | Writing in-process Rust plugins; need the Context API, event modes, effect collection, error model, or loader config format. Explains the shared semantics all forms inherit. |
-| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: export table, JSON descriptor, buffer protocol, status codes, state and teardown. |
+| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: v2 export table, JSON descriptor (incl. `listen`), buffer protocol, CPS event protocol, state and teardown. |
 | [wasm-plugin.md](references/wasm-plugin.md) | Building a wasm component: crate layout, WIT bindings, Guest impl, JSON payload rules, sandbox expectations, host-side requirements. |
 
 ## 4. Verification
@@ -95,6 +101,11 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   vs `inactive_dependency` tells you which half failed.
 - Wasm event listener never fires: registration happens in `apply`, not at
   export time - the guest must call `register_listener` during `apply`.
+- Dylib event listener never fires: the descriptor's `listen` map is missing
+  the event, or the host rejects the v1 table - events need ABI v2
+  (`on_next` export present) plus the `listen` declaration.
+- Dylib waterfall: return `STATUS_DEFERRED` only when `next_available == 1`;
+  deferring outside waterfall, or from `on_next`, is rejected by the host.
 - Wasm replies must be **valid JSON bytes** - a bare string needs quotes
   (`"\"pong\""`), or the host-side decode fails.
 - Wasm host: a `wasm32-wasip2` guest built with std always declares

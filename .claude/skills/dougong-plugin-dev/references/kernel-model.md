@@ -47,6 +47,10 @@ handle.update(new_config)?;                                    // hot update (ma
 ctx.uninstall(&plugin_object).await;                           // LIFO teardown + drain
 ```
 
+A vetoing `internal/update` hook (one that never pulls `Next`) leaves the
+previous config live: the accepted config is persisted only in the update
+waterfall's tail, so a later `restart()` never loads a rejected config.
+
 A plugin started inside another plugin's fiber becomes an *effect of the
 parent*: unloading the parent cascades to the child. The top-level entry is
 `ctx.inject(deps, callback)`, which starts an anonymous root fiber once the
@@ -96,19 +100,26 @@ above are thin wrappers; for anything custom:
 ```rust
 ctx.effect("open-file", async {
     let file = open(...)?;
-    Ok(Some(Disposer::new("close-file", move |_ctx| async move {
-        // cleanup; runs LIFO on withdrawal
-    })))
+    let disposer: dougong::Disposer = Box::new(move || {
+        Box::pin(async move {
+            // cleanup; runs LIFO on withdrawal
+        })
+    });
+    Ok(Some(disposer))
 }).await?;
 ```
+
+`Disposer` is `Box<dyn FnOnce() -> BoxFuture<()> + Send>` - a boxed
+async cleanup thunk, no constructor ceremony.
 
 To run code *last* at teardown, register it *first* in `apply` - LIFO does
 the rest. This is the same invariant the dylib/wasm adapters encode by
 registering the teardown effect before anything else.
 
-Provider withdrawal additionally **drains consumers first**: a service's
-disposer joins all consumer fibers that relied on it (reverse-dependency
-index) before the provider's own effects unwind. Never depend on a service
+Provider withdrawal additionally **drains consumers**: the provide-disposer
+removes the implementation, notifies dependents, and joins every touched
+consumer fiber (reverse-dependency index) before returning - so consumers
+converge before the provider finishes unwinding. Never depend on a service
 outliving your fiber's disposal.
 
 ## Events: five modes at dispatch time
@@ -134,6 +145,14 @@ In waterfall, `next.call(transformed_payload).await?` advances the chain;
 fallback. `dougong::is_bailed(&value)` checks a bail marker. `internal/*`
 event names are framework extension points with scope filtering - never
 dispatch user traffic under that prefix.
+
+Boundary adapters register **mode-aware bridges** instead: `Context::
+on_dispatch(name, listener)` takes a
+`DispatchListener = Arc<dyn Fn(Context, Value, Next, DispatchMode) ->
+BoxFuture<Result<Value>> + Send + Sync>` whose last parameter carries the
+dispatch mode of each invocation. Bridges cannot subscribe to `internal/*`
+events. This is how `dougong-dylib` forwards events across the C boundary
+(the descriptor's `listen` map drives the registrations).
 
 ## Isolation scopes
 
