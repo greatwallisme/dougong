@@ -3,6 +3,10 @@ name = "dougong-loader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "declarative config and reconciliation for dougong plugin sets"
 
 [lints]
@@ -12,9 +16,9 @@ workspace = true
 tokio = { workspace = true }
 
 [dependencies]
-dougong = { path = "../dougong" }
-dougong-dylib = { path = "../dougong-dylib" }
-dougong-wasm = { path = "../dougong-wasm" }
+dougong = { path = "../dougong", version = "0.1.0" }
+dougong-dylib = { path = "../dougong-dylib", version = "0.1.0" }
+dougong-wasm = { path = "../dougong-wasm", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

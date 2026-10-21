@@ -3,13 +3,17 @@ name = "dougong-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "wasm component plugin host for the dougong kernel"
 
 [lints]
 workspace = true
 
 [dependencies]
-dougong = { path = "../dougong" }
+dougong = { path = "../dougong", version = "0.1.0" }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
