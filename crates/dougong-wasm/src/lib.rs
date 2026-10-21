@@ -69,7 +69,7 @@ mod bindings {
 
     bindgen!({
         world: "dougong-plugin",
-        path: "../../wit",
+        path: "wit",
         imports: { default: async },
         exports: { default: async },
     });
