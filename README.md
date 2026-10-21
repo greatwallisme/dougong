@@ -90,5 +90,5 @@ dougong 站在这些开源项目的肩膀上（完整证据链见 [doc/research/
 
 - **语义对齐（复现并有测试钉住）**：可逆 effect 与 LIFO 回滚、epoch 驱动的收敛/重激活、两级依赖解析检查（TS Algorithm 6，`inactive_dependency` vs `undeclared_dependency`）、事件五模式（`isBailed` 非空即断、waterfall 跳过 `next` 即否决、`internal/*` 递归保护）、isolate 域与 scope 遮蔽、provider 卸载先 drain 消费者、声明式期望态 reconcile（insert/update/retire/失败隔离）、插件 body panic 隔离为加载失败。验收映射：`tests/acceptance.rs`（论文 §15 场景）、`tests/kernel_semantics.rs`（上游兼容面）。
 - **dougong 特有的技术折中（原版无需面对）**：原版是 TS 架构，插件由语言运行时装载进同一进程，边界天然稳定，不需要任何 ABI。dougong 的三个形态里有两个跨越独立编译产物，而 Rust 恰恰没有跨产物的稳定 ABI——"三种形态共享一个语义契约"因此只能靠**显式定义边界契约**达成，这是折中而非加成：dylib 侧付出 C-ABI v2 契约与缓冲协议/显式序列化（事件续链还得用 D14 的 CPS 方案绕开"同步 C 回调无法 await"）；wasm 侧付出沙箱工程（capability-empty WASI + fuel/epoch/内存帽）；两个边界都引入每实例串行化约束。进程内形态则与原版一样，不付这些代价。
-- **有意不对齐**：Node 专属机制（prototype context、pnpm/bundle/HMR 生态）不做平移；capability 策略库属应用层（dsh 语境），不进内核；`cordis.patch.yml` 的有序分层由声明式文档的响应式收敛替代（dougong 不需要层序）。
+- **有意不对齐**：Node 专属机制（prototype context、pnpm/bundle/HMR 生态）不做平移；capability 策略库属应用层（dsh 语境），不进内核；`cordis.patch.yml` 的有序分层由"整文档替换 + 响应式收敛"替代——结果只取决于最终文档，歧义靠硬拒而非层序仲裁（dougong 不需要层序，论证见 D9 落地记录）。
 - **文档资产来源**：[cordis.md](doc/research/cordis.md) 是第三方撰写的论文全文分析（论文本体 arXiv:2608.25512，PKU/DeepSeek-AI），获取自 [acryldev/cordis-meta-framework-spatiotemporal-composability](https://github.com/acryldev/cordis-meta-framework-spatiotemporal-composability)，存档作研究参考，非本项目作品——详见该文件内的来源标注。

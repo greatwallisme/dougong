@@ -79,6 +79,7 @@ waterfall 跨边界 = 宿主持剩余链 + next-token（cordis_wasm 已建模；
   - **scope→label 映射在 loader**：`ctx.isolate(name)` 每次 mint 新 label，同名 isolate 不会自动同 realm；loader 自持 `scopes: name→label`（`ctx.fresh_label()` 分配），同文档同 scope 的插件共用一个 label。
   - `builtin` source：基座自带插件（harness 自己的进程内插件）与外部 artifact 走同一套声明式管理（TS cordis 场景即如此）；从 Reconciler 构造时注册的注册表解析。
   - **文件监视不在 loader**：watcher 是事件源而非收敛逻辑；任何触发器（inotify/configmap/REPL）把新文档喂给 `replace + apply` 即复用同一条收敛路径——可分性论证成立，非功能回避。
+  - **层序可省的论证（2026-10-21，README 对齐声明追溯）**：dsh 的有序分层承担两件事——(1) 冲突仲裁（多份 patch 顺序折叠，同 id 行最后写入者胜，必须定义优先级）；(2) 启动次序（挂载即启动，依赖未就绪需排在提供者之后）。dougong 中这两件事分别被消解：(1) 文档是完整期望态，变更 = `replace` 整份替换，最新文档即唯一事实源；歧义（重复槽名 / 同名服务同标签重复 provide）一律硬拒而非按序仲裁；(2) 就绪次序由 Pending 语义吸收——所有 fiber 一次性启动，消费者依赖未就绪即挂起、提供者 commit 后自动收敛，文档行序与收敛无关（有测试钉住）。合流性（Thm73）保证结果只依赖最终文档：即便未来引入分层/patch 语法，也只是 `replace` 之前的文档预处理，内核语义不变——"不需要层序"是被合流性消解的，不是未实现。代价如实：dsh 分层的"预定义栈复用 + 局部小补丁"人体工学（profile 堆 bundle）由调用方在 `replace` 前自行拼装文档承担，属格式层取舍，不影响内核。
   - fingerprint：serde_json Map 为有序结构，`to_string` 即规范序（键序不敏感，有单测）。
 - 语义不可分部分 = 内核意图面：insert(plugin, config, scope) / update-config / retire / isolate 声明——已含于内核 API（ctx.plugin/update/dispose/isolate），随内核一并交付。
 - 可分部分 = 文件格式层（yaml/json、include/patch、文件监视）= 独立 crate **dougong-loader**，与内核同一代码库一并交付。可分性论证：Thm73 合流性保证 loader 正确性只依赖最终配置，内核不因 loader 缺位而改契约。
