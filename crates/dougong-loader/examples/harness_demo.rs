@@ -4,31 +4,32 @@
 //! Real harnesses are not one plugin: they are many plugins with declared
 //! inter-plugin dependencies, swappable capability seams, and event-driven
 //! extension points (see `deepseek-harness/docs/architecture.md`). This
-//! example composes NINE plugin slots in ONE desired-state document and
-//! proves the composition live:
+//! example walks the FULL developer workflow against two real document
+//! files (`harness.json`, `harness.upper.json`, next to this file):
 //!
-//! - in-process plugins: `settings` (config service), `telemetry`
-//!   (capability event attached without importing anything), `llm` (the
-//!   swappable seam), `tools` (registry), `guard` (policy attached purely
-//!   via a waterfall veto - it injects nothing), `agent-a` / `agent-b`
-//!   (consume `harness.llm` + `harness.tools` + settings persona);
-//! - boundary sources mixed into the same document: the greeter dylib and
-//!   the greeter wasm component (prerequisite: the wasip2 guest artifact);
-//! - a **seam swap**: the second document replaces the `llm` row's builtin
-//!   adapter (echo -> upper). `Reconciler::apply` hot-restarts the row, the
-//!   agents re-resolve the provider identity reactively, and the next turn
-//!   is post-processed - "one provider swap changes the whole product"
-//!   without touching any consumer code.
+//! 1. **Load** - boot NINE plugin slots from one document file: 7 in-process
+//!    plugins (`settings`, `telemetry`, `tools`, `guard`, the `llm` seam,
+//!    `agent-a`, `agent-b`) plus the greeter dylib and the greeter wasm
+//!    component mixed into the same document;
+//! 2. **Depend** - the agents declare `inject: [harness.llm, harness.tools,
+//!    harness.settings]` and are wired reactively, regardless of row order;
+//! 3. **Swap** - apply the second document (the `llm` row's config selects
+//!    the `upper` adapter): the row hot-restarts and the consumers re-resolve
+//!    the provider identity - "one provider swap changes the whole product";
+//! 4. **Retire** - delete the `agent-b` row from the document: `apply`
+//!    uninstalls exactly that slot (consumers drained first) and leaves the
+//!    rest of the document untouched.
 //!
 //! Run: `cargo run -p dougong-loader --example harness_demo`
 //! (needs `cargo build --workspace` and the wasip2 guest artifact).
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use dougong::{Context, Error, Injection};
-use dougong_loader::{Config, Reconciler};
+use dougong::{Context, Error, Injection, Result};
+use dougong_loader::{Config, Reconciler, Source};
 use dougong_wasm::{WasmHost, WasmLimits};
 use serde_json::{Value, json};
 
@@ -260,11 +261,6 @@ fn agent_plugin(name: &'static str, label: &'static str) -> Arc<dyn dougong::Plu
                                 },
                             )
                             .await?;
-                        logger.log(
-                            dougong::LogLevel::Info,
-                            label,
-                            &format!("tools/pre-execute verdict = {verdict}"),
-                        );
                         let tool_result =
                             if verdict.get("vetoed").and_then(Value::as_bool) == Some(true) {
                                 json!({ "tool": wanted_tool, "ran": false, "vetoed": true,
@@ -295,31 +291,45 @@ fn agent_plugin(name: &'static str, label: &'static str) -> Arc<dyn dougong::Plu
     })
 }
 
-fn artifact_dir() -> std::path::PathBuf {
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+fn artifact_dir() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.extend(["../../", "target"]);
     path
 }
 
-fn document(llm_adapter: &str) -> Config {
-    let artifact_dir = artifact_dir();
-    let dir = artifact_dir.display();
-    let wasm = artifact_dir.join("wasm32-wasip2/debug/greeter_wasm.wasm");
-    let doc = format!(
-        r#"{{"plugins":[
-        {{"name":"settings","source":{{"kind":"builtin","name":"settings"}},"config":{{"persona":"dougong-miniharness"}},"isolate":null}},
-        {{"name":"telemetry","source":{{"kind":"builtin","name":"telemetry"}},"config":null,"isolate":null}},
-        {{"name":"tools","source":{{"kind":"builtin","name":"tools"}},"config":null,"isolate":null}},
-        {{"name":"guard","source":{{"kind":"builtin","name":"guard"}},"config":null,"isolate":null}},
-        {{"name":"llm","source":{{"kind":"builtin","name":"llm"}},"config":{{"adapter":"{llm_adapter}"}},"isolate":null}},
-        {{"name":"agent-a","source":{{"kind":"builtin","name":"agent"}},"config":{{"label":"A"}},"isolate":null}},
-        {{"name":"agent-b","source":{{"kind":"builtin","name":"agent"}},"config":{{"label":"B"}},"isolate":null}},
-        {{"name":"greeter-dylib","source":{{"kind":"dylib","path":"{dir}/debug/libgreeter_plugin.so"}},"config":null,"isolate":null}},
-        {{"name":"greeter-wasm","source":{{"kind":"wasm","path":"{}"}},"config":null,"isolate":null}}
-    ]}}"#,
-        wasm.display(),
-    );
-    Config::parse(&doc).expect("harness document is valid")
+fn examples_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
+}
+
+/// Loads one document file and resolves the artifact paths: the committed
+/// documents reference build outputs relative to the workspace root, so the
+/// example re-anchors them to this checkout's `target/` and runs from any
+/// working directory.
+fn load_document(file: &str) -> Result<Config> {
+    let mut config = Config::load_file(&examples_dir().join(file))
+        .map_err(|err| Error::msg(format!("load {file}: {err}")))?;
+    let artifacts = artifact_dir();
+    for spec in &mut config.plugins {
+        let file_name = |path: &str| Path::new(path).file_name().unwrap_or_default().to_owned();
+        match &mut spec.source {
+            Source::Dylib { path } => {
+                *path = artifacts
+                    .join("debug")
+                    .join(file_name(path))
+                    .display()
+                    .to_string();
+            }
+            Source::Wasm { path } => {
+                *path = artifacts
+                    .join("wasm32-wasip2/debug")
+                    .join(file_name(path))
+                    .display()
+                    .to_string();
+            }
+            Source::Builtin { .. } => {}
+        }
+    }
+    Ok(config)
 }
 
 fn builtins() -> HashMap<String, Arc<dyn dougong::Plugin>> {
@@ -354,9 +364,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut reconciler = Reconciler::new(builtins(), Some(Arc::new(host)));
 
-    // Boot the whole harness from one document: in-process plugins, the
-    // dylib greeter, and the wasm greeter share the same desired state.
-    reconciler.replace(document("echo"));
+    // Phase 1 - load: boot the whole harness from one document file
+    // (in-process plugins, the dylib greeter, and the wasm greeter share the
+    // same desired state).
+    reconciler.replace(load_document("harness.json")?);
     let report = reconciler.apply(&ctx).await;
     assert!(
         report.failures.is_empty(),
@@ -377,8 +388,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     log("booted: 9 slots from one document (builtin + dylib + wasm)".to_string());
 
-    // Turn 1 over the echo adapter: the waterfall dispatch reaches both
-    // agents (same event, two independent plugin instances).
+    // The agents declared their dependencies and were wired reactively -
+    // row order in the document never mattered.
     let first = ctx
         .waterfall("agent/turn", json!({ "prompt": "hello harness" }), |p| {
             Box::pin(async move { Ok(p) })
@@ -395,10 +406,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     log(format!("turn 1 (echo seam): {first}"));
 
-    // Seam swap by config alone: replace the llm row's builtin adapter. The
-    // reconciler hot-restarts the row, consumers re-resolve the provider
-    // identity, and the next turn is post-processed - no consumer changes.
-    reconciler.replace(document("upper"));
+    // Phase 2 - swap: the new document selects the `upper` adapter for the
+    // llm row. The reconciler hot-restarts that row, the consumers re-resolve
+    // the provider identity, and the next turn is post-processed - no
+    // consumer changes.
+    reconciler.replace(load_document("harness.upper.json")?);
     let report = reconciler.apply(&ctx).await;
     assert_eq!(
         report.updated,
@@ -426,6 +438,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "consumers rewired to the new seam provider"
     );
     log(format!("turn 2 (upper seam after swap): {second}"));
+
+    // Phase 3 - retire: deleting a row from the document uninstalls exactly
+    // that slot. Consumers of retired slots are drained first; everything
+    // else in the document stays untouched.
+    let mut doc = load_document("harness.json")?;
+    doc.plugins.retain(|spec| spec.name != "agent-b");
+    reconciler.replace(doc);
+    let report = reconciler.apply(&ctx).await;
+    assert_eq!(
+        report.retired,
+        vec!["agent-b".to_string()],
+        "exactly the deleted row retired"
+    );
+    assert!(report.failures.is_empty());
+    assert!(
+        !reconciler.live().contains_key("agent-b"),
+        "agent-b is gone"
+    );
+    handle(&reconciler, "agent-a")?.join().await?;
+    log("agent-b retired by deleting its row; agent-a unaffected".to_string());
 
     ctx.stop().await;
     log("done: multi-plugin composition verified".to_string());

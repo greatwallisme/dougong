@@ -1,0 +1,13 @@
+{
+  "plugins": [
+    { "name": "settings", "source": { "kind": "builtin", "name": "settings" }, "config": { "persona": "dougong-miniharness" }, "isolate": null },
+    { "name": "telemetry", "source": { "kind": "builtin", "name": "telemetry" }, "config": null, "isolate": null },
+    { "name": "tools", "source": { "kind": "builtin", "name": "tools" }, "config": null, "isolate": null },
+    { "name": "guard", "source": { "kind": "builtin", "name": "guard" }, "config": null, "isolate": null },
+    { "name": "llm", "source": { "kind": "builtin", "name": "llm" }, "config": { "adapter": "echo" }, "isolate": null },
+    { "name": "agent-a", "source": { "kind": "builtin", "name": "agent" }, "config": { "label": "A" }, "isolate": null },
+    { "name": "agent-b", "source": { "kind": "builtin", "name": "agent" }, "config": { "label": "B" }, "isolate": null },
+    { "name": "greeter-dylib", "source": { "kind": "dylib", "path": "target/debug/libgreeter_plugin.so" }, "config": null, "isolate": null },
+    { "name": "greeter-wasm", "source": { "kind": "wasm", "path": "target/wasm32-wasip2/debug/greeter_wasm.wasm" }, "config": null, "isolate": null }
+  ]
+}

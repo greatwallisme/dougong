@@ -46,6 +46,30 @@ cargo run -p dougong-loader --example harness_demo  # 9 槽混合来源（builti
 
 dougong 以 crate 形态被宿主项目引入（`dougong` / `dougong-dylib` / `dougong-wasm` / `dougong-loader`）。本仓库为**下游项目**的 AI 编码准备了现成技能：[`skills/dougong-plugin-dev/`](skills/dougong-plugin-dev/)。把该目录复制到宿主项目的 `.claude/skills/` 下（Claude Code 等工具会自动发现项目级技能），AI 即可按 dougong 的真实契约开发插件——形态选型、dylib 导出表与描述符、v2 CPS 事件协议、wasm 沙箱约束、验证命令与常见陷阱——而不是凭通用知识猜 API。
 
+## 插件开发工作流
+
+四个动作贯穿插件的一生（可运行对照：[`crates/dougong-loader/examples/harness_demo.rs`](crates/dougong-loader/examples/harness_demo.rs) + 同目录的 [`harness.json`](crates/dougong-loader/examples/harness.json)）：
+
+**1. 开发** —— 选一种形态，只写"声明 + 注册"，不写卸载逻辑：
+
+- 进程内（最简）：`dougong::plugin("名字", 依赖列表, |ctx, 配置| ...)`，激活体里用 `ctx.provide("服务名", 值)` 注册能力；
+- dylib：cdylib crate，只依赖 `dougong-abi`，写导出表（照 `greeter-plugin`）；
+- wasm：wit-bindgen 实现 Guest trait（照 `greeter-wasm`），跑在沙箱里。
+
+**2. 加载** —— 写一份 JSON 期望态文档（每个插件一行：名字 / 来源 `builtin`·`dylib`·`wasm` / 配置 / 隔离域，见 [`harness.json`](crates/dougong-loader/examples/harness.json)），宿主加载并收敛：
+
+```rust
+let mut reconciler = Reconciler::new(内置插件表, wasm宿主);
+reconciler.replace(Config::load_file("harness.json")?);
+reconciler.apply(&ctx).await;      // 文档里的所有插件自动启动
+```
+
+**3. 声明依赖** —— 插件用 `inject` 列出需要的服务名，其余交给内核：提供者没上线就停在 `Pending`，上线即自动激活（文档行序无关）；不声明就用会被直接拒绝（能力检查）；提供者被替换，消费者自动重接线。
+
+**4. 卸载** —— 从文档里**删掉那一行**，重新 `replace` + `apply`：该插件被精确卸载，它的消费者先被 drain，注册的资源按 LIFO 自动回滚——不需要手写任何卸载代码。代码路径等价物：`handle.dispose()` / `ctx.uninstall(&插件)` / `ctx.stop()`。
+
+例外说明：dylib 的代码镜像进程内不卸载（换 .so 版本 = 重启进程）；其配置可随时 `handle.update(新配置)` 热更，不受影响。
+
 ## 内核一句话
 
 插件声明依赖（`inject`）并在激活体（`apply`）里只经 `ctx.effect`/`ctx.provide` 修改环境；
