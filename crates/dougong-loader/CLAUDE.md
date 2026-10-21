@@ -17,4 +17,4 @@ File watching. A watcher is an event source, not reconciliation logic — feed t
 
 ## Tests
 
-`cargo test -p dougong-loader` (behavior: lifecycle, scope sharing, failure isolation; plus fingerprint). `examples/loader_demo.rs` runs the full lifecycle against the dylib greeter artifact (built by `cargo build --workspace`).
+`cargo test -p dougong-loader` (behavior: lifecycle, scope sharing, failure isolation; plus fingerprint). `examples/loader_demo.rs` runs the full lifecycle against the dylib greeter artifact (built by `cargo build --workspace`). `examples/harness_demo.rs` composes NINE slots from one document — in-process plugins with cross-plugin injects (settings/llm seam/tools/agent), a policy guard attached purely via a waterfall veto, mixed builtin+dylib+wasm sources, and a config-only seam swap (echo -> upper) that hot-restarts the row and reactively rewires its consumers.

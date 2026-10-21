@@ -7,6 +7,15 @@
 
 > This document is a full second-pass analysis of the paper. It follows the paper's actual structure, covers every substantive section, reconstructs the numbered equations (1)–(65) in portable LaTeX, summarizes the main definitions/theorems/algorithms, and then translates the results into concrete architectural implications for ACRYL.
 
+> **来源标注（provenance, 2026-10-21）**：论文本体为 Yifan Shi、Wei Zhang、
+> Tianyi Cui（Peking University / DeepSeek-AI），*A Programming Paradigm for
+> Spatiotemporal Composability*，arXiv:2608.25512（2026-08-26；官方仓库
+> [cordiverse/paper](https://github.com/cordiverse/paper)，参考实现
+> [cordiverse/cordis](https://github.com/cordiverse/cordis)）。**本文件并非
+> dougong 项目作品**：它是第三方撰写的全文二次分析，经第三方仓库获取后仅作
+> 研究参考存档于此；文中 ACRYL 等提法属原分析者的项目语境，与 dougong 无关；
+> 权利归原作者所有。
+
 ---
 
 # 0. What the paper is actually claiming
