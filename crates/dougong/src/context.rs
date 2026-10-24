@@ -24,20 +24,30 @@ use crate::plugin::{BoxFuture, Injection, Plugin};
 use crate::registry;
 use crate::scope::{DEFAULT_LABEL, ScopeNode};
 use crate::service::{DependencyIndex, ReflectStore};
+use crate::shard::ShardMap;
 
 /// State shared by every context derived from one root.
+///
+/// The hot structures (`reflect`, `index`, `fibers`) are striped internally
+/// (P1, `shard.rs`); the plugin registry and event store keep a single lock
+/// (cold path / P6 scope), and the active set is an O(1)-per-flip mirror.
+///
+/// Lock-order rule: no root-state structure lock (stripe or single) is ever
+/// held while acquiring another structure's lock or a fiber-internal lock —
+/// cross-structure flows snapshot under one lock, release it, then act. An
+/// S6 group-section lock is always the outermost lock.
 pub struct RootState {
     pub(crate) registry: Mutex<registry::RegistryMap>,
-    pub(crate) reflect: Mutex<ReflectStore>,
+    pub(crate) reflect: ReflectStore,
     pub(crate) events: Mutex<crate::events::EventStore>,
     /// Every live fiber by uid.
-    pub(crate) fibers: Mutex<HashMap<u64, Weak<Fiber>>>,
+    pub(crate) fibers: ShardMap<u64, Weak<Fiber>>,
     /// The immortal root fiber (uid 0); owns built-in listeners/effects.
     pub(crate) root_fiber: std::sync::OnceLock<Arc<Fiber>>,
     pub(crate) counter: AtomicU64,
     pub(crate) label_seed: AtomicU64,
     /// Reverse indexes (design decision D12).
-    pub(crate) index: Mutex<DependencyIndex>,
+    pub(crate) index: DependencyIndex,
     /// Lock-free-friendly mirror of which fiber uids are `Active`.
     pub(crate) active: Mutex<HashSet<u64>>,
     /// Timeout budgets for the critical async paths (S3); fixed at
@@ -52,7 +62,7 @@ pub struct RootState {
 impl std::fmt::Debug for RootState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RootState")
-            .field("live_fibers", &self.fibers.lock().len())
+            .field("live_fibers", &self.fibers.total_entries())
             .finish_non_exhaustive()
     }
 }
@@ -88,22 +98,30 @@ impl RootState {
 
     pub(crate) fn register_fiber(&self, fiber: &Arc<Fiber>) {
         if let Some(uid) = fiber.uid_value() {
-            self.fibers.lock().insert(uid, Arc::downgrade(fiber));
+            self.fibers.write(&uid, |table| {
+                table.insert(uid, Arc::downgrade(fiber));
+            });
         }
     }
 
     /// Removes a disposed fiber: fiber table plus dependency indexes.
     pub(crate) fn remove_fiber(&self, uid: u64, inject_names: &[String]) {
-        self.fibers.lock().remove(&uid);
+        self.fibers.write(&uid, |table| {
+            table.remove(&uid);
+        });
         // The disposed fiber cannot refresh its own mirror any more (its uid
         // is cleared first), so drop the active-set entry here.
         self.active.lock().remove(&uid);
-        self.index.lock().remove_fiber(uid, inject_names);
+        self.index.remove_fiber(uid, inject_names);
+    }
+
+    /// Upgrades the table entry for `uid` to a strong fiber reference.
+    pub(crate) fn fiber_by_uid(&self, uid: u64) -> Option<Arc<Fiber>> {
+        self.fibers.read(&uid, |slot| slot.and_then(Weak::upgrade))
     }
 
     pub(crate) fn context_of(&self, uid: u64) -> Option<Context> {
-        let fiber = self.fibers.lock().get(&uid)?.upgrade()?;
-        Some(fiber.ctx())
+        self.fiber_by_uid(uid).map(|fiber| fiber.ctx())
     }
 }
 
@@ -176,13 +194,13 @@ impl Context {
     pub fn new_with_options(options: ContextOptions) -> Self {
         let root = Arc::new(RootState {
             registry: Mutex::new(HashMap::new()),
-            reflect: Mutex::new(ReflectStore::default()),
+            reflect: ReflectStore::default(),
             events: Mutex::new(crate::events::EventStore::default()),
-            fibers: Mutex::new(HashMap::new()),
+            fibers: ShardMap::new(),
             root_fiber: std::sync::OnceLock::new(),
             counter: AtomicU64::new(0),
             label_seed: AtomicU64::new(1),
-            index: Mutex::new(DependencyIndex::default()),
+            index: DependencyIndex::default(),
             active: Mutex::new(HashSet::new()),
             timeouts: options.timeouts,
             policies: options.policies,
@@ -201,7 +219,7 @@ impl Context {
 
         // Seed the built-in logger (provider: root fiber, uid 0).
         let logger_value = Arc::new(LoggerHandle::new(Arc::new(StderrLogger)));
-        root.reflect.lock().seed(
+        root.reflect.seed(
             crate::service::Provided {
                 name: "logger".to_string(),
                 value: logger_value,
@@ -343,10 +361,7 @@ impl Context {
             }
         }
         let label = self.effective_label(name);
-        let provided = {
-            let store = self.root.reflect.lock();
-            store.get_impl(&self.root, name, label, true)?
-        };
+        let provided = self.root.reflect.get_impl(&self.root, name, label, true)?;
         if let Some(compute) = &provided.compute {
             let computed = compute(self)?;
             return crate::policy::maybe_quarantine(&self.root, provided.provider_uid, computed)
@@ -646,12 +661,14 @@ impl Context {
     /// Number of live fibers known to this root.
     #[must_use]
     pub fn live_fibers(&self) -> usize {
-        self.root
-            .fibers
-            .lock()
-            .values()
-            .filter(|weak| weak.upgrade().is_some())
-            .count()
+        let mut live = 0;
+        self.root.fibers.for_each_shard(|table| {
+            live += table
+                .values()
+                .filter(|weak| weak.upgrade().is_some())
+                .count();
+        });
+        live
     }
 
     /// True when `uid` is an active fiber (root is always active).
@@ -664,7 +681,7 @@ impl Context {
     /// `uid` as a provider (the drain-protocol predicate, paper Eq. 46).
     #[must_use]
     pub fn relied(&self, uid: u64) -> bool {
-        self.root.index.lock().relied(uid)
+        self.root.index.relied(uid)
     }
 
     /// True when `plugin` has at least one live fiber.

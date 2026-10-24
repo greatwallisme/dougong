@@ -74,10 +74,7 @@ pub fn plugin(
     };
     child.bind(&child_ctx);
     ctx.root.register_fiber(&child);
-    ctx.root
-        .index
-        .lock()
-        .add_interest(uid, &child.inject_names());
+    ctx.root.index.add_interest(uid, &child.inject_names());
     // Before the cascade effect exists, so no dispose can race the checks.
     invariant::post_spawn(&child);
 

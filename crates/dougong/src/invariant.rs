@@ -85,31 +85,21 @@ fn post_spawn_deep(fiber: &Fiber, uid: Option<u64>) {
         return; // the release tier already breached on the missing uid
     };
     let root = fiber.ctx().root;
-    let registered = {
-        let fibers = root.fibers.lock();
-        fibers
-            .get(&uid)
-            .is_some_and(|weak| weak.upgrade().is_some())
-    };
+    let registered = root.fibers.read(&uid, |slot| {
+        slot.is_some_and(|weak| weak.upgrade().is_some())
+    });
     let violation = (!registered).then(|| format!("fiber table missing fresh uid {uid}"));
     if let Some(what) = violation {
         breach(fiber, "post_spawn", &what);
     }
-    let violation = {
-        let index = root.index.lock();
-        fiber.inject.iter().find_map(|injection| {
-            let name = injection.service.as_ref();
-            if index
-                .key_interest
-                .get(name)
-                .is_some_and(|set| set.contains(&uid))
-            {
-                None
-            } else {
-                Some(format!("key_interest[{name:?}] missing fresh uid {uid}"))
-            }
-        })
-    };
+    let violation = fiber.inject.iter().find_map(|injection| {
+        let name = injection.service.as_ref();
+        if root.index.interest_has(name, uid) {
+            None
+        } else {
+            Some(format!("key_interest[{name:?}] missing fresh uid {uid}"))
+        }
+    });
     if let Some(what) = violation {
         breach(fiber, "post_spawn", &what);
     }
@@ -188,27 +178,28 @@ fn post_load_deep(fiber: &Fiber, target: &str, committed: &HashMap<String, Provi
     }
     // Index consistency, tolerant form: a concurrently disposed fiber already
     // had its edges removed, so absence is tolerated; present edges must
-    // equal the committed provider set with reverse edges intact.
+    // equal the committed provider set with reverse edges intact. The index
+    // is striped per key (P1), so the forward set is cloned first and the
+    // reverse edges are probed one stripe at a time; a missing reverse edge
+    // is only a breach when the fiber still owns its uid — a racing dispose
+    // (which clears the uid *before* removing edges) is the sole legitimate
+    // remover, since the fiber's own commit/uncommit run on this driver.
     if let Some(uid) = self_uid {
         let violation = {
             let root = fiber.ctx().root;
-            let index = root.index.lock();
-            index.consumer_providers.get(&uid).and_then(|providers| {
+            let index = &root.index;
+            index.consumer_providers_of(uid).and_then(|providers| {
                 let expected: std::collections::HashSet<u64> = committed
                     .values()
                     .map(|snapshot| snapshot.provider_uid)
                     .collect();
-                if *providers != expected {
+                if providers != expected {
                     return Some(format!(
                         "consumer_providers[{uid}] = {providers:?}, expected {expected:?}"
                     ));
                 }
                 providers.iter().find_map(|provider| {
-                    if index
-                        .provider_consumers
-                        .get(provider)
-                        .is_some_and(|set| set.contains(&uid))
-                    {
+                    if index.provider_has_consumer(*provider, uid) || fiber.uid_value().is_none() {
                         None
                     } else {
                         Some(format!(
@@ -335,11 +326,11 @@ fn check_cleared(fiber: &Fiber, checkpoint: &'static str) {
     }
     let violation = {
         let root = fiber.ctx().root;
-        let index = root.index.lock();
+        let index = &root.index;
         let drain_bounded = root.timeouts.drain.is_some();
         fiber.uid_value().map_or_else(
-            || sentinel_residue(&index),
-            |uid| consumer_residue(&index, uid, drain_bounded),
+            || sentinel_residue(index),
+            |uid| consumer_residue(index, uid, drain_bounded),
         )
     };
     if let Some(what) = violation {
@@ -348,21 +339,21 @@ fn check_cleared(fiber: &Fiber, checkpoint: &'static str) {
 }
 
 /// Index residue check for a live uid at unload/fail checkpoints.
+///
+/// Runs only while the fiber still owns its uid, so a racing `remove_fiber`
+/// (which always follows the uid claim) cannot be mid-cleanup here; the
+/// fiber's own `uncommit` already ran on this driver.
 #[cfg(debug_assertions)]
 fn consumer_residue(
     index: &crate::service::DependencyIndex,
     uid: u64,
     drain_bounded: bool,
 ) -> Option<String> {
-    if index.consumer_providers.contains_key(&uid) {
+    if index.consumer_providers_of(uid).is_some() {
         Some(format!("consumer_providers still holds {uid}"))
-    } else if !drain_bounded && index.provider_consumers.contains_key(&uid) {
+    } else if !drain_bounded && index.has_provider_entry(uid) {
         Some(format!("provider_consumers still lists {uid} as provider"))
-    } else if index
-        .provider_consumers
-        .values()
-        .any(|set| set.contains(&uid))
-    {
+    } else if index.any_provider_references(uid) {
         Some(format!(
             "provider_consumers still references consumer {uid}"
         ))
@@ -376,13 +367,9 @@ fn consumer_residue(
 /// legitimate, so only the consumer direction is checked.
 #[cfg(debug_assertions)]
 fn sentinel_residue(index: &crate::service::DependencyIndex) -> Option<String> {
-    if index.consumer_providers.contains_key(&0) {
+    if index.consumer_providers_of(0).is_some() {
         Some("consumer_providers still holds sentinel uid 0".to_string())
-    } else if index
-        .provider_consumers
-        .values()
-        .any(|set| set.contains(&0))
-    {
+    } else if index.any_provider_references(0) {
         Some("provider_consumers still references sentinel uid 0".to_string())
     } else {
         None
@@ -430,8 +417,7 @@ fn post_dispose_deep(fiber: &Fiber, old_uid: u64) {
     let root = fiber.ctx().root;
     let violation = root
         .fibers
-        .lock()
-        .contains_key(&old_uid)
+        .read(&old_uid, |slot| slot.is_some())
         .then(|| format!("fiber table still holds {old_uid}"));
     if let Some(what) = violation {
         breach(fiber, "post_dispose", &what);
@@ -445,31 +431,24 @@ fn post_dispose_deep(fiber: &Fiber, old_uid: u64) {
         breach(fiber, "post_dispose", &what);
     }
     let violation = {
-        let index = root.index.lock();
+        let index = &root.index;
         // The own-provider arm rests on the drain protocol's unbounded wait;
         // a configured drain budget (S3) lets a stuck consumer's stale edge
         // outlive the withdrawal (self-cleaning on its later convergence or
-        // disposal).
+        // disposal). The dispose winner runs `remove_fiber` before its join,
+        // so by this checkpoint every cleanup has already landed.
         let drain_bounded = root.timeouts.drain.is_some();
-        if index.consumer_providers.contains_key(&old_uid) {
+        if index.consumer_providers_of(old_uid).is_some() {
             Some(format!("consumer_providers still holds {old_uid}"))
-        } else if !drain_bounded && index.provider_consumers.contains_key(&old_uid) {
+        } else if !drain_bounded && index.has_provider_entry(old_uid) {
             Some(format!(
                 "provider_consumers still lists {old_uid} as provider"
             ))
-        } else if index
-            .provider_consumers
-            .values()
-            .any(|set| set.contains(&old_uid))
-        {
+        } else if index.any_provider_references(old_uid) {
             Some(format!(
                 "provider_consumers still references consumer {old_uid}"
             ))
-        } else if index
-            .key_interest
-            .values()
-            .any(|set| set.contains(&old_uid))
-        {
+        } else if index.any_interest_has(old_uid) {
             Some(format!("key_interest still references {old_uid}"))
         } else {
             None
@@ -504,7 +483,6 @@ mod tests {
     use crate::context::Context;
     use crate::fiber::FiberHandle;
     use crate::plugin::{Injection, plugin};
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     /// Boots a settled provider/consumer pair; returns the consumer handle.
@@ -607,13 +585,7 @@ mod tests {
         let (ctx, consumer) = boot_consumer().await;
         let fiber = &consumer.0;
         let uid = fiber.uid_value().expect("uid");
-        ctx.root
-            .index
-            .lock()
-            .consumer_providers
-            .get_mut(&uid)
-            .expect("forward edges")
-            .insert(u64::MAX);
+        ctx.root.index.test_add_consumer_provider(uid, u64::MAX);
         let committed = fiber.candidates.lock().clone();
         let epoch = fiber.epoch();
         post_load(fiber, &epoch, &committed);
@@ -633,11 +605,7 @@ mod tests {
             .provider_uid;
         ctx.root
             .index
-            .lock()
-            .provider_consumers
-            .get_mut(&provider_uid)
-            .expect("reverse edges")
-            .remove(&uid);
+            .test_remove_provider_consumer(provider_uid, uid);
         let committed = fiber.candidates.lock().clone();
         let epoch = fiber.epoch();
         post_load(fiber, &epoch, &committed);
@@ -649,7 +617,7 @@ mod tests {
         let (ctx, consumer) = boot_consumer().await;
         let fiber = &consumer.0;
         let uid = fiber.uid_value().expect("uid");
-        ctx.root.index.lock().uncommit(uid);
+        ctx.root.index.uncommit(uid);
         let committed = fiber.candidates.lock().clone();
         let epoch = fiber.epoch();
         post_load(fiber, &epoch, &committed);
@@ -691,11 +659,7 @@ mod tests {
         let ctx = Context::new();
         let handle = spawn_pending(&ctx);
         let uid = handle.0.uid_value().expect("uid");
-        ctx.root
-            .index
-            .lock()
-            .consumer_providers
-            .insert(uid, HashSet::from([u64::MAX]));
+        ctx.root.index.test_add_consumer_provider(uid, u64::MAX);
         post_unload(&handle.0);
     }
 
@@ -741,10 +705,9 @@ mod tests {
         let uid = consumer.0.uid_value().expect("uid");
         consumer.dispose().await;
         // Corrupt: re-register the dead fiber in the table.
-        ctx.root
-            .fibers
-            .lock()
-            .insert(uid, Arc::downgrade(&consumer.0));
+        ctx.root.fibers.write(&uid, |table| {
+            table.insert(uid, Arc::downgrade(&consumer.0));
+        });
         post_dispose(&consumer.0, uid);
     }
 

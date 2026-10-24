@@ -62,6 +62,7 @@ mod policy;
 mod registry;
 mod scope;
 mod service;
+mod shard;
 mod timeout;
 
 pub use context::{Context, ContextOptions};

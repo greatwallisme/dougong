@@ -390,3 +390,40 @@ async fn realm_scope_namespaces_services_with_global_fallback() -> dougong::Resu
     ctx.plugin(root_consumer, None)?.join().await?;
     Ok(())
 }
+
+/// Regression for the pre-P1 notify lock topology (findings §17, L1):
+/// `notify` held the global fiber-table lock across `check_impl`, whose
+/// strict resolution of a *checked* service re-locks the fiber table for the
+/// predicate's provider context — a same-thread deadlock on a non-reentrant
+/// mutex. A provider restart drives exactly that path (withdrawal notify
+/// walks the interested consumer).
+#[tokio::test]
+async fn notify_for_checked_service_with_interested_consumer_completes() {
+    let ctx = Context::new();
+    let provider = plugin("checked-provider", vec![], |ctx, _config| {
+        Box::pin(async move {
+            ctx.provide_with_check("checked", 1_u64, Arc::new(|_: &Context| true))
+                .await?;
+            Ok(())
+        })
+    });
+    let provider = ctx.plugin(provider, None).expect("spawn provider");
+    provider.join().await.expect("provider active");
+    let consumer = plugin(
+        "consumer",
+        vec![Injection::new("checked")],
+        |_ctx, _config| Box::pin(async move { Ok(()) }),
+    );
+    let consumer = ctx.plugin(consumer, None).expect("spawn consumer");
+    consumer.join().await.expect("consumer active");
+
+    // Withdrawal + re-provide notifies walk the interested consumer; the
+    // strict re-resolution evaluates the provider's check predicate. A hard
+    // rail turns a topology regression into a failure instead of a hang.
+    tokio::time::timeout(std::time::Duration::from_secs(5), provider.restart())
+        .await
+        .expect("notify deadlocked")
+        .expect("provider restarted");
+    consumer.join().await.expect("consumer converged");
+    ctx.stop().await;
+}

@@ -184,11 +184,7 @@ impl Invoke for QuarantineInvoke {
             let Some(root) = root.upgrade() else {
                 return result;
             };
-            let fiber = root
-                .fibers
-                .lock()
-                .get(&provider_uid)
-                .and_then(Weak::upgrade);
+            let fiber = root.fiber_by_uid(provider_uid);
             let Some(fiber) = fiber else { return result };
             // Log through the root fiber's context: the wrapper holds only a
             // weak root so the store never keeps its own root alive.

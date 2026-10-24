@@ -177,6 +177,11 @@ pub struct Fiber {
     pub(crate) candidates: Mutex<HashMap<String, ProviderSnapshot>>,
     /// Committed view ω: injected deps as of activation + self-provided.
     pub(crate) store: Mutex<HashMap<String, ProviderSnapshot>>,
+    /// The key this activation's dependency edges were committed under (P1):
+    /// the uid as read at commit time. The unload path uncommits exactly this
+    /// key — re-reading the uid at unload time could observe the sentinel 0
+    /// after a racing dispose cleared the real uid, leaking the edges.
+    committed_uid: Mutex<Option<u64>>,
     loaded: Mutex<String>,
     disposables: Mutex<Vec<Disposable>>,
     next_effect_id: AtomicU64,
@@ -216,6 +221,7 @@ impl Fiber {
             error: Mutex::new(None),
             candidates: Mutex::new(HashMap::new()),
             store: Mutex::new(HashMap::new()),
+            committed_uid: Mutex::new(None),
             loaded: Mutex::new(EPOCH_INACTIVE.to_string()),
             disposables: Mutex::new(Vec::new()),
             next_effect_id: AtomicU64::new(1),
@@ -253,6 +259,7 @@ impl Fiber {
             error: Mutex::new(None),
             candidates: Mutex::new(HashMap::new()),
             store: Mutex::new(HashMap::new()),
+            committed_uid: Mutex::new(None),
             loaded: Mutex::new(EPOCH_INACTIVE.to_string()),
             disposables: Mutex::new(Vec::new()),
             next_effect_id: AtomicU64::new(1),
@@ -822,11 +829,13 @@ impl Fiber {
         let scope = self.current_scope();
         self.reap_scope(&scope).await;
         // Drop committed edges before draining so `relied()` observes the
-        // withdrawal as early as possible.
+        // withdrawal as early as possible. The key captured at commit time is
+        // uncommitted (never a fresh uid read, which a racing dispose could
+        // have cleared to the sentinel in between).
         {
             let root = self.ctx().root;
-            let mut index = root.index.lock();
-            index.uncommit(self.uid_value().unwrap_or(0));
+            let commit_key = self.committed_uid.lock().take().unwrap_or(0);
+            root.index.uncommit(commit_key);
         };
         self.unload_effects().await;
         self.store.lock().clear();
@@ -912,9 +921,12 @@ impl Fiber {
             let label = ScopeNode::effective_label(Some(&scope), name);
             edges.insert(name.clone(), (label, snapshot.provider_uid));
         }
-        root.index
-            .lock()
-            .commit_edges(self.uid_value().unwrap_or(0), &edges);
+        // The commit key is captured once and replayed at uncommit: re-reading
+        // the uid after a racing dispose would see the sentinel and orphan
+        // edges committed under the real uid.
+        let commit_key = self.uid_value().unwrap_or(0);
+        root.index.commit_edges(commit_key, &edges);
+        *self.committed_uid.lock() = Some(commit_key);
         self.store.lock().clone_from(&committed);
         committed
     }
@@ -969,10 +981,7 @@ impl Fiber {
                 // `check_impl` consults provider liveness.
                 self.cache_state();
                 let root = self.ctx().root;
-                let provided = {
-                    let store = root.reflect.lock();
-                    store.provided_names(self.uid_value().unwrap_or(0))
-                };
+                let provided = root.reflect.provided_names(self.uid_value().unwrap_or(0));
                 crate::service::notify(&self.ctx(), &provided);
                 self.bump_settle();
                 self.publish_state();
@@ -1076,8 +1085,8 @@ impl Fiber {
         self.unload_effects().await;
         {
             let root = self.ctx().root;
-            let mut index = root.index.lock();
-            index.uncommit(self.uid_value().unwrap_or(0));
+            let commit_key = self.committed_uid.lock().take().unwrap_or(0);
+            root.index.uncommit(commit_key);
         }
         self.store.lock().clear();
     }

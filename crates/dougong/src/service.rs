@@ -21,6 +21,7 @@ use crate::context::{Context, RootState};
 use crate::error::{Error, Result};
 use crate::fiber::{Fiber, FiberState, ProviderSnapshot};
 use crate::scope::ScopeNode;
+use crate::shard::ShardMap;
 
 /// Availability predicate consulted before dependents may load.
 pub type Check = Arc<dyn Fn(&Context) -> bool + Send + Sync>;
@@ -54,21 +55,32 @@ impl std::fmt::Debug for Provided {
     }
 }
 
-/// Store of provided implementations, keyed by name then isolation label.
+/// Store of provided implementations, striped by service name (P1); each
+/// stripe keeps the `name -> label -> Provided` buckets of its names.
+///
+/// The strict-resolution checks (provider liveness, availability predicate)
+/// run *after* the stripe lock is released: they touch the active set and
+/// the fiber table, and no store stripe may be held across those locks (the
+/// root-state lock-order rule — see `shard.rs`).
 #[derive(Debug, Default)]
 pub struct ReflectStore {
-    labels: HashMap<String, HashMap<u64, Provided>>,
+    slots: ShardMap<String, HashMap<u64, Provided>>,
 }
 
 impl ReflectStore {
     /// Inserts an implementation; fails when the slot is occupied.
-    pub(crate) fn insert(&mut self, provided: Provided, label: u64, owner: &str) -> Result<()> {
-        let bucket = self.labels.entry(provided.name.clone()).or_default();
-        if bucket.contains_key(&label) {
-            return Err(Error::duplicate_provide(&provided.name, owner));
-        }
-        bucket.insert(label, provided);
-        Ok(())
+    pub(crate) fn insert(&self, provided: Provided, label: u64, owner: &str) -> Result<()> {
+        // The striping borrow and the closure both need the name: one extra
+        // clone on a registration path (cold) keeps the shared-key shape.
+        let name = provided.name.clone();
+        self.slots.write(&name.clone(), |slots| {
+            let bucket = slots.entry(name).or_default();
+            if bucket.contains_key(&label) {
+                return Err(Error::duplicate_provide(&provided.name, owner));
+            }
+            bucket.insert(label, provided);
+            Ok(())
+        })
     }
 
     /// Seeds a built-in implementation during context construction, bypassing
@@ -78,29 +90,51 @@ impl ReflectStore {
     ///
     /// Panics when the slot is occupied: seeding happens only at construction
     /// time on an empty store, so occupation indicates a programming error.
-    pub(crate) fn seed(&mut self, provided: Provided, label: u64) {
-        let previous = self
-            .labels
-            .entry(provided.name.clone())
-            .or_default()
-            .insert(label, provided);
+    pub(crate) fn seed(&self, provided: Provided, label: u64) {
+        let name = provided.name.clone();
+        let previous = self.slots.write(&name.clone(), |slots| {
+            slots.entry(name).or_default().insert(label, provided)
+        });
         debug_assert!(previous.is_none(), "builtin slot seeded twice");
     }
 
     /// Removes and returns the implementation at `(name, label)`.
-    pub(crate) fn remove(&mut self, name: &str, label: u64) -> Option<Provided> {
-        self.labels.get_mut(name)?.remove(&label)
+    pub(crate) fn remove(&self, name: &str, label: u64) -> Option<Provided> {
+        self.slots
+            .write(name, |slots| slots.get_mut(name)?.remove(&label))
     }
 
-    /// Mutable access to one implementation slot.
-    pub(crate) fn get_mut_entry(&mut self, name: &str, label: u64) -> Option<&mut Provided> {
-        self.labels.get_mut(name)?.get_mut(&label)
+    /// Overwrites the value of the implementation at `(name, label)`; fails
+    /// unless the slot exists and is owned by fiber `uid` (the `Context::set`
+    /// path).
+    pub(crate) fn overwrite(
+        &self,
+        name: &str,
+        label: u64,
+        uid: u64,
+        value: Arc<dyn Any + Send + Sync>,
+    ) -> Result<()> {
+        self.slots.write(name, |slots| {
+            let entry = slots
+                .get_mut(name)
+                .and_then(|bucket| bucket.get_mut(&label))
+                .ok_or_else(|| Error::undeclared_dependency(name))?;
+            if entry.provider_uid != uid {
+                return Err(Error::not_provider(name));
+            }
+            entry.value = value;
+            Ok(())
+        })
     }
 
     /// Resolves the implementation for `(name, label)` under `strict` mode.
     ///
     /// Strict mode only returns implementations whose providing fiber is
-    /// currently `Active` and whose availability predicate passes.
+    /// currently `Active` and whose availability predicate passes. The entry
+    /// is cloned under the stripe lock and the strict checks run after the
+    /// lock is released (lock-order rule); the checks were never atomic with
+    /// the store read even under the pre-P1 single lock — the active set and
+    /// the fiber table were always separate locks.
     pub(crate) fn get_impl(
         &self,
         root: &RootState,
@@ -108,7 +142,7 @@ impl ReflectStore {
         label: u64,
         strict: bool,
     ) -> Option<Provided> {
-        let provided = self.labels.get(name)?.get(&label)?;
+        let provided = self.slots.read(name, |slots| slots?.get(&label).cloned())?;
         if strict {
             if !root.fiber_is_active(provided.provider_uid) {
                 return None;
@@ -120,102 +154,194 @@ impl ReflectStore {
                 }
             }
         }
-        Some(provided.clone())
+        Some(provided)
     }
 
-    /// Names of services currently provided by fiber `uid`.
+    /// Names of services currently provided by fiber `uid`. Scans every
+    /// stripe sequentially (one lock at a time); called once per successful
+    /// activation for the post-load batch notification.
     pub(crate) fn provided_names(&self, uid: u64) -> Vec<String> {
         let mut names = Vec::new();
-        for (name, bucket) in &self.labels {
-            if bucket.values().any(|provided| provided.provider_uid == uid) {
-                names.push(name.clone());
+        self.slots.for_each_shard(|slots| {
+            for (name, bucket) in slots {
+                if bucket.values().any(|provided| provided.provider_uid == uid) {
+                    names.push(name.clone());
+                }
             }
-        }
+        });
         names
     }
 }
 
-/// Reverse indexes maintained by the kernel (D12).
+/// Reverse indexes maintained by the kernel (D12), striped per map key (P1):
+/// `key_interest` by service name, the edge maps by fiber uid. Edge updates
+/// lock one stripe at a time and never hold two stripes at once; no consumer
+/// relied on the pre-P1 cross-edge atomicity — the invariant layer tolerates
+/// dispose-raced absence and `notify` re-resolves every candidate against
+/// the live store.
 #[derive(Debug, Default)]
 pub struct DependencyIndex {
     /// Service name -> uids of fibers that declare an injection for it.
-    pub(crate) key_interest: HashMap<String, HashSet<u64>>,
+    key_interest: ShardMap<String, HashSet<u64>>,
     /// Provider uid -> uids of consumers whose committed views reference it.
-    pub(crate) provider_consumers: HashMap<u64, HashSet<u64>>,
+    provider_consumers: ShardMap<u64, HashSet<u64>>,
     /// Consumer uid -> provider uids it currently depends on (cleanup mirror
     /// of `provider_consumers`).
-    pub(crate) consumer_providers: HashMap<u64, HashSet<u64>>,
+    consumer_providers: ShardMap<u64, HashSet<u64>>,
 }
 
 impl DependencyIndex {
     /// Registers a fiber's declared interest in its injected service names.
-    pub(crate) fn add_interest(&mut self, uid: u64, names: &[String]) {
+    pub(crate) fn add_interest(&self, uid: u64, names: &[String]) {
         for name in names {
-            self.key_interest
-                .entry(name.clone())
-                .or_default()
-                .insert(uid);
+            self.key_interest.write(name, |interest| {
+                interest.entry(name.clone()).or_default().insert(uid);
+            });
         }
     }
 
-    /// Drops all index entries for a disposed fiber.
-    pub(crate) fn remove_fiber(&mut self, uid: u64, interested: &[String]) {
-        for name in interested {
-            if let Some(set) = self.key_interest.get_mut(name) {
-                set.remove(&uid);
-                if set.is_empty() {
-                    self.key_interest.remove(name);
-                }
+    /// Appends the uids of fibers interested in `name` to `out`.
+    pub(crate) fn interested(&self, name: &str, out: &mut Vec<u64>) {
+        self.key_interest.read(name, |interest| {
+            if let Some(set) = interest {
+                out.extend(set.iter().copied());
             }
-        }
-        if let Some(providers) = self.consumer_providers.remove(&uid) {
-            for provider in providers {
-                if let Some(set) = self.provider_consumers.get_mut(&provider) {
+        });
+    }
+
+    /// True when `uid` is registered as interested in `name` (invariant
+    /// checks).
+    pub(crate) fn interest_has(&self, name: &str, uid: u64) -> bool {
+        self.key_interest.read(name, |interest| {
+            interest.is_some_and(|set| set.contains(&uid))
+        })
+    }
+
+    /// True when any interest set still references `uid` (invariant checks).
+    pub(crate) fn any_interest_has(&self, uid: u64) -> bool {
+        let mut found = false;
+        self.key_interest.for_each_shard(|interest| {
+            found |= interest.values().any(|set| set.contains(&uid));
+        });
+        found
+    }
+
+    /// Drops all index entries for a disposed fiber.
+    pub(crate) fn remove_fiber(&self, uid: u64, interested: &[String]) {
+        for name in interested {
+            self.key_interest.write(name, |interest| {
+                if let Some(set) = interest.get_mut(name) {
                     set.remove(&uid);
                     if set.is_empty() {
-                        self.provider_consumers.remove(&provider);
+                        interest.remove(name);
                     }
                 }
-            }
+            });
+        }
+        let providers = self
+            .consumer_providers
+            .write(&uid, |edges| edges.remove(&uid));
+        if let Some(providers) = providers {
+            self.drop_consumer_edges(uid, &providers);
         }
     }
 
     /// Records the dependency edges of a fiber's committed view.
-    pub(crate) fn commit_edges(&mut self, uid: u64, providers: &HashMap<String, (u64, u64)>) {
-        // providers: service name -> (label, provider uid)
-        for (label, provider) in providers.values() {
-            let _ = label;
-            self.provider_consumers
-                .entry(*provider)
-                .or_default()
-                .insert(uid);
-            self.consumer_providers
-                .entry(uid)
-                .or_default()
-                .insert(*provider);
+    ///
+    /// `providers` maps service name -> (label, provider uid). Each edge is
+    /// written under one stripe lock at a time — two stripes are never held
+    /// together, so concurrent commits for different fibers cannot deadlock.
+    pub(crate) fn commit_edges(&self, uid: u64, providers: &HashMap<String, (u64, u64)>) {
+        for &(_, provider) in providers.values() {
+            self.provider_consumers.write(&provider, |consumers| {
+                consumers.entry(provider).or_default().insert(uid);
+            });
+            self.consumer_providers.write(&uid, |edges| {
+                edges.entry(uid).or_default().insert(provider);
+            });
         }
     }
 
     /// Drops a fiber's committed edges before its store is cleared.
-    pub(crate) fn uncommit(&mut self, uid: u64) {
-        if let Some(providers) = self.consumer_providers.remove(&uid) {
-            for provider in providers {
-                if let Some(set) = self.provider_consumers.get_mut(&provider) {
+    pub(crate) fn uncommit(&self, uid: u64) {
+        let providers = self
+            .consumer_providers
+            .write(&uid, |edges| edges.remove(&uid));
+        if let Some(providers) = providers {
+            self.drop_consumer_edges(uid, &providers);
+        }
+    }
+
+    /// Removes `uid` from every listed provider's consumer set, dropping
+    /// emptied sets.
+    fn drop_consumer_edges(&self, uid: u64, providers: &HashSet<u64>) {
+        for provider in providers {
+            self.provider_consumers.write(provider, |consumers| {
+                if let Some(set) = consumers.get_mut(provider) {
                     set.remove(&uid);
                     if set.is_empty() {
-                        self.provider_consumers.remove(&provider);
+                        consumers.remove(provider);
                     }
                 }
-            }
+            });
         }
     }
 
     /// True when at least one committed consumer references `provider_uid`.
     #[must_use]
     pub fn relied(&self, provider_uid: u64) -> bool {
-        self.provider_consumers
-            .get(&provider_uid)
-            .is_some_and(|set| !set.is_empty())
+        self.provider_consumers.read(&provider_uid, |consumers| {
+            consumers.is_some_and(|set| !set.is_empty())
+        })
+    }
+
+    /// The consumer's provider set, cloned (invariant checks).
+    pub(crate) fn consumer_providers_of(&self, uid: u64) -> Option<HashSet<u64>> {
+        self.consumer_providers
+            .read(&uid, |entry: Option<&HashSet<u64>>| entry.cloned())
+    }
+
+    /// True when `provider`'s consumer set references `uid` (invariant
+    /// checks).
+    pub(crate) fn provider_has_consumer(&self, provider: u64, uid: u64) -> bool {
+        self.provider_consumers.read(&provider, |consumers| {
+            consumers.is_some_and(|set| set.contains(&uid))
+        })
+    }
+
+    /// True when `uid` exists as a provider key (invariant checks).
+    pub(crate) fn has_provider_entry(&self, uid: u64) -> bool {
+        self.provider_consumers.read(&uid, |entry| entry.is_some())
+    }
+
+    /// True when any provider's consumer set references `uid` (invariant
+    /// checks).
+    pub(crate) fn any_provider_references(&self, uid: u64) -> bool {
+        let mut found = false;
+        self.provider_consumers.for_each_shard(|consumers| {
+            found |= consumers.values().any(|set| set.contains(&uid));
+        });
+        found
+    }
+
+    /// Adds a forward edge without its reverse edge (invariant-layer fault
+    /// injection).
+    #[cfg(test)]
+    pub(crate) fn test_add_consumer_provider(&self, uid: u64, provider: u64) {
+        self.consumer_providers.write(&uid, |edges| {
+            edges.entry(uid).or_default().insert(provider);
+        });
+    }
+
+    /// Removes a reverse edge without touching its forward edge
+    /// (invariant-layer fault injection).
+    #[cfg(test)]
+    pub(crate) fn test_remove_provider_consumer(&self, provider: u64, uid: u64) {
+        self.provider_consumers.write(&provider, |consumers| {
+            if let Some(set) = consumers.get_mut(&provider) {
+                set.remove(&uid);
+            }
+        });
     }
 }
 
@@ -229,10 +355,7 @@ pub fn resolve_impl_for(ctx: &Context, dependent: &Fiber, name: &str) -> Option<
     let root = &ctx.root;
     let candidates = ScopeNode::label_candidates(Some(dependent.scope_node()), name);
     for label in candidates {
-        let provided = {
-            let store = root.reflect.lock();
-            store.get_impl(root, name, label, true)
-        };
+        let provided = root.reflect.get_impl(root, name, label, true);
         if let Some(provided) = provided {
             if provided.compute.is_some() {
                 // Accessor entries commit only liveness metadata; values are
@@ -296,10 +419,7 @@ pub async fn provide(
                 let section_ctx = effect_ctx.clone();
                 let section_name = name_owned.clone();
                 effect_ctx.root.ordering.run(&key, move || -> Result<()> {
-                    {
-                        let mut store = section_ctx.root.reflect.lock();
-                        store.insert(provided, label, &owner)?;
-                    };
+                    section_ctx.root.reflect.insert(provided, label, &owner)?;
                     // The provider must see itself during activation (TS
                     // writes the impl into its own committed view).
                     fiber_in.commit_self(
@@ -332,7 +452,7 @@ pub async fn provide(
                         // section; the drain waits *outside* it so a stuck
                         // consumer cannot block later updates of this group.
                         let touched = ctx.root.ordering.run(&key, || {
-                            ctx.root.reflect.lock().remove(&name, label);
+                            ctx.root.reflect.remove(&name, label);
                             notify(&ctx, &[name])
                         });
                         drain_consumers(&ctx, touched).await;
@@ -378,10 +498,7 @@ pub async fn accessor(
                 let section_ctx = effect_ctx.clone();
                 let section_name = name_owned.clone();
                 effect_ctx.root.ordering.run(&key, move || -> Result<()> {
-                    {
-                        let mut store = section_ctx.root.reflect.lock();
-                        store.insert(provided, label, &owner)?;
-                    };
+                    section_ctx.root.reflect.insert(provided, label, &owner)?;
                     fiber_in
                         .commit_self(&section_name, crate::fiber::ProviderSnapshot::dynamic(uid));
                     if fiber_in.state() == FiberState::Active {
@@ -396,7 +513,7 @@ pub async fn accessor(
                     let ctx = disposer_ctx.clone();
                     Box::pin(async move {
                         let touched = ctx.root.ordering.run(&key, || {
-                            ctx.root.reflect.lock().remove(&name, label);
+                            ctx.root.reflect.remove(&name, label);
                             notify(&ctx, &[name])
                         });
                         drain_consumers(&ctx, touched).await;
@@ -417,18 +534,7 @@ pub fn set(ctx: &Context, name: &str, value: Arc<dyn Any + Send + Sync>) -> Resu
     let fiber = ctx.fiber().ok_or_else(Error::inactive_effect)?;
     let label = ScopeNode::primary_label(Some(&ctx.scope), name);
     let uid = fiber.uid_value().ok_or_else(Error::inactive_effect)?;
-    {
-        let mut store = ctx.root.reflect.lock();
-        let impl_ = store
-            .get_mut_entry(name, label)
-            .ok_or_else(|| Error::undeclared_dependency(name))?;
-        if impl_.provider_uid != uid {
-            return Err(Error::not_provider(name));
-        }
-        impl_.value = value;
-        drop(store);
-    }
-    Ok(())
+    ctx.root.reflect.overwrite(name, label, uid, value)
 }
 
 /// Awaits every touched consumer's convergence inside a provider withdrawal,
@@ -475,44 +581,45 @@ async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
 ///
 /// Returns the fibers whose dependency state changed (the withdrawal protocol
 /// awaits them).
+///
+/// Lock discipline (P1): candidate uids are collected from the interest
+/// index and upgraded to strong fiber references one stripe lock at a time;
+/// no root-state lock is then held while a fiber re-resolves (`check_impl`
+/// touches the store and the liveness set). The pre-P1 code held the global
+/// fiber-table lock across every `check_impl`, which both serialized
+/// unrelated notifies and — for services with an availability predicate —
+/// deadlocked: the strict check re-locked the fiber table from the same
+/// thread. A fiber disposed between upgrade and re-resolution is harmless:
+/// its `refresh` is refused by the disposed choke-point guard (S4).
 pub fn notify(ctx: &Context, names: &[String]) -> Vec<Arc<Fiber>> {
+    let mut candidates: Vec<u64> = Vec::new();
+    for name in names {
+        ctx.root.index.interested(name, &mut candidates);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
     let mut touched = Vec::new();
-    {
-        let index = ctx.root.index.lock();
-        let mut candidates: Vec<u64> = Vec::new();
+    for uid in candidates {
+        let Some(fiber) = ctx.root.fiber_by_uid(uid) else {
+            continue;
+        };
+        let mut changed = false;
         for name in names {
-            if let Some(set) = index.key_interest.get(name) {
-                candidates.extend(set.iter().copied());
+            if fiber.declares(name) {
+                changed |= fiber.check_impl(name);
             }
         }
-        candidates.sort_unstable();
-        candidates.dedup();
-        drop(index);
-        let fibers = ctx.root.fibers.lock();
-        for uid in candidates {
-            if let Some(weak) = fibers.get(&uid)
-                && let Some(fiber) = weak.upgrade()
-            {
-                let mut changed = false;
-                for name in names {
-                    if fiber.declares(name) {
-                        changed |= fiber.check_impl(name);
-                    }
-                }
-                if changed {
-                    fiber.refresh();
-                    touched.push(fiber);
-                }
-            }
+        if changed {
+            fiber.refresh();
+            touched.push(fiber);
         }
     }
     for name in names {
-        let value = {
-            let store = ctx.root.reflect.lock();
-            store
-                .get_impl(&ctx.root, name, ctx.effective_label(name), false)
-                .map(|p| p.value)
-        };
+        let value = ctx
+            .root
+            .reflect
+            .get_impl(&ctx.root, name, ctx.effective_label(name), false)
+            .map(|p| p.value);
         let payload = serde_json::json!({ "service": name, "provided": value.is_some() });
         // Service events are scope-filtered: listeners registered under a
         // different isolation label for this service do not receive it.
