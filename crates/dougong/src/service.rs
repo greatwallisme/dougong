@@ -281,46 +281,53 @@ pub async fn provide(
     let effect_ctx = ctx.clone();
     let fiber_in = Arc::clone(&fiber);
     fiber
-        .effect(format!("ctx.provide({name:?})"), async move {
-            {
-                let mut store = effect_ctx.root.reflect.lock();
-                store.insert(provided, label, &owner)?;
-            };
-            // The provider must see itself during activation (TS writes
-            // the impl into its own committed view).
-            fiber_in.commit_self(
-                &name_owned,
-                crate::fiber::ProviderSnapshot {
-                    provider_uid: uid,
-                    value: self_value,
-                    dynamic: false,
-                },
-            );
-            if fiber_in.state() == FiberState::Active {
-                notify(&effect_ctx, std::slice::from_ref(&name_owned));
-            }
-            let disposer_name = name_owned.clone();
-            let disposer_ctx = effect_ctx.clone();
-            let disposer: crate::fiber::Disposer = Box::new(move || {
-                let name = disposer_name.clone();
-                let ctx = disposer_ctx.clone();
-                Box::pin(async move {
-                    {
-                        let mut store = ctx.root.reflect.lock();
-                        store.remove(&name, label)
-                    };
-                    // Withdrawal protocol: wake dependents, then wait for
-                    // them to converge before returning. Consumer join
-                    // errors are the consumer's own startup failures, already
-                    // logged there; the drain only needs convergence.
-                    let touched = notify(&ctx, &[name]);
-                    for fiber in touched {
-                        let _ = fiber.join().await;
-                    }
-                })
-            });
-            Ok(Some(disposer))
-        })
+        .effect(
+            format!("ctx.provide({name:?})"),
+            // Service withdrawal is kernel-structural: it must finish inside
+            // the unload path (S3); its inner consumer wait is bounded by the
+            // drain budget below.
+            crate::fiber::Teardown::Critical,
+            async move {
+                {
+                    let mut store = effect_ctx.root.reflect.lock();
+                    store.insert(provided, label, &owner)?;
+                };
+                // The provider must see itself during activation (TS writes
+                // the impl into its own committed view).
+                fiber_in.commit_self(
+                    &name_owned,
+                    crate::fiber::ProviderSnapshot {
+                        provider_uid: uid,
+                        value: self_value,
+                        dynamic: false,
+                    },
+                );
+                if fiber_in.state() == FiberState::Active {
+                    notify(&effect_ctx, std::slice::from_ref(&name_owned));
+                }
+                let disposer_name = name_owned.clone();
+                let disposer_ctx = effect_ctx.clone();
+                let disposer: crate::fiber::Disposer = Box::new(move || {
+                    let name = disposer_name.clone();
+                    let ctx = disposer_ctx.clone();
+                    Box::pin(async move {
+                        {
+                            let mut store = ctx.root.reflect.lock();
+                            store.remove(&name, label)
+                        };
+                        // Withdrawal protocol: wake dependents, then wait for
+                        // them to converge before returning. Consumer join
+                        // errors are the consumer's own startup failures, already
+                        // logged there; the drain only needs convergence. With a
+                        // drain budget (S3) the per-consumer wait is bounded and
+                        // the configured policy runs on a timeout.
+                        let touched = notify(&ctx, &[name]);
+                        drain_consumers(&ctx, touched).await;
+                    })
+                });
+                Ok(Some(disposer))
+            },
+        )
         .await
 }
 
@@ -349,30 +356,32 @@ pub async fn accessor(
     let effect_ctx = ctx.clone();
     let fiber_in = Arc::clone(&fiber);
     fiber
-        .effect(format!("ctx.accessor({name:?})"), async move {
-            {
-                let mut store = effect_ctx.root.reflect.lock();
-                store.insert(provided, label, &owner)?;
-            };
-            fiber_in.commit_self(&name_owned, crate::fiber::ProviderSnapshot::dynamic(uid));
-            if fiber_in.state() == FiberState::Active {
-                notify(&effect_ctx, std::slice::from_ref(&name_owned));
-            }
-            let disposer_ctx = effect_ctx.clone();
-            let disposer_name = name_owned.clone();
-            let disposer: crate::fiber::Disposer = Box::new(move || {
-                let name = disposer_name.clone();
-                let ctx = disposer_ctx.clone();
-                Box::pin(async move {
-                    ctx.root.reflect.lock().remove(&name, label);
-                    let touched = notify(&ctx, &[name]);
-                    for fiber in touched {
-                        let _ = fiber.join().await;
-                    }
-                })
-            });
-            Ok(Some(disposer))
-        })
+        .effect(
+            format!("ctx.accessor({name:?})"),
+            crate::fiber::Teardown::Critical,
+            async move {
+                {
+                    let mut store = effect_ctx.root.reflect.lock();
+                    store.insert(provided, label, &owner)?;
+                };
+                fiber_in.commit_self(&name_owned, crate::fiber::ProviderSnapshot::dynamic(uid));
+                if fiber_in.state() == FiberState::Active {
+                    notify(&effect_ctx, std::slice::from_ref(&name_owned));
+                }
+                let disposer_ctx = effect_ctx.clone();
+                let disposer_name = name_owned.clone();
+                let disposer: crate::fiber::Disposer = Box::new(move || {
+                    let name = disposer_name.clone();
+                    let ctx = disposer_ctx.clone();
+                    Box::pin(async move {
+                        ctx.root.reflect.lock().remove(&name, label);
+                        let touched = notify(&ctx, &[name]);
+                        drain_consumers(&ctx, touched).await;
+                    })
+                });
+                Ok(Some(disposer))
+            },
+        )
         .await
 }
 
@@ -397,6 +406,45 @@ pub fn set(ctx: &Context, name: &str, value: Arc<dyn Any + Send + Sync>) -> Resu
         drop(store);
     }
     Ok(())
+}
+
+/// Awaits every touched consumer's convergence inside a provider withdrawal,
+/// under the drain budget (S3).
+///
+/// Without a budget the wait is unbounded (the pre-S3 behavior, paper Thm
+/// 63). With one, a consumer that misses its budget is logged and handled per
+/// policy: [`crate::timeout::DrainPolicy::LogAndContinue`] moves on to the
+/// next consumer; [`crate::timeout::DrainPolicy::CancelConsumer`] additionally
+/// cancels the stuck consumer's task scope, which lands an abort-safe hang
+/// `Failed` (a tracked foreign call is unaffected — the reap watchdog
+/// surfaces it).
+async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
+    let drain = ctx.root.timeouts.drain;
+    for fiber in touched {
+        let Some(drain) = drain else {
+            let _ = fiber.join().await;
+            continue;
+        };
+        if tokio::time::timeout(drain.budget, fiber.join())
+            .await
+            .is_ok()
+        {
+            continue;
+        }
+        ctx.logger().log(
+            crate::logger::LogLevel::Error,
+            "dougong",
+            &format!(
+                "drain_timeout: consumer \"{}\" (uid {:?}) missed the {:?} drain budget",
+                fiber.name(),
+                fiber.uid_value(),
+                drain.budget,
+            ),
+        );
+        if drain.policy == crate::timeout::DrainPolicy::CancelConsumer {
+            fiber.current_scope().cancel();
+        }
+    }
 }
 
 /// Re-evaluates every interested fiber for the given service names and emits

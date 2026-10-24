@@ -129,6 +129,21 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - **常驻化**：S1 invariant 层 post_unload / post_fail_load / post_dispose 增 release 级断言「cancelled ⇒ task_count == 0」——「卸载后任务计数归零」从测试断言升级为状态机不变量。
 - 验证锚：`cancel.rs` 单元 9 例 + invariant 注入 1 例 + `tests/cancel_scope.rs` 7 例（dispose 解挂死 body / 在途 listener 中止 / restart 换代 / parallel 跳过 / serial 死跳过 / waterfall 无 veto / stop 全收口）。
 
+### D18 关键异步路径超时 = TimeoutConfig 五预算 + 按 future 类别的诚实策略（S3）
+
+2026-10-24，improve 二.3 落地（设计定稿见 `.planning/2026-10-23-v0-3-0-dylib-outbound-and-runtime-harden/findings.md` §12）：
+
+- **配置面**：`TimeoutConfig { apply, listener, drain, cleanup, reap_watchdog }` 全 `Option`，默认全 `None`（opt-in）——既有面零回归的硬保证；机制在内核、策略值由宿主经 `Context::new_with_timeouts` 接线，与 OBS 裁决（库级 API + 宿主接线）同构。默认翻转是单行变更，config 即缝。
+- **策略按 future 类别分派，不假装抢占 FFI**：abort-safe（in-process body / plain listener / plain disposer）超时 = yield 点丢弃（S2 同粒度）；tracked（bridge 调用 / wasm body / 边界 teardown）超时 = 停止等待 + 错误入账 + 外方调用在监听方 scope 内继续存留，unload reap 仍收口（wasmtime 只禁 drop 在途 `call_async`，暂停轮询合法）。dylib 同步 FFI 死循环任何任务机制都不可杀——由 reap 看门狗周期告警暴露，永不绕过 reap 进 teardown（UB 铁律）。
+- **apply**：`ApplyTimeout { budget, policy: Fail | Retry(u32) }`。超时 ⇒ cancel scope + await 落定 + 事务性回滚（不 park）⇒ drive_loop 裁决：重试余量内直接重载（事务性保证重试安全），耗尽 ⇒ `apply_timeout` 错误 park Failed；并发改期（dispose/换 epoch）⇒ 不重试不 park（防 clobber 新 desired）。重试预算随 epoch 变更/加载成功/显式 restart 复位。
+- **listener**：`parallel` 超时计入聚合失败；`serial`/`bail`/`waterfall` 传播 `listener_timeout`；`emit` 记日志。bridge 在 serial/bail/waterfall 的内联路径改为「临时 spawn_tracked 进监听方 scope + await 侧超时」（到期 detach），plain 仍内联 timeout 丢弃。逐 listener 预算，emitter 最坏等 N×budget（成文）。`internal/config` 整链同套 listener 预算（internal 拒桥 ⇒ 整链丢弃安全）。
+- **notify** 无独立异步面：同步函数；其暴露面 = internal/service 监听器（listener 预算）+ 收敛等待（drain 预算）+ 调用方 join（既有 join_with_timeout）。
+- **drain**：`DrainTimeout { budget, policy: LogAndContinue | CancelConsumer }`，逐 consumer 界 join；CancelConsumer 即文档的 kill-task（撤 consumer scope，abort-safe 卡死落 Failed）。**Thm 63 的撤回等待在 drain 预算下弱化为有界**——这正是该策略的存在意义；S1 invariant 的「dispose/unload 后 provider_consumers[自身] 必空」断言相应改为「drain 预算配置时豁免该臂」（卡死 consumer 的陈旧边在其收敛/dispose 时自清，uid 单调不复用，无后续污染）。
+- **cleanup**：disposer 增 criticality。Critical（provide/accessor 撤回、listener 摘除、registry 级联）永不孤化——其内部等待由各自预算界或同步即返；Orphanable（插件 ctx.effect、边界 teardown）超时 ⇒ 弹入无跟踪任务继续跑（不 abort：wasm teardown 禁 drop、dylib 同步 FFI 不可 preempt）+ 记 `cleanup_timeout` + 继续 LIFO。契约成文：cleanup 预算下插件 teardown 可与下次激活重叠。
+- **reap_watchdog**：只告警不抢占；周期 Error 级日志（fiber 名/uid/滞留任务数）。S2 结构洞察：reap 挂死 ⇔ tracked 调用挂死，故治本在各 tracked 面的超时，看门狗兜不可杀类别的可观测性。
+- 错误码 `apply_timeout` / `listener_timeout` 入 Error 稳定码；drain/cleanup/reap 产结构化日志行（含码词），S5 在此三分之上建分级。
+- 验证锚：`tests/timeouts.rs` 12 例（apply 超时/重试成功/重试耗尽、parallel plain 入聚合、parallel bridge detach 存活、serial 传播、waterfall 传播且 fallback 未触、emit 记日志、drain 两臂、cleanup 孤化续 LIFO、reap 看门狗告警后收口）；默认零配置下既有全套 17 套件回归即零回归证明。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

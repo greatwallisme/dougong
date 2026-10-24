@@ -321,6 +321,12 @@ pub fn post_fail_load(fiber: &Fiber) {
 /// A dispose clears `uid` before the driver unloads; commit and uncommit
 /// then both key on the sentinel uid 0 (symmetric), so a missing uid falls
 /// back to the sentinel-side residue check.
+///
+/// The own-provider-arm residue check (`provider_consumers[uid]` keyed by
+/// the unloading fiber) rests on the drain protocol waiting for every
+/// consumer to uncommit; a configured drain budget (S3) weakens that wait,
+/// so a stuck consumer's stale edge may outlive the withdrawal — it
+/// self-cleans when the consumer later converges or is disposed.
 #[cfg(debug_assertions)]
 fn check_cleared(fiber: &Fiber, checkpoint: &'static str) {
     let violation = (!fiber.store.lock().is_empty()).then(|| "store must be cleared".to_string());
@@ -330,9 +336,10 @@ fn check_cleared(fiber: &Fiber, checkpoint: &'static str) {
     let violation = {
         let root = fiber.ctx().root;
         let index = root.index.lock();
+        let drain_bounded = root.timeouts.drain.is_some();
         fiber.uid_value().map_or_else(
             || sentinel_residue(&index),
-            |uid| consumer_residue(&index, uid),
+            |uid| consumer_residue(&index, uid, drain_bounded),
         )
     };
     if let Some(what) = violation {
@@ -342,10 +349,14 @@ fn check_cleared(fiber: &Fiber, checkpoint: &'static str) {
 
 /// Index residue check for a live uid at unload/fail checkpoints.
 #[cfg(debug_assertions)]
-fn consumer_residue(index: &crate::service::DependencyIndex, uid: u64) -> Option<String> {
+fn consumer_residue(
+    index: &crate::service::DependencyIndex,
+    uid: u64,
+    drain_bounded: bool,
+) -> Option<String> {
     if index.consumer_providers.contains_key(&uid) {
         Some(format!("consumer_providers still holds {uid}"))
-    } else if index.provider_consumers.contains_key(&uid) {
+    } else if !drain_bounded && index.provider_consumers.contains_key(&uid) {
         Some(format!("provider_consumers still lists {uid} as provider"))
     } else if index
         .provider_consumers
@@ -435,9 +446,14 @@ fn post_dispose_deep(fiber: &Fiber, old_uid: u64) {
     }
     let violation = {
         let index = root.index.lock();
+        // The own-provider arm rests on the drain protocol's unbounded wait;
+        // a configured drain budget (S3) lets a stuck consumer's stale edge
+        // outlive the withdrawal (self-cleaning on its later convergence or
+        // disposal).
+        let drain_bounded = root.timeouts.drain.is_some();
         if index.consumer_providers.contains_key(&old_uid) {
             Some(format!("consumer_providers still holds {old_uid}"))
-        } else if index.provider_consumers.contains_key(&old_uid) {
+        } else if !drain_bounded && index.provider_consumers.contains_key(&old_uid) {
             Some(format!(
                 "provider_consumers still lists {old_uid} as provider"
             ))

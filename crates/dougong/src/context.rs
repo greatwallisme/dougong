@@ -40,6 +40,9 @@ pub struct RootState {
     pub(crate) index: Mutex<DependencyIndex>,
     /// Lock-free-friendly mirror of which fiber uids are `Active`.
     pub(crate) active: Mutex<HashSet<u64>>,
+    /// Timeout budgets for the critical async paths (S3); fixed at
+    /// construction so every reader sees one consistent policy set.
+    pub(crate) timeouts: crate::timeout::TimeoutConfig,
 }
 
 impl std::fmt::Debug for RootState {
@@ -126,12 +129,22 @@ impl Default for Context {
 }
 
 impl Context {
-    /// Creates the root context.
+    /// Creates the root context with every timeout budget disabled (the
+    /// pre-S3 unbounded waits).
     ///
     /// The built-in `logger` service is seeded directly into the store (owned
     /// by the root fiber) so every plugin can log before providing anything.
     #[must_use]
     pub fn new() -> Self {
+        Self::new_with_timeouts(crate::timeout::TimeoutConfig::default())
+    }
+
+    /// Creates the root context with explicit timeout budgets (S3).
+    ///
+    /// The budgets are fixed for the lifetime of the root; see
+    /// [`TimeoutConfig`](crate::TimeoutConfig) for the per-path semantics.
+    #[must_use]
+    pub fn new_with_timeouts(timeouts: crate::timeout::TimeoutConfig) -> Self {
         let root = Arc::new(RootState {
             registry: Mutex::new(HashMap::new()),
             reflect: Mutex::new(ReflectStore::default()),
@@ -142,6 +155,7 @@ impl Context {
             label_seed: AtomicU64::new(1),
             index: Mutex::new(DependencyIndex::default()),
             active: Mutex::new(HashSet::new()),
+            timeouts,
         });
         let handle = Self {
             root: Arc::clone(&root),
@@ -404,7 +418,11 @@ impl Context {
         F: std::future::Future<Output = Result<Option<Disposer>>> + Send,
     {
         let fiber = self.require_fiber("effect")?;
-        fiber.effect(label, setup).await
+        // Plugin-registered teardown is orphanable under the S3 cleanup
+        // budget; kernel-structural effects register Critical directly.
+        fiber
+            .effect(label, crate::fiber::Teardown::Orphanable, setup)
+            .await
     }
 
     // ------------------------------------------------------------------
@@ -561,6 +579,12 @@ impl Context {
     // ------------------------------------------------------------------
     // Introspection
     // ------------------------------------------------------------------
+
+    /// The timeout budgets this root was built with (S3).
+    #[must_use]
+    pub fn timeouts(&self) -> &crate::timeout::TimeoutConfig {
+        &self.root.timeouts
+    }
 
     /// Number of registered plugin runtimes.
     #[must_use]

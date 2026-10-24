@@ -26,6 +26,7 @@ use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::events;
 use crate::invariant;
+use crate::logger::LogLevel;
 use crate::plugin::{BoxFuture, Injection, Plugin};
 use crate::scope::ScopeNode;
 use crate::service::resolve_impl_for;
@@ -33,8 +34,48 @@ use crate::service::resolve_impl_for;
 /// A boxed async cleanup routine collected as a fiber effect.
 pub type Disposer = Box<dyn FnOnce() -> BoxFuture<()> + Send>;
 
+/// Whether a disposer may outlive its fiber's unload path (S3 cleanup
+/// budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Teardown {
+    /// Kernel-structural disposers (service withdrawal, listener removal,
+    /// parent cascade): never orphaned — the unload path always awaits them;
+    /// their inner waits are bounded by their own budgets (drain) or are
+    /// synchronous.
+    Critical,
+    /// Plugin-registered teardown ([`Context::effect`], boundary adapters):
+    /// when the cleanup budget fires the disposer keeps running on a detached
+    /// task and the LIFO drain continues (see [`crate::TimeoutConfig::cleanup`]).
+    Orphanable,
+}
+
+/// One collected effect slot: id, label, teardown criticality, disposer.
+type Disposable = Option<(u64, String, Teardown, Disposer)>;
+
 /// Sentinel epoch string meaning "required services are not all available".
 pub const EPOCH_INACTIVE: &str = "";
+
+/// The terminal state of one activation attempt (S3).
+enum LoadOutcome {
+    /// The fiber landed (loaded, or failed and parked) — keep converging.
+    Landed,
+    /// The body hit the apply budget and was rolled back; the driver decides
+    /// between retry and parking `Failed`.
+    TimedOut,
+}
+
+/// How one spawned body task settled (S3).
+enum BodyOutcome {
+    /// The body returned (activation result).
+    Completed(Result<()>),
+    /// The scope was cancelled before or while the body ran.
+    Cancelled,
+    /// The body task died (panic or external abort).
+    Panicked(tokio::task::JoinError),
+    /// The apply budget fired; the task was cancelled and awaited to
+    /// settlement, and any late result was discarded.
+    TimedOut,
+}
 
 /// Lifecycle state of one fiber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +152,9 @@ pub struct DriveState {
     dirty: bool,
     force: bool,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Apply-timeout retries already spent on the current desired epoch (S3);
+    /// reset whenever the desired epoch changes or a load succeeds.
+    retries_used: u32,
 }
 
 /// Live instance of one plugin application.
@@ -130,7 +174,7 @@ pub struct Fiber {
     /// Committed view ω: injected deps as of activation + self-provided.
     pub(crate) store: Mutex<HashMap<String, ProviderSnapshot>>,
     loaded: Mutex<String>,
-    disposables: Mutex<Vec<Option<(u64, String, Disposer)>>>,
+    disposables: Mutex<Vec<Disposable>>,
     next_effect_id: AtomicU64,
     driver: Mutex<DriveState>,
     /// Current cancel-scope generation (S2): every task this fiber owns —
@@ -176,6 +220,7 @@ impl Fiber {
                 dirty: false,
                 force: false,
                 task: None,
+                retries_used: 0,
             }),
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
@@ -211,6 +256,7 @@ impl Fiber {
                 dirty: false,
                 force: false,
                 task: None,
+                retries_used: 0,
             }),
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
@@ -458,6 +504,7 @@ impl Fiber {
     pub(crate) fn register_effect(
         self: &Arc<Self>,
         label: impl Into<String>,
+        teardown: Teardown,
         disposer: Option<Disposer>,
     ) -> Result<EffectGuard> {
         self.ensure_can_effect()?;
@@ -465,7 +512,7 @@ impl Fiber {
         let id = self.next_effect_id.fetch_add(1, Ordering::SeqCst);
         if let Some(disposer) = disposer {
             let mut list = self.disposables.lock();
-            list.push(Some((id, effect_label, disposer)));
+            list.push(Some((id, effect_label, teardown, disposer)));
         }
         Ok(EffectGuard {
             fiber: Arc::downgrade(self),
@@ -478,12 +525,13 @@ impl Fiber {
     pub(crate) async fn effect(
         self: &Arc<Self>,
         label: impl Into<String>,
+        teardown: Teardown,
         setup: impl std::future::Future<Output = Result<Option<Disposer>>> + Send,
     ) -> Result<EffectGuard> {
         self.ensure_can_effect()?;
         let effect_label = label.into();
         let disposer = setup.await?;
-        self.register_effect(effect_label, disposer)
+        self.register_effect(effect_label, teardown, disposer)
     }
 
     /// Runs one pending disposer by id, if still live.
@@ -495,34 +543,75 @@ impl Fiber {
             let mut list = self.disposables.lock();
             let slot = list
                 .iter_mut()
-                .find(|slot| matches!(slot, Some((entry_id, _, _)) if *entry_id == id));
+                .find(|slot| matches!(slot, Some((entry_id, _, _, _)) if *entry_id == id));
             let taken = slot
                 .and_then(std::option::Option::take)
-                .map(|(_, _, disposer)| disposer);
+                .map(|(_, label, teardown, disposer)| (label, teardown, disposer));
             drop(list);
             taken
         };
-        if let Some(disposer) = taken {
-            disposer().await;
+        if let Some((label, teardown, disposer)) = taken {
+            self.run_one_disposer(label, teardown, disposer).await;
             self.bump_settle();
+        }
+    }
+
+    /// Runs one disposer under the cleanup budget (S3).
+    ///
+    /// Critical disposers always run inline to completion. An orphanable
+    /// disposer under a configured budget runs on a detached task: on timeout
+    /// the task is *not* aborted (aborting a wasm teardown would drop an
+    /// in-flight call, and a synchronous foreign call cannot be preempted) —
+    /// the timeout is logged and the drain continues while the disposer
+    /// finishes in the background.
+    async fn run_one_disposer(&self, label: String, teardown: Teardown, disposer: Disposer) {
+        let budget = self.ctx().root.timeouts.cleanup;
+        let Some(budget) = budget.filter(|_| teardown == Teardown::Orphanable) else {
+            disposer().await;
+            return;
+        };
+        let fiber = self.name();
+        let uid = self.uid_value();
+        let logger = self.ctx().logger();
+        let task = tokio::spawn(disposer());
+        match tokio::time::timeout(budget, task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(join_error)) => {
+                logger.log(
+                    LogLevel::Error,
+                    "dougong",
+                    &format!(
+                        "cleanup error: disposer \"{label}\" of fiber \"{fiber}\" (uid {uid:?}) failed: {join_error}"
+                    ),
+                );
+            }
+            Err(_elapsed) => {
+                logger.log(
+                    LogLevel::Error,
+                    "dougong",
+                    &format!(
+                        "cleanup_timeout: disposer \"{label}\" of fiber \"{fiber}\" (uid {uid:?}) exceeded {budget:?}; orphaned (still running in the background)"
+                    ),
+                );
+            }
         }
     }
 
     /// Drains every live effect LIFO, sequentially.
     async fn unload_effects(self: &Arc<Self>) {
-        let disposers: Vec<Disposer> = {
+        let disposers: Vec<(String, Teardown, Disposer)> = {
             let mut list = self.disposables.lock();
             let mut disposers = Vec::new();
             while let Some(slot) = list.pop() {
-                if let Some((_, _, disposer)) = slot {
-                    disposers.push(disposer);
+                if let Some((_, label, teardown, disposer)) = slot {
+                    disposers.push((label, teardown, disposer));
                 }
             }
             disposers
         };
         // Vec::pop yields reverse insertion order: exactly LIFO.
-        for disposer in disposers {
-            disposer().await;
+        for (label, teardown, disposer) in disposers {
+            self.run_one_disposer(label, teardown, disposer).await;
             self.bump_settle();
         }
     }
@@ -533,7 +622,7 @@ impl Fiber {
         self.disposables
             .lock()
             .iter()
-            .filter_map(|slot| slot.as_ref().map(|(_, label, _)| label.clone()))
+            .filter_map(|slot| slot.as_ref().map(|(_, label, _, _)| label.clone()))
             .collect()
     }
 
@@ -604,6 +693,10 @@ impl Fiber {
         if driver.desired == desired && !driver.dirty {
             return;
         }
+        if driver.desired != desired {
+            // A new convergence wave gets a fresh apply-retry budget (S3).
+            driver.retries_used = 0;
+        }
         driver.desired = desired;
         driver.dirty = true;
         if driver
@@ -664,7 +757,42 @@ impl Fiber {
             if self.driver.lock().desired != target {
                 continue;
             }
-            self.load_once(&target).await;
+            if matches!(self.load_once(&target).await, LoadOutcome::TimedOut) {
+                /// What the driver does after a body timeout.
+                enum After {
+                    /// Re-run the same target within the retry budget.
+                    Retry,
+                    /// Park `Failed` with the timeout error.
+                    Park,
+                    /// A newer epoch owns the driver now; loop on and let the
+                    /// next iteration converge on it (parking would clobber
+                    /// the new desired epoch).
+                    Stale,
+                }
+                let after = {
+                    let policy = self
+                        .ctx()
+                        .root
+                        .timeouts
+                        .apply
+                        .map_or(crate::timeout::ApplyPolicy::Fail, |apply| apply.policy);
+                    let mut driver = self.driver.lock();
+                    if driver.desired != target {
+                        After::Stale
+                    } else if let crate::timeout::ApplyPolicy::Retry(max) = policy
+                        && driver.retries_used < max
+                    {
+                        driver.retries_used += 1;
+                        After::Retry
+                    } else {
+                        After::Park
+                    }
+                };
+                match after {
+                    After::Retry | After::Stale => {}
+                    After::Park => self.fail_load(Error::apply_timeout(&self.name())),
+                }
+            }
         }
     }
 
@@ -675,7 +803,8 @@ impl Fiber {
         // listener invocation may outlive the teardown below — a dylib
         // post-teardown call is documented UB. Abort-safe tasks drop at
         // their next yield point; tracked boundary calls run to completion.
-        self.current_scope().cancel_and_reap().await;
+        let scope = self.current_scope();
+        self.reap_scope(&scope).await;
         // Drop committed edges before draining so `relied()` observes the
         // withdrawal as early as possible.
         {
@@ -692,57 +821,103 @@ impl Fiber {
         invariant::post_unload(self);
     }
 
-    async fn load_once(self: &Arc<Self>, target: &str) {
-        invariant::pre_load(self, target);
-        self.publish_state();
-        let Some(runtime) = self.runtime.as_ref().map(Arc::clone) else {
-            *self.loaded.lock() = target.to_string();
+    /// Cancels the scope and reaps it (S2), surfacing a tracked task that
+    /// outlives the reap-watchdog budget with an error log per interval
+    /// (S3). Never proceeds past a non-empty scope: tearing down while a
+    /// tracked foreign call is in flight is documented UB for dylib
+    /// instances, so the watchdog only ever reports.
+    async fn reap_scope(&self, scope: &Arc<CancelScope>) {
+        let Some(budget) = self.ctx().root.timeouts.reap_watchdog else {
+            scope.cancel_and_reap().await;
             return;
         };
+        scope.cancel();
+        let reap = scope.reap();
+        tokio::pin!(reap);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut reap => break,
+                () = tokio::time::sleep(budget) => {
+                    self.ctx().logger().log(
+                        LogLevel::Error,
+                        "dougong",
+                        &format!(
+                            "reap_blocked: fiber \"{}\" (uid {:?}) still waits on {} tracked task(s) after {budget:?}",
+                            self.name(),
+                            self.uid_value(),
+                            scope.task_count(),
+                        ),
+                    );
+                }
+            }
+        }
+    }
 
-        // Config resolution: `internal/config` waterfall, then the plugin's
-        // own validation (v1: JSON-shape only).
+    /// Resolves this activation's config: the `internal/config` waterfall,
+    /// then JSON-shape validation. The whole listener chain is bounded by the
+    /// listener budget (S3): internal events reject bridges, so every
+    /// listener here is plain in-process code and dropping the chain at a
+    /// poll boundary is abort-safe.
+    async fn resolve_config(self: &Arc<Self>) -> Result<Value> {
         let raw = self.raw_config.lock().clone();
-        let resolved = crate::events::waterfall_internal(
-            &self.ctx(),
+        let ctx = self.ctx();
+        let resolve = crate::events::waterfall_internal(
+            &ctx,
             "internal/config",
             Some(Arc::clone(self)),
             raw,
             |value| Box::pin(async move { Ok(value) }),
-        )
-        .await;
-        let config = match resolved {
-            Ok(value) => {
-                let check = crate::error::require_object(&value);
-                match check {
-                    Ok(()) => value,
-                    Err(err) => return self.fail_load(err),
-                }
+        );
+        let resolved = match ctx.root.timeouts.listener {
+            Some(budget) => match tokio::time::timeout(budget, resolve).await {
+                Ok(resolved) => resolved,
+                Err(_elapsed) => return Err(Error::listener_timeout("internal/config")),
+            },
+            None => resolve.await,
+        };
+        let value = resolved?;
+        crate::error::require_object(&value)?;
+        Ok(value)
+    }
+
+    /// Commits the candidate snapshots as the new committed view ω BEFORE the
+    /// body runs: the plugin reads its dependencies through this view during
+    /// activation (TS `_reload` snapshots `this.store = {...this._store}`
+    /// before executing the callback). Returns the committed map for the
+    /// post-load checkpoint.
+    fn commit_view(&self) -> HashMap<String, ProviderSnapshot> {
+        let committed: HashMap<String, ProviderSnapshot> = self.candidates.lock().clone();
+        let root = self.ctx().root;
+        let mut edges: HashMap<String, (u64, u64)> = HashMap::new();
+        let scope = Arc::clone(&self.scope);
+        for (name, snapshot) in &committed {
+            let label = ScopeNode::effective_label(Some(&scope), name);
+            edges.insert(name.clone(), (label, snapshot.provider_uid));
+        }
+        root.index
+            .lock()
+            .commit_edges(self.uid_value().unwrap_or(0), &edges);
+        self.store.lock().clone_from(&committed);
+        committed
+    }
+
+    async fn load_once(self: &Arc<Self>, target: &str) -> LoadOutcome {
+        invariant::pre_load(self, target);
+        self.publish_state();
+        let Some(runtime) = self.runtime.as_ref().map(Arc::clone) else {
+            *self.loaded.lock() = target.to_string();
+            return LoadOutcome::Landed;
+        };
+        let config = match self.resolve_config().await {
+            Ok(config) => config,
+            Err(err) => {
+                self.fail_load(err);
+                return LoadOutcome::Landed;
             }
-            Err(err) => return self.fail_load(err),
         };
         *self.config.lock() = config.clone();
-
-        // Commit the candidate snapshots as the new committed view ω BEFORE
-        // the body runs: the plugin reads its dependencies through this view
-        // during activation (TS `_reload` snapshots `this.store = {...this._store}`
-        // before executing the callback).
-        let committed: HashMap<String, ProviderSnapshot> = self.candidates.lock().clone();
-        {
-            let root = self.ctx().root;
-            let mut edges: HashMap<String, (u64, u64)> = HashMap::new();
-            let scope = Arc::clone(&self.scope);
-            for (name, snapshot) in &committed {
-                let label = ScopeNode::effective_label(Some(&scope), name);
-                edges.insert(name.clone(), (label, snapshot.provider_uid));
-            }
-            {
-                let mut index = root.index.lock();
-                index.commit_edges(self.uid_value().unwrap_or(0), &edges);
-            }
-            // Kept alive for the post-load checkpoint below.
-            self.store.lock().clone_from(&committed);
-        }
+        let committed = self.commit_view();
 
         // A panicking plugin body must not kill the driver task (that would
         // hang every `join`): the body runs on its own task inside the
@@ -763,14 +938,16 @@ impl Fiber {
         };
         // `None`: the scope was cancelled before the body started (a dispose
         // raced this load) — the cancellation arm below handles it.
-        let apply_outcome = match spawned {
-            Some(handle) => handle.await,
-            None => Ok(None),
+        let outcome = match spawned {
+            Some(handle) => self.await_body(handle, &scope).await,
+            None => BodyOutcome::Cancelled,
         };
-        match apply_outcome {
-            Ok(Some(Ok(()))) => {
+        match outcome {
+            BodyOutcome::Completed(Ok(())) => {
                 self.error.lock().take();
                 *self.loaded.lock() = target.to_string();
+                // A successful load starts a fresh retry budget (S3).
+                self.driver.lock().retries_used = 0;
                 // Republish state BEFORE notifying dependents: their
                 // `check_impl` consults provider liveness.
                 self.cache_state();
@@ -783,19 +960,23 @@ impl Fiber {
                 self.bump_settle();
                 self.publish_state();
                 invariant::post_load(self, target, &committed);
+                LoadOutcome::Landed
             }
-            Ok(Some(Err(err))) => {
+            BodyOutcome::Completed(Err(err)) => {
                 // Transactional activation: roll back what the body collected
                 // and what was committed above.
-                self.rollback_activation(&scope, err).await;
+                self.rollback_activation(&scope).await;
+                self.fail_load(err);
+                LoadOutcome::Landed
             }
-            Ok(None) => {
+            BodyOutcome::Cancelled => {
                 // The scope was cancelled (a dispose raced the load): the
                 // body was aborted at a yield point or never started.
-                self.rollback_activation(&scope, Error::msg("plugin task was cancelled"))
-                    .await;
+                self.rollback_activation(&scope).await;
+                self.fail_load(Error::msg("plugin task was cancelled"));
+                LoadOutcome::Landed
             }
-            Err(join_error) => {
+            BodyOutcome::Panicked(join_error) => {
                 let err = if join_error.is_panic() {
                     let payload = join_error.into_panic();
                     let text = payload
@@ -807,7 +988,62 @@ impl Fiber {
                 } else {
                     Error::msg("plugin task was cancelled")
                 };
-                self.rollback_activation(&scope, err).await;
+                self.rollback_activation(&scope).await;
+                self.fail_load(err);
+                LoadOutcome::Landed
+            }
+            BodyOutcome::TimedOut => {
+                // Rolled back here; the driver decides between retrying the
+                // same target and parking `Failed` (S3).
+                self.rollback_activation(&scope).await;
+                LoadOutcome::TimedOut
+            }
+        }
+    }
+
+    /// Awaits the spawned body task under the apply budget (S3).
+    ///
+    /// On timeout the scope is cancelled and the task is still awaited to
+    /// settlement: an abort-safe body resolves `None` at its next yield
+    /// point, while a tracked boundary body runs its foreign call to
+    /// completion (the wasm sandbox budget bounds that wait; a synchronous
+    /// FFI loop that never returns is surfaced by the reap watchdog). The
+    /// timeout policy owns the outcome either way, so a late body result —
+    /// including a late success — is discarded; a late panic is logged.
+    async fn await_body(
+        &self,
+        mut handle: tokio::task::JoinHandle<Option<Result<()>>>,
+        scope: &Arc<CancelScope>,
+    ) -> BodyOutcome {
+        fn classify(result: Result<Option<Result<()>>, tokio::task::JoinError>) -> BodyOutcome {
+            match result {
+                Ok(Some(result)) => BodyOutcome::Completed(result),
+                Ok(None) => BodyOutcome::Cancelled,
+                Err(join_error) => BodyOutcome::Panicked(join_error),
+            }
+        }
+        let Some(apply) = self.ctx().root.timeouts.apply else {
+            return classify(handle.await);
+        };
+        tokio::select! {
+            biased;
+            result = &mut handle => classify(result),
+            () = tokio::time::sleep(apply.budget) => {
+                scope.cancel();
+                if let Err(join_error) = handle.await
+                    && join_error.is_panic()
+                {
+                    self.ctx().logger().log(
+                        LogLevel::Error,
+                        "dougong",
+                        &format!(
+                            "apply_timeout: fiber \"{}\" (uid {:?}) body panicked while settling after its budget fired: {join_error}",
+                            self.name(),
+                            self.uid_value(),
+                        ),
+                    );
+                }
+                BodyOutcome::TimedOut
             }
         }
     }
@@ -815,9 +1051,10 @@ impl Fiber {
     /// Transactional activation rollback: reap the scope generation first
     /// (no task — and therefore no guest call — may outlive the teardown
     /// effects), then drain collected effects LIFO, uncommit the index
-    /// edges, clear the store, and park the fiber with the startup error.
-    async fn rollback_activation(self: &Arc<Self>, scope: &Arc<CancelScope>, err: Error) {
-        scope.cancel_and_reap().await;
+    /// edges, and clear the store. Parking the fiber with the startup error
+    /// is the caller's call (the S3 retry policy needs the split).
+    async fn rollback_activation(self: &Arc<Self>, scope: &Arc<CancelScope>) {
+        self.reap_scope(scope).await;
         self.unload_effects().await;
         {
             let root = self.ctx().root;
@@ -825,7 +1062,6 @@ impl Fiber {
             index.uncommit(self.uid_value().unwrap_or(0));
         }
         self.store.lock().clear();
-        self.fail_load(err);
     }
 
     fn fail_load(self: &Arc<Self>, err: Error) {
@@ -930,6 +1166,8 @@ impl Fiber {
             // currently loaded; a Failed/Pending fiber just loads directly.
             driver.force = self.loaded.lock().as_str() != EPOCH_INACTIVE;
             driver.dirty = true;
+            // An explicit restart is operator action: fresh retry budget (S3).
+            driver.retries_used = 0;
             if driver
                 .task
                 .as_ref()
@@ -1139,7 +1377,7 @@ impl EffectGuard {
                 .disposables
                 .lock()
                 .iter()
-                .any(|slot| matches!(slot, Some((id, _, _)) if *id == self.id))
+                .any(|slot| matches!(slot, Some((id, _, _, _)) if *id == self.id))
         })
     }
 }

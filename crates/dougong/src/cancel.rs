@@ -78,12 +78,18 @@ impl CancelScope {
     }
 
     /// Cancels the scope and waits until every admitted task has finished.
+    pub async fn cancel_and_reap(&self) {
+        self.cancel();
+        self.reap().await;
+    }
+
+    /// Waits until every admitted task has finished, without cancelling.
     ///
     /// Tracked tasks run to completion; a task that never yields (a
     /// synchronous foreign call that never returns) keeps the reap waiting —
-    /// that hang class belongs to the timeout policy (S3), not here.
-    pub async fn cancel_and_reap(&self) {
-        self.cancel();
+    /// that hang class is surfaced by the reap watchdog (S3), never by
+    /// proceeding past a non-empty scope.
+    pub async fn reap(&self) {
         loop {
             let notified = self.empty_signal.notified();
             tokio::pin!(notified);

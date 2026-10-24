@@ -80,6 +80,26 @@ impl Error {
         Self::new("aggregate", message)
     }
 
+    /// Creates an `apply_timeout` error: the plugin body of `name` missed its
+    /// activation budget (stability track S3).
+    #[must_use]
+    pub fn apply_timeout(name: &str) -> Self {
+        Self::new(
+            "apply_timeout",
+            format!("plugin \"{name}\" body timed out during activation"),
+        )
+    }
+
+    /// Creates a `listener_timeout` error: a listener on `name` missed its
+    /// invocation budget (stability track S3).
+    #[must_use]
+    pub fn listener_timeout(name: &str) -> Self {
+        Self::new(
+            "listener_timeout",
+            format!("listener for \"{name}\" timed out"),
+        )
+    }
+
     /// Builds a generic message-only error.
     #[must_use]
     pub fn msg(message: impl Into<String>) -> Self {

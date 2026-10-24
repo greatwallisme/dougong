@@ -93,7 +93,13 @@ pub fn plugin(
                 cascade_child.dispose().await;
             })
         });
-        if let Err(err) = parent_fiber.register_effect(label, Some(disposer)) {
+        if let Err(err) = parent_fiber.register_effect(
+            label,
+            // The cascade is kernel-structural: a child dispose must never
+            // be orphaned by the parent's cleanup budget (S3).
+            crate::fiber::Teardown::Critical,
+            Some(disposer),
+        ) {
             tokio::spawn(async move {
                 child.dispose().await;
             });

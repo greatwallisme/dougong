@@ -60,6 +60,7 @@ mod plugin;
 mod registry;
 mod scope;
 mod service;
+mod timeout;
 
 pub use context::Context;
 pub use error::{Error, Result};
@@ -72,3 +73,4 @@ pub use invoke::{Invoke, Invoker};
 pub use logger::{LogLevel, Logger, LoggerHandle, StderrLogger};
 pub use plugin::{BoxFuture, Injection, Plugin, plugin};
 pub use scope::{DEFAULT_LABEL, ScopeNode};
+pub use timeout::{ApplyPolicy, ApplyTimeout, DrainPolicy, DrainTimeout, TimeoutConfig};

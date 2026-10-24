@@ -249,6 +249,105 @@ fn null_next() -> Next {
     }))
 }
 
+/// How one bounded listener invocation settled (S3).
+enum InvokeOutcome {
+    /// The listener ran and returned (possibly with an error, including
+    /// `listener_timeout`).
+    Returned(Result<Value>),
+    /// The listener's fiber vanished between the dead-check and the spawn
+    /// (bridge path only): the listener counts as absent, never failed. The
+    /// payload comes back so the caller can pass it down the chain.
+    Vanished(Value),
+}
+
+/// How one awaited parallel-dispatch listener task settled (S3).
+enum Joined {
+    /// The `JoinHandle` resolved (task finished, vanished, or died).
+    Done(Result<Option<Result<Value>>, tokio::task::JoinError>),
+    /// The await-side budget of a tracked listener fired.
+    Elapsed,
+}
+
+/// Invokes one dispatch entry under the listener budget (S3).
+///
+/// A plain listener's future is abort-safe, so its budget is enforced by
+/// dropping the future at a poll boundary. A bridge's foreign call is never
+/// dropped mid-flight: it runs tracked inside the listener fiber's scope on
+/// a *cloned* payload and the dispatcher simply stops awaiting at the budget
+/// — the call keeps running there and the unload reap still accounts for it.
+async fn invoke_bounded(
+    entry: DispatchEntry,
+    name: &str,
+    ctx: Context,
+    payload: Value,
+    next: Next,
+    mode: DispatchMode,
+    budget: std::time::Duration,
+) -> InvokeOutcome {
+    if entry.bridge.is_none() {
+        let result =
+            match tokio::time::timeout(budget, entry.invoke(ctx, payload, next, mode)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(Error::listener_timeout(name)),
+            };
+        return InvokeOutcome::Returned(result);
+    }
+    let worker = entry.clone();
+    let spawned = entry.spawn_scoped(worker.invoke(ctx, payload.clone(), next, mode));
+    let Some(handle) = spawned else {
+        return InvokeOutcome::Vanished(payload);
+    };
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(Some(result))) => InvokeOutcome::Returned(result),
+        // `spawn_scoped` admits the task before the scope can cancel it, so
+        // a `None` here means the listener's fiber unloaded in flight.
+        Ok(Ok(None)) => InvokeOutcome::Vanished(payload),
+        Ok(Err(join_error)) => InvokeOutcome::Returned(Err(Error::msg(format!(
+            "listener task failed: {join_error}"
+        )))),
+        // Dropping the JoinHandle await detaches the task; the tracked
+        // foreign call itself is never dropped.
+        Err(_elapsed) => InvokeOutcome::Returned(Err(Error::listener_timeout(name))),
+    }
+}
+
+/// Fire-and-forget listener work under the listener budget (S3): a plain
+/// listener's future is dropped at the budget (abort-safe); a bridge call is
+/// never dropped mid-flight — the timeout is logged and the task keeps
+/// awaiting the foreign call to completion (pausing a `call_async` future is
+/// sound; only dropping it is forbidden).
+async fn run_fire_and_forget(
+    entry: DispatchEntry,
+    name: String,
+    ctx: Context,
+    payload: Value,
+    budget: Option<std::time::Duration>,
+) {
+    let tracked = entry.bridge.is_some();
+    let invoke = entry.invoke(ctx.clone(), payload, null_next(), DispatchMode::Emit);
+    match (budget, tracked) {
+        (Some(budget), false) => match tokio::time::timeout(budget, invoke).await {
+            Ok(Err(err)) => ctx.logger().log_error(&err),
+            Ok(Ok(_)) => {}
+            Err(_elapsed) => ctx.logger().log_error(&Error::listener_timeout(&name)),
+        },
+        (Some(budget), true) => {
+            tokio::pin!(invoke);
+            if tokio::time::timeout(budget, &mut invoke).await.is_err() {
+                ctx.logger().log_error(&Error::listener_timeout(&name));
+                if let Err(err) = invoke.await {
+                    ctx.logger().log_error(&err);
+                }
+            }
+        }
+        _ => {
+            if let Err(err) = invoke.await {
+                ctx.logger().log_error(&err);
+            }
+        }
+    }
+}
+
 /// Fire-and-forget dispatch. Listener failures are logged, never propagated.
 pub fn emit(ctx: &Context, name: &str, payload: Value) {
     let ctx = ctx.clone();
@@ -257,19 +356,16 @@ pub fn emit(ctx: &Context, name: &str, payload: Value) {
     // teardown never revokes in-flight delivery to *other* listeners. Each
     // listener task belongs to its owning fiber's cancel scope instead (S2).
     tokio::spawn(async move {
+        let budget = ctx.root.timeouts.listener;
         let dispatch = begin_dispatch(&ctx, "emit", &name);
         for entry in dispatch.entries {
-            let ctx = ctx.clone();
-            let payload = payload.clone();
-            let worker = entry.clone();
-            let work = async move {
-                if let Err(err) = worker
-                    .invoke(ctx.clone(), payload, null_next(), DispatchMode::Emit)
-                    .await
-                {
-                    ctx.logger().log_error(&err);
-                }
-            };
+            let work = run_fire_and_forget(
+                entry.clone(),
+                name.clone(),
+                ctx.clone(),
+                payload.clone(),
+                budget,
+            );
             // Detached on purpose: fire-and-forget. `None` means the
             // listener's fiber vanished between snapshot and spawn — skipped.
             let _ = entry.spawn_scoped(work);
@@ -283,32 +379,62 @@ pub fn emit(ctx: &Context, name: &str, payload: Value) {
 ///
 /// Returns an aggregate error when any listener fails.
 pub async fn parallel(ctx: &Context, name: &str, payload: Value) -> Result<Value> {
+    let budget = ctx.root.timeouts.listener;
     let dispatch = begin_dispatch(ctx, "parallel", name);
     let mut tasks = Vec::with_capacity(dispatch.entries.len());
     for entry in dispatch.entries {
         let ctx = ctx.clone();
         let payload = payload.clone();
         let worker = entry.clone();
+        let tracked = entry.bridge.is_some();
         let work = async move {
             worker
                 .invoke(ctx, payload, null_next(), DispatchMode::Parallel)
                 .await
         };
+        // A plain listener's budget is enforced inside its own task (the
+        // future is abort-safe, so dropping it at the budget is the S2
+        // granularity); a bridge's budget is enforced await-side below so
+        // the tracked foreign call is never dropped mid-flight.
+        let spawned = match budget.filter(|_| !tracked) {
+            Some(budget) => {
+                let name = name.to_string();
+                entry.spawn_scoped(async move {
+                    match tokio::time::timeout(budget, work).await {
+                        Ok(result) => result,
+                        Err(_elapsed) => Err(Error::listener_timeout(&name)),
+                    }
+                })
+            }
+            None => entry.spawn_scoped(work),
+        };
         // `None`: the listener's fiber unloaded between snapshot and spawn.
-        if let Some(handle) = entry.spawn_scoped(work) {
-            tasks.push(handle);
+        if let Some(handle) = spawned {
+            tasks.push((handle, budget.filter(|_| tracked)));
         }
     }
     let mut failures = Vec::new();
     let mut last = payload;
-    for task in tasks {
-        match task.await {
-            Ok(Some(Ok(value))) => last = value,
-            Ok(Some(Err(err))) => failures.push(err),
+    for (task, await_budget) in tasks {
+        let joined = match await_budget {
+            Some(budget) => match tokio::time::timeout(budget, task).await {
+                Ok(result) => Joined::Done(result),
+                Err(_elapsed) => Joined::Elapsed,
+            },
+            None => Joined::Done(task.await),
+        };
+        match joined {
+            Joined::Done(Ok(Some(Ok(value)))) => last = value,
+            Joined::Done(Ok(Some(Err(err)))) => failures.push(err),
             // The listener's fiber unloaded mid-dispatch: a vanished listener
             // counts as absent, never as a failure the emitter caused.
-            Ok(None) => {}
-            Err(join_err) => failures.push(Error::msg(format!("listener task failed: {join_err}"))),
+            Joined::Done(Ok(None)) => {}
+            Joined::Done(Err(join_err)) => {
+                failures.push(Error::msg(format!("listener task failed: {join_err}")));
+            }
+            // Dropping the JoinHandle await detaches the task; the tracked
+            // foreign call keeps running in the listener fiber's scope.
+            Joined::Elapsed => failures.push(Error::listener_timeout(name)),
         }
     }
     if failures.is_empty() {
@@ -329,6 +455,7 @@ async fn run_sequential(
     mode: DispatchMode,
     payload: Value,
 ) -> Result<Value> {
+    let budget = ctx.root.timeouts.listener;
     let dispatch = begin_dispatch(ctx, mode.as_str(), name);
     let mut current = payload;
     for entry in dispatch.entries {
@@ -338,7 +465,21 @@ async fn run_sequential(
             continue;
         }
         let ctx = ctx.clone();
-        let value = entry.invoke(ctx, current, null_next(), mode).await?;
+        let value = match budget {
+            Some(budget) => {
+                match invoke_bounded(entry, name, ctx, current, null_next(), mode, budget).await {
+                    InvokeOutcome::Returned(result) => result?,
+                    // The listener's fiber vanished between the dead-check
+                    // and the tracked spawn: absent, never failed (S2); the
+                    // payload passes through unchanged.
+                    InvokeOutcome::Vanished(back) => {
+                        current = back;
+                        continue;
+                    }
+                }
+            }
+            None => entry.invoke(ctx, current, null_next(), mode).await?,
+        };
         if is_bailed(&value) {
             return Ok(value);
         }
@@ -370,6 +511,8 @@ pub async fn waterfall<F>(ctx: &Context, name: &str, payload: Value, fallback: F
 where
     F: Fn(Value) -> BoxFuture<Result<Value>> + Send + Sync + 'static,
 {
+    let budget = ctx.root.timeouts.listener;
+    let name_owned = name.to_string();
     let dispatch = begin_dispatch(ctx, "waterfall", name);
     let fallback = Arc::new(fallback);
     let ctx_owned = ctx.clone();
@@ -380,23 +523,48 @@ where
     for entry in dispatch.entries.into_iter().rev() {
         let inner = Arc::clone(&continuation);
         let hook_ctx = ctx_owned.clone();
+        let name = name_owned.clone();
         continuation = Arc::new(move |payload: Value| {
             let inner = Arc::clone(&inner);
             let entry = entry.clone();
             let hook_ctx = hook_ctx.clone();
+            let name = name.clone();
             Box::pin(async move {
                 // A listener whose fiber unloaded mid-chain must not veto
                 // the rest: skip straight to the remaining chain.
                 if entry.is_dead() {
                     return inner(payload).await;
                 }
+                let next_inner = Arc::clone(&inner);
                 let next = Next::new(Arc::new(move |payload| {
-                    let inner = Arc::clone(&inner);
+                    let inner = Arc::clone(&next_inner);
                     Box::pin(async move { inner(payload).await })
                 }));
-                entry
-                    .invoke(hook_ctx, payload, next, DispatchMode::Waterfall)
-                    .await
+                match budget {
+                    Some(budget) => {
+                        match invoke_bounded(
+                            entry,
+                            &name,
+                            hook_ctx,
+                            payload,
+                            next,
+                            DispatchMode::Waterfall,
+                            budget,
+                        )
+                        .await
+                        {
+                            InvokeOutcome::Returned(result) => result,
+                            // Vanished mid-chain: same as dead — no veto;
+                            // the payload passes down the remaining chain.
+                            InvokeOutcome::Vanished(back) => inner(back).await,
+                        }
+                    }
+                    None => {
+                        entry
+                            .invoke(hook_ctx, payload, next, DispatchMode::Waterfall)
+                            .await
+                    }
+                }
             })
         });
     }
@@ -416,18 +584,15 @@ pub fn emit_internal(
         let store = ctx.root.events.lock();
         store.matching(name, filter).entries
     };
+    let budget = ctx.root.timeouts.listener;
     for entry in entries {
-        let ctx = ctx.clone();
-        let payload = payload.clone();
-        let worker = entry.clone();
-        let work = async move {
-            if let Err(err) = worker
-                .invoke(ctx.clone(), payload, null_next(), DispatchMode::Emit)
-                .await
-            {
-                ctx.logger().log_error(&err);
-            }
-        };
+        let work = run_fire_and_forget(
+            entry.clone(),
+            name.to_string(),
+            ctx.clone(),
+            payload.clone(),
+            budget,
+        );
         // Detached fire-and-forget, bound to the listener fiber's scope (S2).
         let _ = entry.spawn_scoped(work);
     }
@@ -502,27 +667,32 @@ async fn register_listener(
     let dispose_name = name_owned.clone();
     let dispose_ctx = register_ctx.clone();
     fiber
-        .effect(label, async move {
-            {
-                let mut store = register_ctx.root.events.lock();
-                store.register(
-                    &name_owned,
-                    register_ctx.clone(),
-                    Arc::clone(&hook_callback),
-                    global,
-                    bridge,
-                );
-            }
-            let disposer: crate::fiber::Disposer = Box::new(move || {
-                let name = dispose_name.clone();
-                let listener = Arc::clone(&listener_for_dispose);
-                let ctx = dispose_ctx.clone();
-                Box::pin(async move {
-                    ctx.root.events.lock().remove(&name, &listener);
-                })
-            });
-            Ok(Some(disposer))
-        })
+        .effect(
+            label,
+            // Listener removal is kernel-structural and synchronous (S3).
+            crate::fiber::Teardown::Critical,
+            async move {
+                {
+                    let mut store = register_ctx.root.events.lock();
+                    store.register(
+                        &name_owned,
+                        register_ctx.clone(),
+                        Arc::clone(&hook_callback),
+                        global,
+                        bridge,
+                    );
+                }
+                let disposer: crate::fiber::Disposer = Box::new(move || {
+                    let name = dispose_name.clone();
+                    let listener = Arc::clone(&listener_for_dispose);
+                    let ctx = dispose_ctx.clone();
+                    Box::pin(async move {
+                        ctx.root.events.lock().remove(&name, &listener);
+                    })
+                });
+                Ok(Some(disposer))
+            },
+        )
         .await
 }
 
