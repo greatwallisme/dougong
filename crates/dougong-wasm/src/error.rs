@@ -54,11 +54,58 @@ pub const fn to_log_level(level: wit::LogLevel) -> dougong::LogLevel {
 
 /// Encodes a kernel JSON payload onto the wire.
 pub fn encode(value: &serde_json::Value) -> dougong::Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|err| dougong::Error::msg(format!("encode payload: {err}")))
+    serde_json::to_vec(value)
+        .map_err(|err| dougong::Error::transport("payload_codec", format!("encode payload: {err}")))
 }
 
 /// Decodes a wire payload into a kernel JSON value.
 pub fn decode(bytes: &[u8]) -> dougong::Result<serde_json::Value> {
     serde_json::from_slice(bytes)
-        .map_err(|err| dougong::Error::msg(format!("decode payload: {err}")))
+        .map_err(|err| dougong::Error::transport("payload_codec", format!("decode payload: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str) -> wit::ServiceKey {
+        wit::ServiceKey {
+            name: name.to_string(),
+            abi_hash: CONTRACT_ABI_HASH.to_vec(),
+        }
+    }
+
+    #[test]
+    fn wit_mapping_preserves_the_two_level_distinction() {
+        let err = dougong::Error::undeclared_dependency("svc");
+        assert!(matches!(
+            to_wit(&err, Some(&key("svc"))),
+            wit::KernelError::UndeclaredDependency(_)
+        ));
+        let err = dougong::Error::inactive_dependency("svc");
+        assert!(matches!(
+            to_wit(&err, Some(&key("svc"))),
+            wit::KernelError::InactiveDependency(_)
+        ));
+        let roundtrip = to_kernel(&to_wit(
+            &dougong::Error::undeclared_dependency("svc"),
+            Some(&key("svc")),
+        ));
+        assert_eq!(roundtrip.code, "undeclared_dependency");
+    }
+
+    #[test]
+    fn transport_codes_survive_the_internal_variant() {
+        // The WIT variant set is contract-frozen (D7): a boundary failure
+        // degrades to `internal`, but its stable code keeps the error's type
+        // explicit and recoverable on the wire (S5/D20).
+        let err = dougong::Error::transport("wasm_trap", "guest trapped");
+        let wit::KernelError::Internal(message) = to_wit(&err, None) else {
+            panic!("transport errors map to internal");
+        };
+        assert_eq!(message, "wasm_trap: guest trapped");
+        let back = to_kernel(&wit::KernelError::Internal(message));
+        assert_eq!(back.code, "internal");
+        assert!(back.message.contains("wasm_trap"));
+    }
 }

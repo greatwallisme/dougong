@@ -80,20 +80,20 @@ impl WasmHost {
         // removed); fuel and epoch drive the sandbox budget.
         config.consume_fuel(true);
         config.epoch_interruption(true);
-        let engine =
-            Engine::new(&config).map_err(|err| Error::msg(format!("wasmtime engine: {err}")))?;
+        let engine = Engine::new(&config)
+            .map_err(|err| Error::transport("wasm_engine", format!("wasmtime engine: {err}")))?;
 
         let mut linker = Linker::new(&engine);
         crate::bindings::DougongPlugin::add_to_linker::<PluginState, HasSelf<PluginState>>(
             &mut linker,
             |state: &mut PluginState| state,
         )
-        .map_err(|err| Error::msg(format!("linker setup: {err}")))?;
+        .map_err(|err| Error::transport("wasm_engine", format!("linker setup: {err}")))?;
         // Minimal WASI: the wasip2 guest runtime always declares wasi:io
         // imports; the definitions are inert because the per-instance
         // `WasiCtx` grants no capabilities.
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(|err| Error::msg(format!("wasi linker setup: {err}")))?;
+            .map_err(|err| Error::transport("wasm_engine", format!("wasi linker setup: {err}")))?;
 
         let ticker_engine = engine.clone();
         let tick = limits.epoch_tick;

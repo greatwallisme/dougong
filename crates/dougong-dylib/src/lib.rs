@@ -176,18 +176,23 @@ const unsafe fn input_slice<'a>(data: *const u8, len: usize) -> &'a [u8] {
     }
 }
 
-/// Writes a JSON `{"code", "message"}` detail document into the caller's
-/// out-buffer, then reports `status` — or [`STATUS_CAPACITY`] when the
-/// detail does not fit, so the caller retries with a larger buffer.
+/// Writes a JSON `{"code", "class", "message"}` detail document into the
+/// caller's out-buffer, then reports `status` — or [`STATUS_CAPACITY`] when
+/// the detail does not fit, so the caller retries with a larger buffer.
+///
+/// `class` is the kernel's S5 error class (`logic` / `timeout` /
+/// `transport`): it makes the error's type explicit to the plugin without
+/// growing the status-code set (D20).
 fn write_detail(
     out_buf: *mut u8,
     cap: usize,
     out_len: *mut usize,
     code: &str,
+    class: &str,
     message: &str,
     status: i32,
 ) -> i32 {
-    let detail = serde_json::json!({ "code": code, "message": message });
+    let detail = serde_json::json!({ "code": code, "class": class, "message": message });
     // Serializing a string-only JSON object cannot fail; if it ever did,
     // reporting the bare status stays contract-correct (detail is optional).
     let Ok(bytes) = serde_json::to_vec(&detail) else {
@@ -279,6 +284,7 @@ unsafe extern "C" fn host_require(
             cap,
             out_len,
             "host_panic",
+            dougong::ErrorClass::Transport.as_str(),
             "host require entry panicked",
             STATUS_HOST_ERROR,
         )
@@ -310,6 +316,7 @@ fn require_impl(
             cap,
             out_len,
             "undeclared_dependency",
+            dougong::ErrorClass::Logic.as_str(),
             "service name is not valid UTF-8",
             STATUS_UNDECLARED,
         );
@@ -321,6 +328,7 @@ fn require_impl(
             cap,
             out_len,
             "undeclared_dependency",
+            dougong::ErrorClass::Logic.as_str(),
             &format!("cannot get property \"{service}\" without inject"),
             STATUS_UNDECLARED,
         );
@@ -333,6 +341,7 @@ fn require_impl(
             cap,
             out_len,
             "inactive_dependency",
+            dougong::ErrorClass::Logic.as_str(),
             &format!("cannot get required service \"{service}\" in inactive context"),
             STATUS_INACTIVE,
         );
@@ -357,7 +366,15 @@ fn require_impl(
             } else {
                 STATUS_FAILED
             };
-            write_detail(out_buf, cap, out_len, err.code, &err.message, status)
+            write_detail(
+                out_buf,
+                cap,
+                out_len,
+                err.code,
+                err.class.as_str(),
+                &err.message,
+                status,
+            )
         }
     }
 }
@@ -466,14 +483,17 @@ impl Exports {
                 dougong_abi::STATUS_CAPACITY => {
                     cap = cap.saturating_mul(2);
                     if cap > Self::MAX_OUTPUT_BYTES {
-                        return Err(Error::msg(format!(
-                            "dylib {op} output exceeds {} bytes",
-                            Self::MAX_OUTPUT_BYTES
-                        )));
+                        return Err(Error::transport(
+                            "ffi_status",
+                            format!("dylib {op} output exceeds {} bytes", Self::MAX_OUTPUT_BYTES),
+                        ));
                     }
                 }
                 other => {
-                    return Err(Error::msg(format!("dylib {op} failed with status {other}")));
+                    return Err(Error::transport(
+                        "ffi_status",
+                        format!("dylib {op} failed with status {other}"),
+                    ));
                 }
             }
         }
@@ -504,8 +524,12 @@ impl Exports {
         let bytes = Self::growable_call("descriptor()", move |out, cap, len| unsafe {
             ((*table).descriptor)(out, cap, len)
         })?;
-        serde_json::from_slice(&bytes)
-            .map_err(|err| Error::msg(format!("dylib descriptor is not valid JSON: {err}")))
+        serde_json::from_slice(&bytes).map_err(|err| {
+            Error::transport(
+                "plugin_load",
+                format!("dylib descriptor is not valid JSON: {err}"),
+            )
+        })
     }
 
     fn setup(&self, host: &HostExports) -> Option<Handle> {
@@ -549,10 +573,10 @@ impl Exports {
                 STATUS_CAPACITY => {
                     cap = cap.saturating_mul(2);
                     if cap > Self::MAX_OUTPUT_BYTES {
-                        return Err(Error::msg(format!(
-                            "dylib {op} output exceeds {} bytes",
-                            Self::MAX_OUTPUT_BYTES
-                        )));
+                        return Err(Error::transport(
+                            "ffi_status",
+                            format!("dylib {op} output exceeds {} bytes", Self::MAX_OUTPUT_BYTES),
+                        ));
                     }
                 }
                 STATUS_FAILED => {
@@ -563,7 +587,10 @@ impl Exports {
                     ));
                 }
                 other => {
-                    return Err(Error::msg(format!("dylib {op} failed with status {other}")));
+                    return Err(Error::transport(
+                        "ffi_status",
+                        format!("dylib {op} failed with status {other}"),
+                    ));
                 }
             }
         }
@@ -603,10 +630,13 @@ impl Exports {
                 dougong_abi::STATUS_CAPACITY => {
                     cap = cap.saturating_mul(2);
                     if cap > Self::MAX_OUTPUT_BYTES {
-                        return Err(Error::msg(format!(
-                            "dylib on_event(event={event}) output exceeds {} bytes",
-                            Self::MAX_OUTPUT_BYTES
-                        )));
+                        return Err(Error::transport(
+                            "ffi_status",
+                            format!(
+                                "dylib on_event(event={event}) output exceeds {} bytes",
+                                Self::MAX_OUTPUT_BYTES
+                            ),
+                        ));
                     }
                 }
                 other => return Ok((other, buf[..len].to_vec())),
@@ -646,22 +676,27 @@ impl Exports {
                 dougong_abi::STATUS_CAPACITY => {
                     cap = cap.saturating_mul(2);
                     if cap > Self::MAX_OUTPUT_BYTES {
-                        return Err(Error::msg(format!(
-                            "dylib on_next(event={event}) output exceeds {} bytes",
-                            Self::MAX_OUTPUT_BYTES
-                        )));
+                        return Err(Error::transport(
+                            "ffi_status",
+                            format!(
+                                "dylib on_next(event={event}) output exceeds {} bytes",
+                                Self::MAX_OUTPUT_BYTES
+                            ),
+                        ));
                     }
                 }
                 dougong_abi::STATUS_OK => return Ok(buf[..len].to_vec()),
                 dougong_abi::STATUS_DEFERRED => {
-                    return Err(Error::msg(
+                    return Err(Error::transport(
+                        "ffi_status",
                         "dylib on_next returned STATUS_DEFERRED, which is a contract violation",
                     ));
                 }
                 other => {
-                    return Err(Error::msg(format!(
-                        "dylib on_next(event={event}) failed with status {other}"
-                    )));
+                    return Err(Error::transport(
+                        "ffi_status",
+                        format!("dylib on_next(event={event}) failed with status {other}"),
+                    ));
                 }
             }
         }
@@ -758,8 +793,9 @@ fn event_bridge(
         let lock = Arc::clone(&lock);
         Box::pin(async move {
             let _instance = lock.lock().await;
-            let bytes = serde_json::to_vec(&payload)
-                .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
+            let bytes = serde_json::to_vec(&payload).map_err(|err| {
+                Error::transport("payload_codec", format!("encode payload: {err}"))
+            })?;
             let waterfall = mode == DispatchMode::Waterfall;
             let (status, reply) = {
                 let _entry = EntryGuard::enter(instance_id);
@@ -774,23 +810,27 @@ fn event_bridge(
             match status {
                 dougong_abi::STATUS_DEFERRED => {
                     if !waterfall {
-                        return Err(Error::msg(format!(
-                            "dylib plugin deferred event {event_id} outside waterfall"
-                        )));
+                        return Err(Error::transport(
+                            "ffi_status",
+                            format!("dylib plugin deferred event {event_id} outside waterfall"),
+                        ));
                     }
                     // DEFERRED output, when present, is the payload the chain
                     // continues with; empty output continues with the
                     // original.
                     let value: Value = if reply.is_empty() {
-                        serde_json::from_slice(&bytes)
-                            .map_err(|err| Error::msg(format!("decode payload: {err}")))?
+                        serde_json::from_slice(&bytes).map_err(|err| {
+                            Error::transport("payload_codec", format!("decode payload: {err}"))
+                        })?
                     } else {
-                        serde_json::from_slice(&reply)
-                            .map_err(|err| Error::msg(format!("decode payload: {err}")))?
+                        serde_json::from_slice(&reply).map_err(|err| {
+                            Error::transport("payload_codec", format!("decode payload: {err}"))
+                        })?
                     };
                     let continued = next.call(value).await?;
-                    let chain_bytes = serde_json::to_vec(&continued)
-                        .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
+                    let chain_bytes = serde_json::to_vec(&continued).map_err(|err| {
+                        Error::transport("payload_codec", format!("encode payload: {err}"))
+                    })?;
                     let processed = {
                         let _entry = EntryGuard::enter(instance_id);
                         exports.deliver_next(
@@ -800,14 +840,17 @@ fn event_bridge(
                             &chain_bytes,
                         )?
                     };
-                    serde_json::from_slice(&processed)
-                        .map_err(|err| Error::msg(format!("decode payload: {err}")))
+                    serde_json::from_slice(&processed).map_err(|err| {
+                        Error::transport("payload_codec", format!("decode payload: {err}"))
+                    })
                 }
-                STATUS_FAILED => Err(Error::msg(format!(
-                    "dylib on_event(event={event_id}) failed"
-                ))),
-                _ => serde_json::from_slice(&reply)
-                    .map_err(|err| Error::msg(format!("decode payload: {err}"))),
+                STATUS_FAILED => Err(Error::new(
+                    "listener_failed",
+                    format!("dylib on_event(event={event_id}) failed"),
+                )),
+                _ => serde_json::from_slice(&reply).map_err(|err| {
+                    Error::transport("payload_codec", format!("decode payload: {err}"))
+                }),
             }
         })
     })
@@ -886,9 +929,10 @@ impl Plugin for DynPlugin {
                 // SAFETY: setup failed, the vtable was never published; this
                 // is the unique reclaim of the raw activation reference.
                 unsafe { activation.reclaim() };
-                return Err(Error::msg(format!(
-                    "dylib plugin \"{plugin_name}\" setup returned null"
-                )));
+                return Err(Error::new(
+                    "setup_failed",
+                    format!("dylib plugin \"{plugin_name}\" setup returned null"),
+                ));
             };
 
             // Teardown runs exactly once per successful setup, after every
@@ -957,14 +1001,19 @@ pub fn load(path: &Path) -> Result<Arc<dyn Plugin>> {
     // SAFETY: `Library::new` maps a shared library the user asked for;
     // dougong keeps every plugin mapped for the process lifetime (D5), so
     // the returned handle is never used to unmap code that may still run.
-    let lib = unsafe { Library::new(path) }
-        .map_err(|err| Error::msg(format!("dlopen {}: {err}", path.display())))?;
+    let lib = unsafe { Library::new(path) }.map_err(|err| {
+        Error::transport("plugin_load", format!("dlopen {}: {err}", path.display()))
+    })?;
     let lib = Arc::new(lib);
     // SAFETY: the symbol lives in the just-mapped library, which the
     // `Arc<Library>` kept alongside keeps alive.
     let table: libloading::Symbol<*const PluginExports> =
-        unsafe { lib.get(b"DOUGONG_PLUGIN_EXPORTS") }
-            .map_err(|err| Error::msg(format!("missing DOUGONG_PLUGIN_EXPORTS: {err}")))?;
+        unsafe { lib.get(b"DOUGONG_PLUGIN_EXPORTS") }.map_err(|err| {
+            Error::transport(
+                "plugin_load",
+                format!("missing DOUGONG_PLUGIN_EXPORTS: {err}"),
+            )
+        })?;
     let exports = Exports {
         table: *table,
         _lib: Some(lib),
@@ -980,10 +1029,13 @@ pub fn load(path: &Path) -> Result<Arc<dyn Plugin>> {
 /// Fails when the ABI version mismatches or the descriptor is malformed.
 pub fn from_exports(exports: Exports) -> Result<DynPlugin> {
     if exports.abi_version() != ABI_VERSION {
-        return Err(Error::msg(format!(
-            "ABI version mismatch: plugin exports {}, host expects {ABI_VERSION}",
-            exports.abi_version()
-        )));
+        return Err(Error::transport(
+            "plugin_load",
+            format!(
+                "ABI version mismatch: plugin exports {}, host expects {ABI_VERSION}",
+                exports.abi_version()
+            ),
+        ));
     }
     let name = exports.name();
     let descriptor: Value = exports.descriptor()?;
@@ -1016,16 +1068,18 @@ pub fn from_exports(exports: Exports) -> Result<DynPlugin> {
             for (event_name, id) in map {
                 let Ok(id) = u32::try_from(id.as_u64().unwrap_or_else(|| u64::from(u32::MAX) + 1))
                 else {
-                    return Err(Error::msg(format!(
-                        "descriptor listen[\"{event_name}\"] must be a u32 event id"
-                    )));
+                    return Err(Error::transport(
+                        "plugin_load",
+                        format!("descriptor listen[\"{event_name}\"] must be a u32 event id"),
+                    ));
                 };
                 listen.push((event_name.clone(), id));
             }
             listen
         }
         Some(_) => {
-            return Err(Error::msg(
+            return Err(Error::transport(
+                "plugin_load",
                 "descriptor listen must be an object of event name to u32 id",
             ));
         }
@@ -1189,6 +1243,9 @@ mod tests {
     fn abi_gate_rejects_version_mismatch() {
         let err = from_static(&WRONG_VERSION).expect_err("gate must reject");
         assert!(err.to_string().contains("ABI version mismatch"));
+        // S5: artifact loading is a boundary-transport failure.
+        assert_eq!(err.code, "plugin_load");
+        assert_eq!(err.class, dougong::ErrorClass::Transport);
     }
 
     #[test]
@@ -1231,6 +1288,8 @@ mod tests {
     fn malformed_listen_is_a_load_error() {
         let err = from_static(&BAD_LISTEN_TABLE).expect_err("malformed listen must fail load");
         assert!(err.to_string().contains("must be a u32 event id"));
+        assert_eq!(err.code, "plugin_load");
+        assert_eq!(err.class, dougong::ErrorClass::Transport);
     }
 
     #[tokio::test]
@@ -1307,6 +1366,101 @@ mod tests {
             .exports
             .call_full(&Handle(std::ptr::null_mut()), 0, b"");
         assert_eq!(outcome.expect("retry succeeds"), b"second");
+    }
+
+    unsafe extern "C" fn failing_call(
+        _handle: *mut std::os::raw::c_void,
+        _method: u32,
+        _data: *const u8,
+        _len: usize,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32 {
+        // SAFETY: host buffer contract; the detail is the callee's business
+        // diagnostic (v3 contract).
+        if unsafe { write_out(b"bad name", out, cap, out_len) } {
+            dougong_abi::STATUS_FAILED
+        } else {
+            dougong_abi::STATUS_CAPACITY
+        }
+    }
+
+    unsafe extern "C" fn weird_call(
+        _handle: *mut std::os::raw::c_void,
+        _method: u32,
+        _data: *const u8,
+        _len: usize,
+        _out: *mut u8,
+        _cap: usize,
+        _out_len: *mut usize,
+    ) -> i32 {
+        // Not a status the v3 contract defines: the boundary itself misbehaves.
+        42
+    }
+
+    static FAILING_TABLE: PluginExports = PluginExports {
+        abi_version: ABI_VERSION,
+        name: fake_name,
+        descriptor: fake_descriptor,
+        setup: fake_setup,
+        call: failing_call,
+        on_event: fake_on_event,
+        on_next: fake_on_next,
+        teardown: fake_teardown,
+    };
+
+    static WEIRD_TABLE: PluginExports = PluginExports {
+        abi_version: ABI_VERSION,
+        name: fake_name,
+        descriptor: fake_descriptor,
+        setup: fake_setup,
+        call: weird_call,
+        on_event: fake_on_event,
+        on_next: fake_on_next,
+        teardown: fake_teardown,
+    };
+
+    #[test]
+    fn call_statuses_map_to_classes() {
+        // STATUS_FAILED carried a business diagnostic: the transport worked,
+        // so the failure is the callee's logic.
+        let plugin = from_static(&FAILING_TABLE).expect("adapter builds");
+        let err = plugin
+            .exports
+            .call_full(&Handle(std::ptr::null_mut()), 0, b"")
+            .expect_err("business failure");
+        assert_eq!(err.code, "service_error");
+        assert_eq!(err.class, dougong::ErrorClass::Logic);
+        assert!(err.message.contains("bad name"));
+        // An undefined status is a boundary-transport failure.
+        let plugin = from_static(&WEIRD_TABLE).expect("adapter builds");
+        let err = plugin
+            .exports
+            .call_full(&Handle(std::ptr::null_mut()), 0, b"")
+            .expect_err("unknown status");
+        assert_eq!(err.code, "ffi_status");
+        assert_eq!(err.class, dougong::ErrorClass::Transport);
+    }
+
+    #[test]
+    fn outbound_detail_carries_the_class_field() {
+        let mut buf = [0_u8; 256];
+        let mut len = 0_usize;
+        let status = write_detail(
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut len,
+            "wasm_trap",
+            dougong::ErrorClass::Transport.as_str(),
+            "trap",
+            STATUS_FAILED,
+        );
+        assert_eq!(status, STATUS_FAILED);
+        let detail: Value = serde_json::from_slice(&buf[..len]).expect("detail is JSON");
+        assert_eq!(detail["code"], json!("wasm_trap"));
+        assert_eq!(detail["class"], json!("transport"));
+        assert_eq!(detail["message"], json!("trap"));
     }
 
     #[test]

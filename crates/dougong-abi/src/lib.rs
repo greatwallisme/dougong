@@ -34,8 +34,10 @@
 //!   instead of deadlocking. `in` payloads are uncapped; `out` payloads
 //!   follow the growable buffer protocol (retry on [`STATUS_CAPACITY`]).
 //! - On any `require` status other than [`STATUS_OK`]/[`STATUS_CAPACITY`]
-//!   the out buffer may carry a UTF-8 JSON detail document
-//!   (`{"code": ..., "message": ...}`); under [`STATUS_FAILED`] it conveys
+//!   the out buffer may carry a UTF-8 JSON detail document (`{"code": ...,
+//!   "class": ..., "message": ...}` — `class` is the kernel's error class,
+//!   one of `"logic"` / `"timeout"` / `"transport"`, added additively in
+//!   v0.3.0's stability track); under [`STATUS_FAILED`] it conveys
 //!   the target service's own failure. As with `call`, the host may
 //!   re-execute the invocation when the caller retries with a larger buffer.
 //! - `emit` payloads must be valid JSON bytes ([`STATUS_INVALID_PAYLOAD`]

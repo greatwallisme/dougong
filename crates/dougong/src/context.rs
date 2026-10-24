@@ -43,6 +43,8 @@ pub struct RootState {
     /// Timeout budgets for the critical async paths (S3); fixed at
     /// construction so every reader sees one consistent policy set.
     pub(crate) timeouts: crate::timeout::TimeoutConfig,
+    /// Per-class error reactions (S5); likewise fixed at construction.
+    pub(crate) policies: crate::policy::ErrorPolicies,
 }
 
 impl std::fmt::Debug for RootState {
@@ -128,23 +130,48 @@ impl Default for Context {
     }
 }
 
+/// Construction-time options of a root context: timeout budgets (S3) plus
+/// per-class error policies (S5).
+///
+/// Every field defaults to the pre-policy behavior (all budgets unbounded,
+/// all errors logged at `Error`, no listener-failure reactions, no provider
+/// quarantine), so a default-constructed root behaves exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct ContextOptions {
+    /// Timeout budgets for the critical async paths.
+    pub timeouts: crate::timeout::TimeoutConfig,
+    /// Per-class error reactions.
+    pub policies: crate::policy::ErrorPolicies,
+}
+
 impl Context {
-    /// Creates the root context with every timeout budget disabled (the
-    /// pre-S3 unbounded waits).
+    /// Creates the root context with every budget and policy disabled (the
+    /// pre-S3/S5 behavior).
     ///
     /// The built-in `logger` service is seeded directly into the store (owned
     /// by the root fiber) so every plugin can log before providing anything.
     #[must_use]
     pub fn new() -> Self {
-        Self::new_with_timeouts(crate::timeout::TimeoutConfig::default())
+        Self::new_with_options(ContextOptions::default())
     }
 
-    /// Creates the root context with explicit timeout budgets (S3).
+    /// Creates the root context with explicit timeout budgets (S3) and
+    /// default error policies.
     ///
     /// The budgets are fixed for the lifetime of the root; see
     /// [`TimeoutConfig`](crate::TimeoutConfig) for the per-path semantics.
     #[must_use]
     pub fn new_with_timeouts(timeouts: crate::timeout::TimeoutConfig) -> Self {
+        Self::new_with_options(ContextOptions {
+            timeouts,
+            policies: crate::policy::ErrorPolicies::default(),
+        })
+    }
+
+    /// Creates the root context with explicit options (S3 budgets + S5
+    /// error policies), both fixed for the lifetime of the root.
+    #[must_use]
+    pub fn new_with_options(options: ContextOptions) -> Self {
         let root = Arc::new(RootState {
             registry: Mutex::new(HashMap::new()),
             reflect: Mutex::new(ReflectStore::default()),
@@ -155,7 +182,8 @@ impl Context {
             label_seed: AtomicU64::new(1),
             index: Mutex::new(DependencyIndex::default()),
             active: Mutex::new(HashSet::new()),
-            timeouts,
+            timeouts: options.timeouts,
+            policies: options.policies,
         });
         let handle = Self {
             root: Arc::clone(&root),
@@ -286,6 +314,11 @@ impl Context {
     /// Typed service read: prefers this fiber's committed view, then the
     /// scoped store (provider must be active). Accessor entries are computed
     /// against this context on every read.
+    ///
+    /// When the S5 provider quarantine is enabled, an
+    /// [`Invoker`](crate::Invoker) read wraps
+    /// the handle so a transport-class call failure disposes the provider
+    /// fiber; the wrapper is transparent to callers otherwise.
     #[must_use]
     pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
         if let Some(fiber) = self.fiber() {
@@ -294,7 +327,12 @@ impl Context {
                 if snapshot.dynamic {
                     // Fall through to the live computation below.
                 } else {
-                    return Arc::clone(&snapshot.value).downcast::<T>().ok();
+                    let value = crate::policy::maybe_quarantine(
+                        &self.root,
+                        snapshot.provider_uid,
+                        snapshot.value,
+                    );
+                    return value.downcast::<T>().ok();
                 }
             } else if fiber.declares(name) {
                 // Declared but not committed: inactive dependency.
@@ -308,9 +346,13 @@ impl Context {
         };
         if let Some(compute) = &provided.compute {
             let computed = compute(self)?;
-            return computed.downcast::<T>().ok();
+            return crate::policy::maybe_quarantine(&self.root, provided.provider_uid, computed)
+                .downcast::<T>()
+                .ok();
         }
-        provided.value.downcast::<T>().ok()
+        crate::policy::maybe_quarantine(&self.root, provided.provider_uid, provided.value)
+            .downcast::<T>()
+            .ok()
     }
 
     /// Typed read or a descriptive error (TS proxy-miss diagnostics).
@@ -584,6 +626,12 @@ impl Context {
     #[must_use]
     pub fn timeouts(&self) -> &crate::timeout::TimeoutConfig {
         &self.root.timeouts
+    }
+
+    /// The per-class error policies this root was built with (S5).
+    #[must_use]
+    pub fn policies(&self) -> &crate::policy::ErrorPolicies {
+        &self.root.policies
     }
 
     /// Number of registered plugin runtimes.

@@ -57,13 +57,14 @@ mod invariant;
 mod invoke;
 mod logger;
 mod plugin;
+mod policy;
 mod registry;
 mod scope;
 mod service;
 mod timeout;
 
-pub use context::Context;
-pub use error::{Error, Result};
+pub use context::{Context, ContextOptions};
+pub use error::{Error, ErrorClass, Result};
 pub use events::{DispatchListener, DispatchMode, Listener, Next, is_bailed};
 pub use fiber::{
     Disposer, EPOCH_INACTIVE, EffectGuard, Fiber, FiberHandle, FiberState, ProviderSnapshot,
@@ -72,5 +73,6 @@ pub use fiber::{
 pub use invoke::{Invoke, Invoker};
 pub use logger::{LogLevel, Logger, LoggerHandle, StderrLogger};
 pub use plugin::{BoxFuture, Injection, Plugin, plugin};
+pub use policy::{ClassPolicy, ErrorPolicies, ListenerFailurePolicy, ProviderQuarantine};
 pub use scope::{DEFAULT_LABEL, ScopeNode};
 pub use timeout::{ApplyPolicy, ApplyTimeout, DrainPolicy, DrainTimeout, TimeoutConfig};

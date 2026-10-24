@@ -431,9 +431,9 @@ async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
         {
             continue;
         }
-        ctx.logger().log(
-            crate::logger::LogLevel::Error,
-            "dougong",
+        ctx.root.policies.log(
+            &*ctx.logger(),
+            crate::ErrorClass::Timeout,
             &format!(
                 "drain_timeout: consumer \"{}\" (uid {:?}) missed the {:?} drain budget",
                 fiber.name(),

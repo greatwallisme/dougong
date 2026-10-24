@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-20
+// Rust guideline compliant 2026-10-24
 //! Event bus with the five cordis dispatch modes.
 //!
 //! Events are named (`&str`) and carry one JSON payload. Every listener is an
@@ -15,9 +15,14 @@
 //!
 //! `internal/*` events are framework extension points; `internal/dispatch`
 //! fires before every non-internal dispatch.
+//!
+//! S5: every listener invocation that settles as a failure additionally runs
+//! the per-class reaction of [`crate::ErrorPolicies`] (log level plus an
+//! optional restart/dispose of the offending fiber); the mode's propagation
+//! semantics are unchanged.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use serde_json::Value;
 
@@ -113,6 +118,9 @@ struct DispatchEntry {
     bridge: Option<DispatchListener>,
     /// The owning fiber's cancel-scope generation at snapshot time (S2).
     scope: Option<Arc<CancelScope>>,
+    /// The owning fiber itself (weak), for the S5 listener-failure reaction.
+    /// The root fiber (uid 0) is framework-owned and never acted on.
+    fiber: Option<Weak<Fiber>>,
 }
 
 impl DispatchEntry {
@@ -227,6 +235,7 @@ impl EventStore {
                 callback: Arc::clone(&hook.callback),
                 bridge: hook.bridge.clone(),
                 scope: hook.ctx.fiber().map(|fiber| fiber.current_scope()),
+                fiber: Some(Weak::clone(&hook.ctx.fiber)),
             })
             .collect();
         Dispatch { entries }
@@ -284,6 +293,28 @@ async fn invoke_bounded(
     mode: DispatchMode,
     budget: std::time::Duration,
 ) -> InvokeOutcome {
+    let fiber = entry.fiber.clone();
+    let react_ctx = ctx.clone();
+    let outcome = invoke_bounded_inner(entry, name, ctx, payload, next, mode, budget).await;
+    // S5: one settled failure = one policy reaction on the offending fiber,
+    // regardless of the dispatch mode the invocation ran under.
+    if let InvokeOutcome::Returned(Err(err)) = &outcome {
+        crate::policy::react_to_listener_failure(&react_ctx, fiber.as_ref(), err);
+    }
+    outcome
+}
+
+/// The budgeted invocation itself, split from [`invoke_bounded`] so the S5
+/// reaction wraps every settled-failure arm in one place.
+async fn invoke_bounded_inner(
+    entry: DispatchEntry,
+    name: &str,
+    ctx: Context,
+    payload: Value,
+    next: Next,
+    mode: DispatchMode,
+    budget: std::time::Duration,
+) -> InvokeOutcome {
     if entry.bridge.is_none() {
         let result =
             match tokio::time::timeout(budget, entry.invoke(ctx, payload, next, mode)).await {
@@ -302,9 +333,7 @@ async fn invoke_bounded(
         // `spawn_scoped` admits the task before the scope can cancel it, so
         // a `None` here means the listener's fiber unloaded in flight.
         Ok(Ok(None)) => InvokeOutcome::Vanished(payload),
-        Ok(Err(join_error)) => InvokeOutcome::Returned(Err(Error::msg(format!(
-            "listener task failed: {join_error}"
-        )))),
+        Ok(Err(join_error)) => InvokeOutcome::Returned(Err(Error::listener_panicked(&join_error))),
         // Dropping the JoinHandle await detaches the task; the tracked
         // foreign call itself is never dropped.
         Err(_elapsed) => InvokeOutcome::Returned(Err(Error::listener_timeout(name))),
@@ -316,6 +345,11 @@ async fn invoke_bounded(
 /// never dropped mid-flight — the timeout is logged and the task keeps
 /// awaiting the foreign call to completion (pausing a `call_async` future is
 /// sound; only dropping it is forbidden).
+///
+/// S5: failures log at the level their class's policy assigns and run the
+/// class's listener-failure reaction. One invocation reacts at most once: a
+/// bridge that first misses its budget reacts to the timeout; a later
+/// completion error of the same call is only logged.
 async fn run_fire_and_forget(
     entry: DispatchEntry,
     name: String,
@@ -324,25 +358,38 @@ async fn run_fire_and_forget(
     budget: Option<std::time::Duration>,
 ) {
     let tracked = entry.bridge.is_some();
+    let fiber = entry.fiber.clone();
     let invoke = entry.invoke(ctx.clone(), payload, null_next(), DispatchMode::Emit);
+    let note = |err: &Error, react: bool| {
+        ctx.root.policies.log_error(&*ctx.logger(), err);
+        if react {
+            crate::policy::react_to_listener_failure(&ctx, fiber.as_ref(), err);
+        }
+    };
     match (budget, tracked) {
         (Some(budget), false) => match tokio::time::timeout(budget, invoke).await {
-            Ok(Err(err)) => ctx.logger().log_error(&err),
+            Ok(Err(err)) => note(&err, true),
             Ok(Ok(_)) => {}
-            Err(_elapsed) => ctx.logger().log_error(&Error::listener_timeout(&name)),
+            Err(_elapsed) => note(&Error::listener_timeout(&name), true),
         },
         (Some(budget), true) => {
             tokio::pin!(invoke);
-            if tokio::time::timeout(budget, &mut invoke).await.is_err() {
-                ctx.logger().log_error(&Error::listener_timeout(&name));
-                if let Err(err) = invoke.await {
-                    ctx.logger().log_error(&err);
+            match tokio::time::timeout(budget, &mut invoke).await {
+                // A within-budget failure was previously dropped unlogged;
+                // S5 closes that swallow gap.
+                Ok(Err(err)) => note(&err, true),
+                Ok(Ok(_)) => {}
+                Err(_elapsed) => {
+                    note(&Error::listener_timeout(&name), true);
+                    if let Err(err) = invoke.await {
+                        note(&err, false);
+                    }
                 }
             }
         }
         _ => {
             if let Err(err) = invoke.await {
-                ctx.logger().log_error(&err);
+                note(&err, true);
             }
         }
     }
@@ -386,6 +433,9 @@ pub async fn parallel(ctx: &Context, name: &str, payload: Value) -> Result<Value
         let ctx = ctx.clone();
         let payload = payload.clone();
         let worker = entry.clone();
+        // Kept for the S5 failure reaction at join time; the invocation
+        // itself consumes `entry` at spawn.
+        let reactor = entry.clone();
         let tracked = entry.bridge.is_some();
         let work = async move {
             worker
@@ -410,12 +460,12 @@ pub async fn parallel(ctx: &Context, name: &str, payload: Value) -> Result<Value
         };
         // `None`: the listener's fiber unloaded between snapshot and spawn.
         if let Some(handle) = spawned {
-            tasks.push((handle, budget.filter(|_| tracked)));
+            tasks.push((handle, budget.filter(|_| tracked), reactor));
         }
     }
     let mut failures = Vec::new();
     let mut last = payload;
-    for (task, await_budget) in tasks {
+    for (task, await_budget, entry) in tasks {
         let joined = match await_budget {
             Some(budget) => match tokio::time::timeout(budget, task).await {
                 Ok(result) => Joined::Done(result),
@@ -423,18 +473,23 @@ pub async fn parallel(ctx: &Context, name: &str, payload: Value) -> Result<Value
             },
             None => Joined::Done(task.await),
         };
-        match joined {
-            Joined::Done(Ok(Some(Ok(value)))) => last = value,
-            Joined::Done(Ok(Some(Err(err)))) => failures.push(err),
+        let failed = match joined {
+            Joined::Done(Ok(Some(Ok(value)))) => {
+                last = value;
+                None
+            }
+            Joined::Done(Ok(Some(Err(err)))) => Some(err),
             // The listener's fiber unloaded mid-dispatch: a vanished listener
             // counts as absent, never as a failure the emitter caused.
-            Joined::Done(Ok(None)) => {}
-            Joined::Done(Err(join_err)) => {
-                failures.push(Error::msg(format!("listener task failed: {join_err}")));
-            }
+            Joined::Done(Ok(None)) => None,
+            Joined::Done(Err(join_err)) => Some(Error::listener_panicked(&join_err)),
             // Dropping the JoinHandle await detaches the task; the tracked
             // foreign call keeps running in the listener fiber's scope.
-            Joined::Elapsed => failures.push(Error::listener_timeout(name)),
+            Joined::Elapsed => Some(Error::listener_timeout(name)),
+        };
+        if let Some(err) = failed {
+            crate::policy::react_to_listener_failure(ctx, entry.fiber.as_ref(), &err);
+            failures.push(err);
         }
     }
     if failures.is_empty() {
@@ -465,20 +520,28 @@ async fn run_sequential(
             continue;
         }
         let ctx = ctx.clone();
-        let value = match budget {
-            Some(budget) => {
-                match invoke_bounded(entry, name, ctx, current, null_next(), mode, budget).await {
-                    InvokeOutcome::Returned(result) => result?,
-                    // The listener's fiber vanished between the dead-check
-                    // and the tracked spawn: absent, never failed (S2); the
-                    // payload passes through unchanged.
-                    InvokeOutcome::Vanished(back) => {
-                        current = back;
-                        continue;
-                    }
+        let value = if let Some(budget) = budget {
+            match invoke_bounded(entry, name, ctx, current, null_next(), mode, budget).await {
+                InvokeOutcome::Returned(result) => result?,
+                // The listener's fiber vanished between the dead-check
+                // and the tracked spawn: absent, never failed (S2); the
+                // payload passes through unchanged.
+                InvokeOutcome::Vanished(back) => {
+                    current = back;
+                    continue;
                 }
             }
-            None => entry.invoke(ctx, current, null_next(), mode).await?,
+        } else {
+            // Inline (unbudgeted) invocation: the S5 reaction wraps the
+            // settled failure here; the budgeted arm reacts inside
+            // `invoke_bounded` instead.
+            let fiber = entry.fiber.clone();
+            let react_ctx = ctx.clone();
+            let result = entry.invoke(ctx, current, null_next(), mode).await;
+            if let Err(err) = &result {
+                crate::policy::react_to_listener_failure(&react_ctx, fiber.as_ref(), err);
+            }
+            result?
         };
         if is_bailed(&value) {
             return Ok(value);
@@ -540,30 +603,35 @@ where
                     let inner = Arc::clone(&next_inner);
                     Box::pin(async move { inner(payload).await })
                 }));
-                match budget {
-                    Some(budget) => {
-                        match invoke_bounded(
-                            entry,
-                            &name,
-                            hook_ctx,
-                            payload,
-                            next,
-                            DispatchMode::Waterfall,
-                            budget,
-                        )
-                        .await
-                        {
-                            InvokeOutcome::Returned(result) => result,
-                            // Vanished mid-chain: same as dead — no veto;
-                            // the payload passes down the remaining chain.
-                            InvokeOutcome::Vanished(back) => inner(back).await,
-                        }
+                if let Some(budget) = budget {
+                    match invoke_bounded(
+                        entry,
+                        &name,
+                        hook_ctx,
+                        payload,
+                        next,
+                        DispatchMode::Waterfall,
+                        budget,
+                    )
+                    .await
+                    {
+                        InvokeOutcome::Returned(result) => result,
+                        // Vanished mid-chain: same as dead — no veto;
+                        // the payload passes down the remaining chain.
+                        InvokeOutcome::Vanished(back) => inner(back).await,
                     }
-                    None => {
-                        entry
-                            .invoke(hook_ctx, payload, next, DispatchMode::Waterfall)
-                            .await
+                } else {
+                    // Inline (unbudgeted) invocation: same S5 reaction
+                    // seam as `run_sequential`.
+                    let fiber = entry.fiber.clone();
+                    let react_ctx = hook_ctx.clone();
+                    let result = entry
+                        .invoke(hook_ctx, payload, next, DispatchMode::Waterfall)
+                        .await;
+                    if let Err(err) = &result {
+                        crate::policy::react_to_listener_failure(&react_ctx, fiber.as_ref(), err);
                     }
+                    result
                 }
             })
         });

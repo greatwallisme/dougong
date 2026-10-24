@@ -103,8 +103,13 @@ pub use engine::{WasmHost, WasmLimits};
 /// Fails when the file is not a valid component, instantiation or the
 /// descriptor export traps, or the sandbox limits reject the instantiation.
 pub async fn load(host: &WasmHost, path: &Path) -> Result<Arc<dyn Plugin>> {
-    let component = wasmtime::component::Component::from_file(host.engine(), path)
-        .map_err(|err| Error::msg(format!("component {}: {err}", path.display())))?;
+    let component =
+        wasmtime::component::Component::from_file(host.engine(), path).map_err(|err| {
+            Error::transport(
+                "plugin_load",
+                format!("component {}: {err}", path.display()),
+            )
+        })?;
 
     let channel = Arc::new(channel::GuestChannel::new());
     let mut store = wasmtime::Store::new(
@@ -117,7 +122,12 @@ pub async fn load(host: &WasmHost, path: &Path) -> Result<Arc<dyn Plugin>> {
     channel::arm_budget(&mut store)?;
     let exports = DougongPlugin::instantiate_async(&mut store, &component, host.linker())
         .await
-        .map_err(|err| Error::msg(format!("instantiate {}: {err}", path.display())))?;
+        .map_err(|err| {
+            Error::transport(
+                "plugin_load",
+                format!("instantiate {}: {err}", path.display()),
+            )
+        })?;
     channel.bind_exports(exports);
 
     let descriptor = channel
@@ -125,7 +135,7 @@ pub async fn load(host: &WasmHost, path: &Path) -> Result<Arc<dyn Plugin>> {
         .dougong_kernel_plugin()
         .call_descriptor(&mut store)
         .await
-        .map_err(|err| Error::msg(format!("descriptor trap: {err}")))?;
+        .map_err(|err| Error::transport("wasm_trap", format!("descriptor trap: {err}")))?;
 
     let provide: Vec<String> = descriptor
         .provide

@@ -112,7 +112,7 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - **D-V3-1 vtable 传递 = a) setup 携带**：`setup(host: *const HostExports) -> *mut c_void`，`HostExports { host_handle, require, emit }` 在 setup 期间按值复制。理由：vtable 先于 setup 首指令可用，setup 期 require（G5）天然满足；ABI 版本本已必 bump，无兼容包袱；失败模式最少。
 - **D-V3-3 重入策略 = b') 同线程环检测**：thread-local 激活栈覆盖全部外来入口（setup/call/on_event/on_next/teardown，guard 不跨 await——任务迁移会破坏线程配对）；环 = 确定性 `reentrancy_cycle` 错误（`STATUS_REENTRANCY`），永不死锁。合法 service→service 链（call 处理器内 require 其他服务）放行；插件自有线程空栈出发，永不入环。否决项：a) 全禁令会禁掉 fr 侧审批→session 落账的合法链（不可用）；c) 嵌套派发独立执行体帧跳跃 + 跨执行体锁等待，复杂度最高。
 - **D-V3-4 require 执行器 = 实现期基准**：基线 = `rt.enter()` + 调用线程本地自写 parker `block_on`——不依赖调用线程恰在 tokio 内（B1 定性满足）、不消耗 runtime worker、current_thread 兼容、对 future 无 Send 要求、重入栈在该路径上精确。驱动器收敛为 dougong-dylib 内部单个函数，缝后可换（备选：spawn-to-runtime + 调用线程 park oneshot）。
-- **D-V3-5 错误模型 = 状态码 + 详情载荷**：新增 `STATUS_UNDECLARED(-3)`/`INACTIVE(-4)`/`REENTRANCY(-5)`/`HOST_ERROR(-6)`/`INVALID_PAYLOAD(-7)`/`INVALID_EVENT(-8)`；任何非 OK/CAPACITY 状态可在 out buffer 携带 `{"code","message"}` JSON 详情，`STATUS_FAILED` 的详情 = 目标业务错误透传。与内核两级能力检查（undeclared vs inactive，TS Alg. 6）同名对齐。
+- **D-V3-5 错误模型 = 状态码 + 详情载荷**：新增 `STATUS_UNDECLARED(-3)`/`INACTIVE(-4)`/`REENTRANCY(-5)`/`HOST_ERROR(-6)`/`INVALID_PAYLOAD(-7)`/`INVALID_EVENT(-8)`；任何非 OK/CAPACITY 状态可在 out buffer 携带 `{"code","message"}` JSON 详情（D20 起增 `"class"` 字段，additive），`STATUS_FAILED` 的详情 = 目标业务错误透传。与内核两级能力检查（undeclared vs inactive，TS Alg. 6）同名对齐。
 - **§5.8 推翻（附带裁决）**：事件派发队列化（bounded 队列 + worker pool + per-event-type 并发上限 + 背压 + 按事件名 opt-in 可丢弃）全量入 v0.3.0 范围；默认语义不变（不丢弃、五次序承诺照旧）。
 - 生命周期与纪律：vtable 按激活期构造（A3），旧激活回滚后其 vtable 死亡，其后调用 = 文档化 UB（不检测）；插件自有线程须在本次 teardown 返回前终止并 join（A6，成文不强制）；宿主全部 vtable 入口 catch_unwind（A4，panic 不跨界）；emit 不取发射方实例锁（C6 恒合法）；teardown 后在途派发不撤销（C7）。
 - 验证锚：E1.1–11 矩阵（`dougong-dylib::outbound_tests`）+ `outbound_demo` 两臂；内核本体零改动（桥全走既有公共面：`ctx.get::<Invoker>` / `ctx.emit` / `Error::new`）；dougong-loader 经 `dougong_dylib::load` 同源复用（D3）。语义差异落附录 A 等价表。
@@ -154,6 +154,19 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - **入口显式错误**（稳定码入 Error）：restart/update on disposed ⇒ `fiber_disposed(action)`（替代语义含糊的 `inactive_effect`，需求「error with explicit reason」）；update on Unloading ⇒ `fiber_unloading`（需求字面 reject）；update on Loading ⇒ `fiber_loading`（超字面扩展，依据：在途激活已 clone 配置，Ok 返回即谎言）。入口守卫是进入时刻的点读；waterfall 期间的流转由 driver 串行化 + 咽喉守卫兜底收敛（tail 的 restart 自带 disposed 检查）。
 - **Pending/Failed 的 update stash 臂保留**（loader 预配置通路）：清 error + 写 raw_config + refresh；原 `request_epoch(EPOCH_INACTIVE)` 在守卫后证明恒空转（parked fiber desired 已是 INACTIVE）⇒ 删除。零 API 签名变更；边界宿主透传安全（dylib 仅特判 reentrancy_cycle，其余码入详情载荷泛传；wasm 不枚举码）。
 - 验证锚：`tests/lifecycle_guards.rs` 6 例（顺序双 dispose 单 teardown / 并发 8× dispose 单 winner + disposed 事件恰一次 / restart+update on disposed 显式错 / update on Unloading（provider 撤回 + 受控门 disposer 确定性构造）/ update on Loading（受控门 body））+ fiber.rs 内联单测（dispose 后直接 refresh 不复活：driver 快照恒 INACTIVE + body 计数不变）；既有全套回归零改动通过 = 无既有流依赖 Loading/Unloading 期 update。
+
+### D20 错误三分 + 分级策略 = Error.class 字段 + ErrorPolicies 政策表（S5）
+
+2026-10-24，improve 二.5 落地（设计定稿见 `.planning/2026-10-23-v0-3-0-dylib-outbound-and-runtime-harden/findings.md` §14）：
+
+- **三分载体**：`Error` 增 `pub class: ErrorClass`（`Logic` / `Timeout` / `Transport`，声明序即严重度 Ord ⇒ `aggregate` 取成员最重）。构造器设定：`new`/`msg` = Logic，`Error::transport` = Transport，三个 timeout 构造器 = Timeout。依据：码派生分类对 `internal` 桶结构性失效；显式字段编译期强制每个构造点做分类决定。
+- **码面整顿（「明确报错类型」落地）**：msg 桶细分——内核 `plugin_panicked` / `plugin_cancelled` / `listener_panicked` / `join_timeout`；dylib `ffi_status`（非约状态 + 容量溢出 + DEFERRED 契约违背）/ `plugin_load`（dlopen / 描述符 / ABI 门）/ `payload_codec` / `setup_failed` / `listener_failed`；wasm `wasm_trap` / `wasm_engine` / `payload_codec`。`service_error` 保持 Logic（传输成功、业务失败——类描述的是故障面而非方向）。
+- **政策面（OBS 裁决同构）**：`ErrorPolicies { logic, timeout, transport: ClassPolicy, provider_quarantine }`；`ClassPolicy { log_level, on_listener_failure: LogOnly | RestartFiber | DisposeFiber }`；`ProviderQuarantine::Disabled | DisposeOnTransportError`。构造期固定于 RootState，经 `ContextOptions` + `Context::new_with_options` 注入（`new`/`new_with_timeouts` 委托之，签名不变）。**默认 = 全 Error 级 + LogOnly + Disabled ⇒ 零行为变化**（既有全套零改动通过即实证）。
+- **四旋钮 → 诚实缝映射**：log level = 全部内核错误日志点（fail_load / fire-and-forget / cleanup / reap 看门狗 / drain / apply 落定 panic）改道政策助手按类取级。crash = listener 失败在**全部五模式的结算点**对肇事 fiber 施加反应（detached 执行，不占派发延迟、不与 drain 成环；uid 0 root fiber 永不为目标）；传播语义不动（五模式契约）——反应是运行时对肇事者的带外动作；body 失败的 transactional Failed 是固定语义非旋钮。retry = 仅 apply 有界重试（S3 已落地，即 Timeout 类重试旋钮）；listener / transport 自动重试**不提供**——投递次数是五模式契约语义，内核无幂等信号，重试归发射方业务层。isolate = quarantine 在 `Context::get` 的 Invoker 解析处包 `QuarantineInvoke`（`Weak<RootState>` 防循环引用），Transport 类调用失败 ⇒ detached dispose 肇事 provider fiber（terminal 无自动循环；loader reconcile 可显式重载）；in-process impl 永不产 Transport ⇒ 对其零影响。
+- **边界映射显式化**：dylib 出站详情 JSON 增 `"class"` 字段（additive，状态码集不变，不触 ABI 面）；wasm 的 WIT `kernel-error` 变体集不变（契约变更属 D7 流程，本项不动）——`internal` 串内 code 现已显式（`"wasm_trap: …"`），类型可恢复。
+- **「fire-and-forget 吞错误」痛点闭环**：盘点实证 bridge + 预算臂在预算内失败时既不记录也不传播（原代码只在超时分支记录）；现统一按类分级记录 + 政策反应，且一次调用至多反应一次（桥超时先反应，迟到的完成错误只记录）。
+- **与 O6 的分界**：S5 三类 = 运行时政策维度；O6（Phase 4，IR 三.6）八类告警 = 可观测性维度，将在本分类日志助手上构建，互不吞并。
+- 验证锚：`tests/error_policy.rs` 11 例（构造器分类 / 三类 log level / LogOnly 默认 / RestartFiber / DisposeFiber / parallel 聚合与反应并存 / serial 传播与反应 / quarantine 三臂（Transport⇒dispose、Logic⇒不动、Disabled⇒不动）/ root fiber 豁免）+ dylib `call_statuses_map_to_classes` 与 `outbound_detail_carries_the_class_field`（另有两例既有测试扩类断言）+ wasm 4 例（两级区分保持、Internal 串码可恢复、trap/reentry 分类）；默认零配置回归 = 既有全套。
 
 ## 3. 剩余真实待决（产品判断，非工程回避）
 

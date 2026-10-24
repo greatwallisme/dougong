@@ -26,7 +26,6 @@ use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::events;
 use crate::invariant;
-use crate::logger::LogLevel;
 use crate::plugin::{BoxFuture, Injection, Plugin};
 use crate::scope::ScopeNode;
 use crate::service::resolve_impl_for;
@@ -579,23 +578,24 @@ impl Fiber {
         };
         let fiber = self.name();
         let uid = self.uid_value();
-        let logger = self.ctx().logger();
+        let ctx = self.ctx();
+        let logger = ctx.logger();
         let task = tokio::spawn(disposer());
         match tokio::time::timeout(budget, task).await {
             Ok(Ok(())) => {}
             Ok(Err(join_error)) => {
-                logger.log(
-                    LogLevel::Error,
-                    "dougong",
+                ctx.root.policies.log(
+                    &*logger,
+                    crate::ErrorClass::Logic,
                     &format!(
                         "cleanup error: disposer \"{label}\" of fiber \"{fiber}\" (uid {uid:?}) failed: {join_error}"
                     ),
                 );
             }
             Err(_elapsed) => {
-                logger.log(
-                    LogLevel::Error,
-                    "dougong",
+                ctx.root.policies.log(
+                    &*logger,
+                    crate::ErrorClass::Timeout,
                     &format!(
                         "cleanup_timeout: disposer \"{label}\" of fiber \"{fiber}\" (uid {uid:?}) exceeded {budget:?}; orphaned (still running in the background)"
                     ),
@@ -855,9 +855,10 @@ impl Fiber {
                 biased;
                 () = &mut reap => break,
                 () = tokio::time::sleep(budget) => {
-                    self.ctx().logger().log(
-                        LogLevel::Error,
-                        "dougong",
+                    let ctx = self.ctx();
+                    ctx.root.policies.log(
+                        &*ctx.logger(),
+                        crate::ErrorClass::Timeout,
                         &format!(
                             "reap_blocked: fiber \"{}\" (uid {:?}) still waits on {} tracked task(s) after {budget:?}",
                             self.name(),
@@ -989,7 +990,7 @@ impl Fiber {
                 // The scope was cancelled (a dispose raced the load): the
                 // body was aborted at a yield point or never started.
                 self.rollback_activation(&scope).await;
-                self.fail_load(Error::msg("plugin task was cancelled"));
+                self.fail_load(Error::plugin_cancelled());
                 LoadOutcome::Landed
             }
             BodyOutcome::Panicked(join_error) => {
@@ -1000,9 +1001,9 @@ impl Fiber {
                         .map(|slice| (*slice).to_string())
                         .or_else(|| payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "plugin body panicked".to_string());
-                    Error::msg(format!("plugin panicked: {text}"))
+                    Error::plugin_panicked(&text)
                 } else {
-                    Error::msg("plugin task was cancelled")
+                    Error::plugin_cancelled()
                 };
                 self.rollback_activation(&scope).await;
                 self.fail_load(err);
@@ -1049,9 +1050,10 @@ impl Fiber {
                 if let Err(join_error) = handle.await
                     && join_error.is_panic()
                 {
-                    self.ctx().logger().log(
-                        LogLevel::Error,
-                        "dougong",
+                    let ctx = self.ctx();
+                    ctx.root.policies.log(
+                        &*ctx.logger(),
+                        crate::ErrorClass::Timeout,
                         &format!(
                             "apply_timeout: fiber \"{}\" (uid {:?}) body panicked while settling after its budget fired: {join_error}",
                             self.name(),
@@ -1082,7 +1084,7 @@ impl Fiber {
 
     fn fail_load(self: &Arc<Self>, err: Error) {
         let ctx = self.ctx();
-        ctx.logger().log_error(&err);
+        ctx.root.policies.log_error(&*ctx.logger(), &err);
         self.error.lock().replace(err);
         *self.loaded.lock() = EPOCH_INACTIVE.to_string();
         // Park: the next provide/withdraw notification re-arms convergence.
@@ -1156,10 +1158,10 @@ impl Fiber {
             let _ = *rx.borrow_and_update();
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(Error::msg(format!("join(\"{}\") timed out", self.name())));
+                return Err(Error::join_timeout(&self.name()));
             }
             if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
-                return Err(Error::msg(format!("join(\"{}\") timed out", self.name())));
+                return Err(Error::join_timeout(&self.name()));
             }
         }
         self.error

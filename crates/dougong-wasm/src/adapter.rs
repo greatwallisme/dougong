@@ -115,7 +115,9 @@ impl Plugin for WasmPlugin {
                     .dougong_kernel_plugin()
                     .call_apply(&mut *guard, &site, &config_bytes)
                     .await
-                    .map_err(|err| Error::msg(format!("wasm trap in apply: {err}")))?;
+                    .map_err(|err| {
+                        Error::transport("wasm_trap", format!("wasm trap in apply: {err}"))
+                    })?;
                 // Release the store before surfacing guest errors.
                 drop(guard);
                 applied.map_err(|err| crate::error::to_kernel(&err))?;

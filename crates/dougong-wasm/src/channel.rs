@@ -28,7 +28,7 @@ pub fn arm_budget(store: &mut Store<PluginState>) -> Result<()> {
     let fuel = store.data().fuel_per_call();
     store
         .set_fuel(fuel)
-        .map_err(|err| Error::msg(format!("set fuel: {err}")))?;
+        .map_err(|err| Error::transport("wasm_engine", format!("set fuel: {err}")))?;
     let ticks = store.data().epoch_ticks_per_yield();
     store.epoch_deadline_async_yield_and_update(ticks);
     Ok(())
@@ -44,7 +44,7 @@ fn reentrant() -> Error {
 
 /// Trap (or abort) surfaced by a guest export call.
 fn trapped(op: &str, err: &wasmtime::Error) -> Error {
-    Error::msg(format!("wasm trap in {op}: {err}"))
+    Error::transport("wasm_trap", format!("wasm trap in {op}: {err}"))
 }
 
 /// Route from the kernel into one guest instance.
@@ -131,7 +131,7 @@ impl GuestChannel {
     pub fn exports(&self) -> Result<&DougongPlugin> {
         self.exports
             .get()
-            .ok_or_else(|| Error::msg("guest exports are not bound"))
+            .ok_or_else(|| Error::transport("wasm_engine", "guest exports are not bound"))
     }
 
     fn store_arc(&self, service: &str) -> Result<StoreArc> {
@@ -272,5 +272,22 @@ impl Invoke for WasmInvoke {
         let channel = Arc::clone(&self.channel);
         let service = self.service.clone();
         Box::pin(async move { channel.call_service(&service, method, payload).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn trap_is_a_transport_error() {
+        let err = super::trapped("handle-service-call", &wasmtime::Error::msg("boom"));
+        assert_eq!(err.code, "wasm_trap");
+        assert_eq!(err.class, dougong::ErrorClass::Transport);
+    }
+
+    #[test]
+    fn reentry_guard_is_a_logic_error() {
+        let err = super::reentrant();
+        assert_eq!(err.code, "capability_denied");
+        assert_eq!(err.class, dougong::ErrorClass::Logic);
     }
 }
