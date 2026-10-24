@@ -288,40 +288,53 @@ pub async fn provide(
             // drain budget below.
             crate::fiber::Teardown::Critical,
             async move {
-                {
-                    let mut store = effect_ctx.root.reflect.lock();
-                    store.insert(provided, label, &owner)?;
-                };
-                // The provider must see itself during activation (TS writes
-                // the impl into its own committed view).
-                fiber_in.commit_self(
-                    &name_owned,
-                    crate::fiber::ProviderSnapshot {
-                        provider_uid: uid,
-                        value: self_value,
-                        dynamic: false,
-                    },
-                );
-                if fiber_in.state() == FiberState::Active {
-                    notify(&effect_ctx, std::slice::from_ref(&name_owned));
-                }
+                // S6 (D21): the slot mutation, self-commit, and dependent
+                // refresh form one serial section per service group, so a
+                // concurrent update to the same slot can never slip between
+                // them (which used to be able to lose a withdrawal event).
+                let key = crate::ordering::GroupKey::new(label, &name_owned);
+                let section_ctx = effect_ctx.clone();
+                let section_name = name_owned.clone();
+                effect_ctx.root.ordering.run(&key, move || -> Result<()> {
+                    {
+                        let mut store = section_ctx.root.reflect.lock();
+                        store.insert(provided, label, &owner)?;
+                    };
+                    // The provider must see itself during activation (TS
+                    // writes the impl into its own committed view).
+                    fiber_in.commit_self(
+                        &section_name,
+                        crate::fiber::ProviderSnapshot {
+                            provider_uid: uid,
+                            value: self_value,
+                            dynamic: false,
+                        },
+                    );
+                    if fiber_in.state() == FiberState::Active {
+                        notify(&section_ctx, std::slice::from_ref(&section_name));
+                    }
+                    Ok(())
+                })?;
                 let disposer_name = name_owned.clone();
                 let disposer_ctx = effect_ctx.clone();
                 let disposer: crate::fiber::Disposer = Box::new(move || {
                     let name = disposer_name.clone();
                     let ctx = disposer_ctx.clone();
                     Box::pin(async move {
-                        {
-                            let mut store = ctx.root.reflect.lock();
-                            store.remove(&name, label)
-                        };
                         // Withdrawal protocol: wake dependents, then wait for
                         // them to converge before returning. Consumer join
                         // errors are the consumer's own startup failures, already
                         // logged there; the drain only needs convergence. With a
                         // drain budget (S3) the per-consumer wait is bounded and
                         // the configured policy runs on a timeout.
-                        let touched = notify(&ctx, &[name]);
+                        //
+                        // S6 (D21): removal + notification are one serial
+                        // section; the drain waits *outside* it so a stuck
+                        // consumer cannot block later updates of this group.
+                        let touched = ctx.root.ordering.run(&key, || {
+                            ctx.root.reflect.lock().remove(&name, label);
+                            notify(&ctx, &[name])
+                        });
                         drain_consumers(&ctx, touched).await;
                     })
                 });
@@ -360,22 +373,32 @@ pub async fn accessor(
             format!("ctx.accessor({name:?})"),
             crate::fiber::Teardown::Critical,
             async move {
-                {
-                    let mut store = effect_ctx.root.reflect.lock();
-                    store.insert(provided, label, &owner)?;
-                };
-                fiber_in.commit_self(&name_owned, crate::fiber::ProviderSnapshot::dynamic(uid));
-                if fiber_in.state() == FiberState::Active {
-                    notify(&effect_ctx, std::slice::from_ref(&name_owned));
-                }
+                // S6 (D21): same serial-section discipline as `provide`.
+                let key = crate::ordering::GroupKey::new(label, &name_owned);
+                let section_ctx = effect_ctx.clone();
+                let section_name = name_owned.clone();
+                effect_ctx.root.ordering.run(&key, move || -> Result<()> {
+                    {
+                        let mut store = section_ctx.root.reflect.lock();
+                        store.insert(provided, label, &owner)?;
+                    };
+                    fiber_in
+                        .commit_self(&section_name, crate::fiber::ProviderSnapshot::dynamic(uid));
+                    if fiber_in.state() == FiberState::Active {
+                        notify(&section_ctx, std::slice::from_ref(&section_name));
+                    }
+                    Ok(())
+                })?;
                 let disposer_ctx = effect_ctx.clone();
                 let disposer_name = name_owned.clone();
                 let disposer: crate::fiber::Disposer = Box::new(move || {
                     let name = disposer_name.clone();
                     let ctx = disposer_ctx.clone();
                     Box::pin(async move {
-                        ctx.root.reflect.lock().remove(&name, label);
-                        let touched = notify(&ctx, &[name]);
+                        let touched = ctx.root.ordering.run(&key, || {
+                            ctx.root.reflect.lock().remove(&name, label);
+                            notify(&ctx, &[name])
+                        });
                         drain_consumers(&ctx, touched).await;
                     })
                 });

@@ -45,6 +45,8 @@ pub struct RootState {
     pub(crate) timeouts: crate::timeout::TimeoutConfig,
     /// Per-class error reactions (S5); likewise fixed at construction.
     pub(crate) policies: crate::policy::ErrorPolicies,
+    /// Per-service-group serial sections for dependency updates (S6, D21).
+    pub(crate) ordering: crate::ordering::UpdateSerializers,
 }
 
 impl std::fmt::Debug for RootState {
@@ -184,6 +186,7 @@ impl Context {
             active: Mutex::new(HashSet::new()),
             timeouts: options.timeouts,
             policies: options.policies,
+            ordering: crate::ordering::UpdateSerializers::default(),
         });
         let handle = Self {
             root: Arc::clone(&root),

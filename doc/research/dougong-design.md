@@ -168,6 +168,18 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - **与 O6 的分界**：S5 三类 = 运行时政策维度；O6（Phase 4，IR 三.6）八类告警 = 可观测性维度，将在本分类日志助手上构建，互不吞并。
 - 验证锚：`tests/error_policy.rs` 11 例（构造器分类 / 三类 log level / LogOnly 默认 / RestartFiber / DisposeFiber / parallel 聚合与反应并存 / serial 传播与反应 / quarantine 三臂（Transport⇒dispose、Logic⇒不动、Disabled⇒不动）/ root fiber 豁免）+ dylib `call_statuses_map_to_classes` 与 `outbound_detail_carries_the_class_field`（另有两例既有测试扩类断言）+ wasm 4 例（两级区分保持、Internal 串码可恢复、trap/reentry 分类）；默认零配置回归 = 既有全套。
 
+### D21 依赖更新确定性排序 = 按 service group 串行段（S6）
+
+2026-10-24，improve 二.6 落地（设计定稿见 `.planning/2026-10-23-v0-3-0-dylib-outbound-and-runtime-harden/findings.md` §15）：
+
+- **实证缺口**：provide/withdraw 的「reflect 槽位变更」与「notify（candidate 重算 + refresh + `internal/service` 发射）」是两段分离操作，段间可被同槽位的对立变更插入——同槽并发「替换」时撤销事件可整体丢失（事件流 `[true,true]` 无 `false`）或与提交序倒置，收敛路径（先 Pending 再激活 vs 跳过 Pending 直接换绑）由线程调度器掷骰。TS 参照（单线程事件循环）下该交错本不可达——S6 把参照语义还原回多线程 runtime。
+- **机制**：`RootState::ordering`（新模块 `ordering.rs`，crate 私有，零公共 API）= 按 `(label, name)` 键控的串行段表。四处段落点全部同步无 await：provide/accessor 的 apply 臂 `{insert + commit_self + (Active ⇒ notify)}` 与撤回 disposer 同步前缀 `{remove + notify}`；consumer 的 **drain 等待留在段外**（Thm 63 等待不持键——卡死 consumer 不得堵死同组后续更新；无缝换绑路径保留）。键以 provide 落槽的 `primary_label` 同源计算 ⇒ key↔slot 精确对应；键表常驻形态与 reflect/events 的按名驻留同型。
+- **机制选型诚实说明**：段体无 await ⇒ keyed parking_lot mutex 即充分；真并发提交者的相对顺序本就由调度器定义，任务队列不改变该事实（承诺 = 同组**全序且连贯**：无撕裂、无丢失撤销事件、事件生成序 == 提交序，而非预定顺序）。coalescing 队列留作 P3 缝（语义不变可换）。
+- **不包段的面（附依据）**：加载成功批通知（fiber.rs:976）——槽位所有权 ⇒ 同键写者唯 owner fiber 自身，driver 已串行；registry 初始探针 / `Context::set` / 一切读路径——只读或本 fiber 轴。同 fiber 并发 `update()`（config）交错 = **范围外**（非依赖/事件刷新；S4 已钉入口边界；loader reconcile 串行调用；记录 findings §15 N2 备查）。
+- **锁序**：update-key → reflect/index/fibers/candidates/driver，反向路径不存在（读路径不取键；段内 emit 全 spawn 无内联执行 ⇒ 无 re-entry）⇒ 无环。
+- **保证表**：G1 同组全序连贯（无半态/无丢失事件/生成序==提交序）；G2 同 fiber 收敛全序（既有 D4 机制，风暴测试钉死）；G3 并发负载重复运行终态逐字节相同（验收锚）；G4 异组互不阻塞（单测直证）；G5 五派发模式 / C5 无次序承诺 / C7 / S1–S5 语义零改动，always-on 无旋钮（确定性是机制不是策略）。事件**观察**序仍属 C5/C7 契约面（spawn 派发，执行序不承诺）——承诺止于生成序，载荷在段内读取（与提交态一致）。
+- 验证锚：`ordering.rs` 单测 3 例（同键零重叠 / 异键不互堵 / 同键锁复用）+ `tests/ordering.rs` 4 例（同槽替换风暴 30 轮逐轮精确终态（multi_thread 4 线程）/ 4 service × 3 consumer 替换风暴 10 轮不动点逐字节精确 / 同 fiber 双 service 并发替换 20 轮无一新一陈 / current_thread 生成序==观察序交替断言）；既有全套零改动通过 = always-on 机制零回归实证。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

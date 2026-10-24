@@ -56,6 +56,7 @@ mod fiber;
 mod invariant;
 mod invoke;
 mod logger;
+mod ordering;
 mod plugin;
 mod policy;
 mod registry;
