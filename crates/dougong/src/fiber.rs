@@ -21,9 +21,11 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use serde_json::Value;
 
+use crate::cancel::CancelScope;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::events;
+use crate::invariant;
 use crate::plugin::{BoxFuture, Injection, Plugin};
 use crate::scope::ScopeNode;
 use crate::service::resolve_impl_for;
@@ -131,6 +133,10 @@ pub struct Fiber {
     disposables: Mutex<Vec<Option<(u64, String, Disposer)>>>,
     next_effect_id: AtomicU64,
     driver: Mutex<DriveState>,
+    /// Current cancel-scope generation (S2): every task this fiber owns —
+    /// listener invocations and the plugin body — is spawned into it, and
+    /// unloading the activation cancels and reaps it (see `cancel.rs`).
+    task_scope: Mutex<Arc<CancelScope>>,
     settle: (
         tokio::sync::watch::Sender<u64>,
         tokio::sync::watch::Receiver<u64>,
@@ -171,6 +177,7 @@ impl Fiber {
                 force: false,
                 task: None,
             }),
+            task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Active as u8),
         })
@@ -205,6 +212,7 @@ impl Fiber {
                 force: false,
                 task: None,
             }),
+            task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Pending as u8),
         })
@@ -257,6 +265,49 @@ impl Fiber {
     /// The uid, or `None` when disposed.
     pub(crate) fn uid_value(&self) -> Option<u64> {
         *self.uid.lock()
+    }
+
+    /// The driver's `(desired epoch, dirty flag)` snapshot.
+    pub(crate) fn driver_snapshot(&self) -> (String, bool) {
+        let driver = self.driver.lock();
+        (driver.desired.clone(), driver.dirty)
+    }
+
+    /// True while a startup error is recorded.
+    pub(crate) fn has_error(&self) -> bool {
+        self.error.lock().is_some()
+    }
+
+    /// Compares the loaded epoch against `epoch` without cloning it.
+    pub(crate) fn loaded_eq(&self, epoch: &str) -> bool {
+        *self.loaded.lock() == epoch
+    }
+
+    /// The fiber's current cancel-scope generation (S2).
+    pub(crate) fn current_scope(&self) -> Arc<CancelScope> {
+        Arc::clone(&self.task_scope.lock())
+    }
+
+    /// Swaps in a fresh scope generation; called once per activation attempt.
+    fn reset_scope(&self) -> Arc<CancelScope> {
+        let fresh = Arc::new(CancelScope::new());
+        *self.task_scope.lock() = Arc::clone(&fresh);
+        fresh
+    }
+
+    /// Scope-draining predicate for the invariant layer: a cancelled scope
+    /// must have reached zero live tasks by the time a transition lands.
+    pub(crate) fn scope_reaped(&self) -> bool {
+        let scope = self.current_scope();
+        !scope.is_cancelled() || scope.task_count() == 0
+    }
+
+    /// Test-only driver override for invariant-layer fault injection.
+    #[cfg(test)]
+    pub(crate) fn test_set_driver(&self, desired: String, dirty: bool) {
+        let mut driver = self.driver.lock();
+        driver.desired = desired;
+        driver.dirty = dirty;
     }
 
     /// The committed epoch string; [`EPOCH_INACTIVE`] while the fiber is not
@@ -583,7 +634,11 @@ impl Fiber {
                     continue;
                 }
                 driver.task = None;
+                let desired = driver.desired.clone();
                 drop(driver);
+                // `loaded` is written only by this task and `desired` was
+                // captured under the driver lock: one atomic landing snapshot.
+                invariant::settled(&self, &loaded, &desired);
                 self.cache_state();
                 self.bump_settle();
                 self.publish_state();
@@ -614,7 +669,13 @@ impl Fiber {
     }
 
     async fn unload_once(self: &Arc<Self>) {
+        invariant::pre_unload(self);
         self.publish_state();
+        // Reap the activation's task scope before unwinding effects (S2): no
+        // listener invocation may outlive the teardown below — a dylib
+        // post-teardown call is documented UB. Abort-safe tasks drop at
+        // their next yield point; tracked boundary calls run to completion.
+        self.current_scope().cancel_and_reap().await;
         // Drop committed edges before draining so `relied()` observes the
         // withdrawal as early as possible.
         {
@@ -628,9 +689,11 @@ impl Fiber {
         self.cache_state();
         self.bump_settle();
         self.publish_state();
+        invariant::post_unload(self);
     }
 
     async fn load_once(self: &Arc<Self>, target: &str) {
+        invariant::pre_load(self, target);
         self.publish_state();
         let Some(runtime) = self.runtime.as_ref().map(Arc::clone) else {
             *self.loaded.lock() = target.to_string();
@@ -677,18 +740,35 @@ impl Fiber {
                 let mut index = root.index.lock();
                 index.commit_edges(self.uid_value().unwrap_or(0), &edges);
             }
-            *self.store.lock() = committed;
+            // Kept alive for the post-load checkpoint below.
+            self.store.lock().clone_from(&committed);
         }
 
         // A panicking plugin body must not kill the driver task (that would
-        // hang every `join`): the body runs on its own task, and a panic is
-        // reported through the JoinHandle as a startup failure so the rollback
-        // path runs (self-evolving runtimes host generated code, paper §1.2).
+        // hang every `join`): the body runs on its own task inside the
+        // freshly minted scope generation, and a panic is reported through
+        // the JoinHandle as a startup failure so the rollback path runs
+        // (self-evolving runtimes host generated code, paper §1.2).
+        let scope = self.reset_scope();
         let body_ctx = self.ctx();
         let body = runtime.plugin.apply(body_ctx.clone(), config.clone());
-        let apply_outcome = tokio::spawn(body).await;
+        let spawned = if runtime.plugin.body_abort_safe() {
+            scope.spawn(body)
+        } else {
+            // A boundary body holds its foreign execution context across
+            // awaits (a wasmtime store forbids abandoning an in-flight
+            // call), so it is never dropped mid-flight; the sandbox budget
+            // bounds the wait instead.
+            scope.spawn_tracked(body)
+        };
+        // `None`: the scope was cancelled before the body started (a dispose
+        // raced this load) — the cancellation arm below handles it.
+        let apply_outcome = match spawned {
+            Some(handle) => handle.await,
+            None => Ok(None),
+        };
         match apply_outcome {
-            Ok(Ok(())) => {
+            Ok(Some(Ok(()))) => {
                 self.error.lock().take();
                 *self.loaded.lock() = target.to_string();
                 // Republish state BEFORE notifying dependents: their
@@ -702,41 +782,50 @@ impl Fiber {
                 crate::service::notify(&self.ctx(), &provided);
                 self.bump_settle();
                 self.publish_state();
+                invariant::post_load(self, target, &committed);
             }
-            Ok(Err(err)) => {
+            Ok(Some(Err(err))) => {
                 // Transactional activation: roll back what the body collected
                 // and what was committed above.
-                self.unload_effects().await;
-                {
-                    let root = self.ctx().root;
-                    let mut index = root.index.lock();
-                    index.uncommit(self.uid_value().unwrap_or(0));
-                }
-                self.store.lock().clear();
-                self.fail_load(err);
+                self.rollback_activation(&scope, err).await;
+            }
+            Ok(None) => {
+                // The scope was cancelled (a dispose raced the load): the
+                // body was aborted at a yield point or never started.
+                self.rollback_activation(&scope, Error::msg("plugin task was cancelled"))
+                    .await;
             }
             Err(join_error) => {
-                let message = if join_error.is_panic() {
+                let err = if join_error.is_panic() {
                     let payload = join_error.into_panic();
                     let text = payload
                         .downcast_ref::<&str>()
                         .map(|slice| (*slice).to_string())
                         .or_else(|| payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "plugin body panicked".to_string());
-                    format!("plugin panicked: {text}")
+                    Error::msg(format!("plugin panicked: {text}"))
                 } else {
-                    "plugin task was cancelled".to_string()
+                    Error::msg("plugin task was cancelled")
                 };
-                self.unload_effects().await;
-                {
-                    let root = self.ctx().root;
-                    let mut index = root.index.lock();
-                    index.uncommit(self.uid_value().unwrap_or(0));
-                }
-                self.store.lock().clear();
-                self.fail_load(Error::msg(format!("plugin panicked: {message}")));
+                self.rollback_activation(&scope, err).await;
             }
         }
+    }
+
+    /// Transactional activation rollback: reap the scope generation first
+    /// (no task — and therefore no guest call — may outlive the teardown
+    /// effects), then drain collected effects LIFO, uncommit the index
+    /// edges, clear the store, and park the fiber with the startup error.
+    async fn rollback_activation(self: &Arc<Self>, scope: &Arc<CancelScope>, err: Error) {
+        scope.cancel_and_reap().await;
+        self.unload_effects().await;
+        {
+            let root = self.ctx().root;
+            let mut index = root.index.lock();
+            index.uncommit(self.uid_value().unwrap_or(0));
+        }
+        self.store.lock().clear();
+        self.fail_load(err);
     }
 
     fn fail_load(self: &Arc<Self>, err: Error) {
@@ -751,6 +840,7 @@ impl Fiber {
         self.cache_state();
         self.bump_settle();
         self.publish_state();
+        invariant::post_fail_load(self);
     }
 }
 
@@ -913,9 +1003,16 @@ impl Fiber {
             "uid": old_uid,
         });
         events::emit_internal(&self.ctx(), "internal/plugin", &payload, None);
+        // Cancel the task scope up front (S2): a hung in-flight body would
+        // otherwise park the driver — and this join — forever. The reap runs
+        // on the driver path (`unload_once` / the load rollback arms), which
+        // also keeps this safe when dispose is invoked from one of this
+        // fiber's own listener tasks (no self-join).
+        self.current_scope().cancel();
         self.request_epoch(EPOCH_INACTIVE.to_string());
         let _ = self.join().await;
         self.publish_state();
+        invariant::post_dispose(self, old_uid);
     }
 }
 

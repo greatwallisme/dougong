@@ -48,10 +48,12 @@
 //! # }
 //! ```
 
+mod cancel;
 mod context;
 mod error;
 mod events;
 mod fiber;
+mod invariant;
 mod invoke;
 mod logger;
 mod plugin;

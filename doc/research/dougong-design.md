@@ -117,6 +117,18 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - 生命周期与纪律：vtable 按激活期构造（A3），旧激活回滚后其 vtable 死亡，其后调用 = 文档化 UB（不检测）；插件自有线程须在本次 teardown 返回前终止并 join（A6，成文不强制）；宿主全部 vtable 入口 catch_unwind（A4，panic 不跨界）；emit 不取发射方实例锁（C6 恒合法）；teardown 后在途派发不撤销（C7）。
 - 验证锚：E1.1–11 矩阵（`dougong-dylib::outbound_tests`）+ `outbound_demo` 两臂；内核本体零改动（桥全走既有公共面：`ctx.get::<Invoker>` / `ctx.emit` / `Error::new`）；dougong-loader 经 `dougong_dylib::load` 同源复用（D3）。语义差异落附录 A 等价表。
 
+### D17 fiber 级 cancel scope = 代际取消域 + 边界调用只跟踪不中止（S2）
+
+2026-10-24，improve 二.2 落地（设计定稿见 `.planning/2026-10-23-v0-3-0-dylib-outbound-and-runtime-harden/findings.md` §11）：
+
+- **代际 scope**：每 fiber 持 `CancelScope` 代际（`Fiber::task_scope`，`cancel.rs`）；load 铸新代，unload 与 load 回滚臂先 `cancel_and_reap` 再 drain effects ⇒ 在途 guest 调用绝不越过 teardown（dylib「teardown 后调用 = UB」窗口封闭）；`dispose` 先 cancel 解挂在途 body（修复「body 挂起 ⇒ dispose 永久悬挂」这一现行泄漏），reap 留给驱动路径（dispose 可被本 fiber 的 listener 任务调用，自 reap 即自死锁）。
+- **姿态二分**：in-process 监听器与默认插件 body = yield 点中止（Rust async 纪律保证）；boundary bridge 与 wasm body = 只跟踪不中止（wasmtime 48 `call_concurrent` 文档明示 drop 不取消在途执行、`call` 对 in-call 递归 panic——store 排他模型不可弃）。`Plugin::body_abort_safe()` 默认 true，仅 WasmPlugin 覆写 false；wasm 挂起由 fuel 预算兜界。
+- **监听方视角**：卸载 ⇒ 快照后未启的调用确定性跳过；parallel 聚合将「在途被撤」视为监听者消失（absent）而非失败；serial/bail/waterfall 内联链遇死监听者跳过，waterfall 中死监听者不得 veto。
+- **C7 不变**：发射方派发任务独立于发射方寿命，emit 外层任务不跟踪。
+- **effect disposer 不挂 token**：中止 disposer 会破坏 LIFO 完备性（剩余 disposer 泄漏）；绑定形态 = 时序（reap 先于 drain）；disposer 超时归 S3。wasm 宿主 epoch ticker 改随 WasmHost drop 中止（同旨附修）。
+- **常驻化**：S1 invariant 层 post_unload / post_fail_load / post_dispose 增 release 级断言「cancelled ⇒ task_count == 0」——「卸载后任务计数归零」从测试断言升级为状态机不变量。
+- 验证锚：`cancel.rs` 单元 9 例 + invariant 注入 1 例 + `tests/cancel_scope.rs` 7 例（dispose 解挂死 body / 在途 listener 中止 / restart 换代 / parallel 跳过 / serial 死跳过 / waterfall 无 veto / stop 全收口）。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。
@@ -156,6 +168,7 @@ dougong = 内核（约 3k 行级）+ ABI 契约与 dylib 宿主（数百行级�
 | `internal/*` 事件 | 桥禁订（`on_dispatch` 拒绝） | 出站禁发（`STATUS_INVALID_EVENT`） | C3 |
 | 重入行为 | 每 fiber 单驱动循环，同 fiber 无锁可环 | 同线程激活栈；环 = 确定性 `reentrancy_cycle` 错误 | B4 / D-V3-3 |
 | teardown 后在途派发 | 监听方集随其 fiber 回滚自然收缩 | 发射方 teardown 不撤销已入队派发（内核任务独立于发射方寿命完成） | C7 |
+| 监听方卸载时在途调用 | in-process 监听器在 yield 点中止（cancel scope） | 桥调用只跟踪不中止，卸载等其完成（wasm store 禁弃在途 `call_async`；dylib 续链持实例锁，teardown 取锁本就隐式等待） | D17 / S2；C7 发射方语义不变 |
 | require 执行器 | fiber 任务上 await | 调用线程本地 `block_on`（`rt.enter` 供 tokio 上下文） | D-V3-4 |
 | 错误形态 | `Error { code, message }`（undeclared_dependency / inactive_dependency） | 状态码 + `{"code","message"}` JSON 详情（同名 code 对齐） | D-V3-5 |
 | 解析作用域 | fiber 激活 realm（D15 候选链） | 激活 realm（vtable 闭包捕获同一 ctx，同源） | B3 / A3 |

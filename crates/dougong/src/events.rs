@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::cancel::CancelScope;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::fiber::{EffectGuard, Fiber};
@@ -110,6 +111,8 @@ struct Hook {
 struct DispatchEntry {
     callback: Listener,
     bridge: Option<DispatchListener>,
+    /// The owning fiber's cancel-scope generation at snapshot time (S2).
+    scope: Option<Arc<CancelScope>>,
 }
 
 impl DispatchEntry {
@@ -123,6 +126,32 @@ impl DispatchEntry {
         match self.bridge {
             Some(bridge) => bridge(ctx, payload, next, mode).await,
             None => (self.callback)(ctx, payload, next).await,
+        }
+    }
+
+    /// True when the owning fiber is gone or its scope generation was
+    /// cancelled: the listener counts as unregistered for this dispatch.
+    fn is_dead(&self) -> bool {
+        self.scope.as_ref().is_none_or(|scope| scope.is_cancelled())
+    }
+
+    /// Spawns the invocation under the owning fiber's scope (S2). Plain
+    /// listeners are abort-safe — dropped at their next yield point once
+    /// the fiber unloads; boundary bridges are tracked-only — never dropped
+    /// mid-call, because a wasm store forbids abandoning an in-flight
+    /// `call_async` — so the unload reap awaits them instead. Returns
+    /// `None` without spawning when the listener's fiber is gone or its
+    /// scope already cancelled (a vanished listener is absent, not failed).
+    fn spawn_scoped<F, T>(self, future: F) -> Option<tokio::task::JoinHandle<Option<T>>>
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let scope = Arc::clone(self.scope.as_ref()?);
+        if self.bridge.is_some() {
+            scope.spawn_tracked(future)
+        } else {
+            scope.spawn(future)
         }
     }
 }
@@ -197,6 +226,7 @@ impl EventStore {
             .map(|hook| DispatchEntry {
                 callback: Arc::clone(&hook.callback),
                 bridge: hook.bridge.clone(),
+                scope: hook.ctx.fiber().map(|fiber| fiber.current_scope()),
             })
             .collect();
         Dispatch { entries }
@@ -212,26 +242,37 @@ fn begin_dispatch(ctx: &Context, mode: &str, name: &str) -> Dispatch {
     ctx.root.events.lock().matching(name, None)
 }
 
+/// A null continuation for modes that never advance a chain.
+fn null_next() -> Next {
+    Next::new(Arc::new(|_| {
+        Box::pin(async { Ok(Value::Null) }) as BoxFuture<Result<Value>>
+    }))
+}
+
 /// Fire-and-forget dispatch. Listener failures are logged, never propagated.
 pub fn emit(ctx: &Context, name: &str, payload: Value) {
     let ctx = ctx.clone();
     let name = name.to_string();
+    // The dispatch task itself stays emitter-independent (C7): an emitter
+    // teardown never revokes in-flight delivery to *other* listeners. Each
+    // listener task belongs to its owning fiber's cancel scope instead (S2).
     tokio::spawn(async move {
         let dispatch = begin_dispatch(&ctx, "emit", &name);
         for entry in dispatch.entries {
             let ctx = ctx.clone();
             let payload = payload.clone();
-            tokio::spawn(async move {
-                let next = Next::new(Arc::new(|_| {
-                    Box::pin(async { Ok(Value::Null) }) as BoxFuture<Result<Value>>
-                }));
-                if let Err(err) = entry
-                    .invoke(ctx.clone(), payload, next, DispatchMode::Emit)
+            let worker = entry.clone();
+            let work = async move {
+                if let Err(err) = worker
+                    .invoke(ctx.clone(), payload, null_next(), DispatchMode::Emit)
                     .await
                 {
                     ctx.logger().log_error(&err);
                 }
-            });
+            };
+            // Detached on purpose: fire-and-forget. `None` means the
+            // listener's fiber vanished between snapshot and spawn — skipped.
+            let _ = entry.spawn_scoped(work);
         }
     });
 }
@@ -247,21 +288,26 @@ pub async fn parallel(ctx: &Context, name: &str, payload: Value) -> Result<Value
     for entry in dispatch.entries {
         let ctx = ctx.clone();
         let payload = payload.clone();
-        tasks.push(tokio::spawn(async move {
-            let next = Next::new(Arc::new(|_| {
-                Box::pin(async { Ok(Value::Null) }) as BoxFuture<Result<Value>>
-            }));
-            entry
-                .invoke(ctx, payload, next, DispatchMode::Parallel)
+        let worker = entry.clone();
+        let work = async move {
+            worker
+                .invoke(ctx, payload, null_next(), DispatchMode::Parallel)
                 .await
-        }));
+        };
+        // `None`: the listener's fiber unloaded between snapshot and spawn.
+        if let Some(handle) = entry.spawn_scoped(work) {
+            tasks.push(handle);
+        }
     }
     let mut failures = Vec::new();
     let mut last = payload;
     for task in tasks {
         match task.await {
-            Ok(Ok(value)) => last = value,
-            Ok(Err(err)) => failures.push(err),
+            Ok(Some(Ok(value))) => last = value,
+            Ok(Some(Err(err))) => failures.push(err),
+            // The listener's fiber unloaded mid-dispatch: a vanished listener
+            // counts as absent, never as a failure the emitter caused.
+            Ok(None) => {}
             Err(join_err) => failures.push(Error::msg(format!("listener task failed: {join_err}"))),
         }
     }
@@ -286,11 +332,13 @@ async fn run_sequential(
     let dispatch = begin_dispatch(ctx, mode.as_str(), name);
     let mut current = payload;
     for entry in dispatch.entries {
+        // A listener whose fiber unloaded between snapshot and invocation
+        // counts as unregistered: skip it instead of running dead code.
+        if entry.is_dead() {
+            continue;
+        }
         let ctx = ctx.clone();
-        let next = Next::new(Arc::new(|_| {
-            Box::pin(async { Ok(Value::Null) }) as BoxFuture<Result<Value>>
-        }));
-        let value = entry.invoke(ctx, current, next, mode).await?;
+        let value = entry.invoke(ctx, current, null_next(), mode).await?;
         if is_bailed(&value) {
             return Ok(value);
         }
@@ -337,6 +385,11 @@ where
             let entry = entry.clone();
             let hook_ctx = hook_ctx.clone();
             Box::pin(async move {
+                // A listener whose fiber unloaded mid-chain must not veto
+                // the rest: skip straight to the remaining chain.
+                if entry.is_dead() {
+                    return inner(payload).await;
+                }
                 let next = Next::new(Arc::new(move |payload| {
                     let inner = Arc::clone(&inner);
                     Box::pin(async move { inner(payload).await })
@@ -366,17 +419,17 @@ pub fn emit_internal(
     for entry in entries {
         let ctx = ctx.clone();
         let payload = payload.clone();
-        tokio::spawn(async move {
-            let next = Next::new(Arc::new(|_| {
-                Box::pin(async { Ok(Value::Null) }) as BoxFuture<Result<Value>>
-            }));
-            if let Err(err) = entry
-                .invoke(ctx.clone(), payload, next, DispatchMode::Emit)
+        let worker = entry.clone();
+        let work = async move {
+            if let Err(err) = worker
+                .invoke(ctx.clone(), payload, null_next(), DispatchMode::Emit)
                 .await
             {
                 ctx.logger().log_error(&err);
             }
-        });
+        };
+        // Detached fire-and-forget, bound to the listener fiber's scope (S2).
+        let _ = entry.spawn_scoped(work);
     }
 }
 

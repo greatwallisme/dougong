@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::fiber::{Fiber, FiberHandle, Runtime};
+use crate::invariant;
 use crate::plugin::{AnonymousPlugin, Injection, Plugin};
 use crate::scope::ScopeNode;
 
@@ -77,6 +78,8 @@ pub fn plugin(
         .index
         .lock()
         .add_interest(uid, &child.inject_names());
+    // Before the cascade effect exists, so no dispose can race the checks.
+    invariant::post_spawn(&child);
 
     // Cascade: the child's whole lifecycle is one effect of the parent
     // (paper Eq. 31). Registered synchronously; a parent that cannot host the

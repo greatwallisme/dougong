@@ -69,6 +69,18 @@ pub trait Plugin: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Whether the driver may drop a hung body future at an `.await` point
+    /// to unstick `dispose` during activation (S2 cancel scope).
+    ///
+    /// In-process Rust bodies are drop-safe at await points by construction,
+    /// so the default is `true`. Boundary hosts whose body holds a foreign
+    /// execution context across an await must return `false` (a wasmtime
+    /// store forbids abandoning an in-flight `call_async`); their hung
+    /// bodies are awaited instead, bounded by their own sandbox budget.
+    fn body_abort_safe(&self) -> bool {
+        true
+    }
+
     /// Runs the plugin body. Return an error to fail activation; collected
     /// effects are rolled back LIFO.
     fn apply(&self, ctx: Context, config: Value) -> BoxFuture<Result<()>>;

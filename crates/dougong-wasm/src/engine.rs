@@ -44,7 +44,7 @@ pub struct WasmHost {
     engine: Engine,
     linker: Linker<PluginState>,
     limits: WasmLimits,
-    _ticker: tokio::task::JoinHandle<()>,
+    ticker: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for WasmHost {
@@ -52,6 +52,14 @@ impl std::fmt::Debug for WasmHost {
         f.debug_struct("WasmHost")
             .field("limits", &self.limits)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WasmHost {
+    fn drop(&mut self) {
+        // Abort the epoch ticker with its host: a detached interval task
+        // would pin the engine alive forever (S2 leak sweep).
+        self.ticker.abort();
     }
 }
 
@@ -101,7 +109,7 @@ impl WasmHost {
             engine,
             linker,
             limits,
-            _ticker: ticker,
+            ticker,
         })
     }
 

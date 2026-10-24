@@ -9,6 +9,7 @@ One store = one execution. All guest entries funnel through `channel.rs::GuestCh
 - The marker is written **only after acquiring the store lock** (writing it earlier lets waiters overwrite the holder's task id and turns same-task reentry into a self-deadlock).
 - Same-task reentry is rejected *before* the lock (`reject_self_reentry`) — otherwise the guest calling its own service would block on the mutex forever.
 - Concurrent callers (e.g. a consumer notified mid-`apply`) wait; that wait is correct and must not be replaced by `try_lock`.
+- Abandoning an in-flight call is forbidden for the same reason, which is why `WasmPlugin::body_abort_safe()` returns `false` (S2): the kernel never drops a wasm body or bridge invocation mid-call — it awaits completion, bounded by the fuel budget. The epoch ticker aborts on `WasmHost` drop so it cannot pin the engine alive.
 
 The `clippy::significant_drop_tightening` allowances on the store guards are intentional: the guard must span the awaited export call.
 

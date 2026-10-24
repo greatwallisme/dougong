@@ -61,6 +61,14 @@ impl Plugin for WasmPlugin {
         self.inject.clone()
     }
 
+    fn body_abort_safe(&self) -> bool {
+        // The body holds the store mutex across awaited export calls and
+        // wasmtime forbids abandoning an in-flight `call_async`, so the
+        // driver must never drop the body mid-flight: a hung guest body is
+        // awaited, bounded by the fuel budget (D11).
+        false
+    }
+
     fn apply(&self, ctx: Context, config: Value) -> BoxFuture<Result<()>> {
         let channel = Arc::clone(&self.channel);
         let store = Arc::clone(&self.store);
