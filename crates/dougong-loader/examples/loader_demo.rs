@@ -1,12 +1,13 @@
-// Rust guideline compliant 2026-10-21
+// Rust guideline compliant 2026-10-24
 //! Declarative loader demo: one JSON document drives the full lifecycle —
-//! a builtin plugin plus the dylib greeter artifact, a config hot-update,
+//! builtin plugins plus the dylib greeter artifact, a config hot-update,
 //! and a retirement pass.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use dougong::{Context, LogLevel, plugin};
+use dougong::{Context, Invoke, Invoker, LogLevel, plugin};
 use dougong_loader::{Config, Reconciler};
 
 fn dylib_path() -> PathBuf {
@@ -46,13 +47,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             })
         });
-        let builtins = HashMap::from([("boot".to_string(), boot)]);
+        // Satisfies the greeter dylib's declared `greeter.oracle` inject
+        // (ABI v3): greeter's own worker thread requires it on activation,
+        // so every document below carries this row or greeter parks.
+        let oracle = plugin("oracle", vec![], |ctx, _config| {
+            struct Oracle;
+            impl Invoke for Oracle {
+                fn call(
+                    &self,
+                    _method: u32,
+                    payload: Vec<u8>,
+                ) -> dougong::BoxFuture<dougong::Result<Vec<u8>>> {
+                    Box::pin(async move { Ok([b"oracle:".as_ref(), &payload].concat()) })
+                }
+            }
+            Box::pin(async move {
+                ctx.provide("greeter.oracle", Invoker::new(Arc::new(Oracle)))
+                    .await?;
+                Ok(())
+            })
+        });
+        let builtins = HashMap::from([
+            ("boot".to_string(), boot),
+            ("oracle".to_string(), oracle),
+        ]);
 
         let mut reconciler = Reconciler::new(builtins, None);
 
         let doc = format!(
             r#"{{"plugins":[
                 {{"name":"boot","source":{{"kind":"builtin","name":"boot"}},"config":{{"phase":"boot"}}}},
+                {{"name":"oracle","source":{{"kind":"builtin","name":"oracle"}}}},
                 {{"name":"greeter","source":{{"kind":"dylib","path":"{}"}}}}
             ]}}"#,
             dylib_path().display()
@@ -68,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let doc = format!(
             r#"{{"plugins":[
                 {{"name":"boot","source":{{"kind":"builtin","name":"boot"}},"config":{{"phase":"steady"}}}},
+                {{"name":"oracle","source":{{"kind":"builtin","name":"oracle"}}}},
                 {{"name":"greeter","source":{{"kind":"dylib","path":"{}"}}}}
             ]}}"#,
             dylib_path().display()
@@ -84,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconciler.replace(Config::parse(r#"{"plugins":[]}"#)?);
         let report = reconciler.apply(&ctx).await;
         log(format!("pass 3: {report:?}"));
-        assert_eq!(report.retired.len(), 2);
+        assert_eq!(report.retired.len(), 3);
         let report = reconciler.apply(&ctx).await;
         assert!(report.converged());
 

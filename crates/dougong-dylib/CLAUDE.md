@@ -13,4 +13,4 @@ dylib/so plugin host. Trusted-code territory: the library is mapped for the whol
 
 ## Tests
 
-`cargo test -p dougong-dylib` uses static fake export tables (`from_static`) — extend them whenever `dougong-abi` changes shape. The end-to-end path is `examples/dylib_demo.rs`, which requires `libgreeter_plugin.so` in `target/debug` (built by `cargo build --workspace`).
+`cargo test -p dougong-dylib` uses static fake export tables (`from_static`) — extend them whenever `dougong-abi` changes shape. The end-to-end paths are `examples/dylib_demo.rs` (greeter showcase, incl. its ABI v3 own-thread require/emit legs) and `examples/outbound_demo.rs` (v3 acceptance: full chain + the undeclared-capability and reentrancy-cycle arms), both requiring `libgreeter_plugin.so` in `target/debug` (built by `cargo build --workspace`).

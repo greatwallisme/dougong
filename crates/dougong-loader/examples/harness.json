@@ -4,6 +4,7 @@
     { "name": "telemetry", "source": { "kind": "builtin", "name": "telemetry" }, "config": null, "isolate": null },
     { "name": "tools", "source": { "kind": "builtin", "name": "tools" }, "config": null, "isolate": null },
     { "name": "guard", "source": { "kind": "builtin", "name": "guard" }, "config": null, "isolate": null },
+    { "name": "oracle", "source": { "kind": "builtin", "name": "oracle" }, "config": null, "isolate": null },
     { "name": "llm-a", "source": { "kind": "builtin", "name": "llm" }, "config": { "adapter": "echo" }, "isolate": "session-a" },
     { "name": "llm-b", "source": { "kind": "builtin", "name": "llm" }, "config": { "adapter": "upper" }, "isolate": "session-b" },
     { "name": "agent-a", "source": { "kind": "builtin", "name": "agent" }, "config": { "label": "A" }, "isolate": "session-a" },

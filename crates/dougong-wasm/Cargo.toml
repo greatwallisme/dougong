@@ -13,7 +13,7 @@ description = "wasm component plugin host for the dougong kernel"
 workspace = true
 
 [dependencies]
-dougong = { path = "../dougong", version = "0.2.0" }
+dougong = { path = "../dougong", version = "0.3.0" }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -25,6 +25,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # End-to-end demos (each must exit 0):
 cargo run -p dougong-dylib  --example dylib_demo    # needs: cargo build --workspace (builds greeter-plugin)
+cargo run -p dougong-dylib  --example outbound_demo # ABI v3 outbound arms; same dylib artifact
 cargo run -p dougong-wasm   --example wasm_demo     # needs the wasm32-wasip2 guest artifact
 cargo run -p dougong-loader --example loader_demo   # needs the dylib artifact
 cargo run -p dougong-loader --example harness_demo  # multi-plugin composition: needs the dylib artifact + wasip2 guest

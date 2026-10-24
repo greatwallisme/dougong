@@ -106,6 +106,17 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 ### D15 realm 作用域 = 成员服务域内命名空间 + 全局回退
 2026-10-21，实现 isolate realm 的"每会话不同能力集"（dsh 对齐）时发现：loader 的 `isolate` 只把成员行归到同一标签，不给成员的**同名服务**按域分命名空间——两个域各提供一个同名 seam 会 `duplicate_provide` 碰撞。D15 语义：`ScopeNode` 增加域级回退标签（`realm_child`）；解析候选取「显式按名隔离（严格，单个）→ 最内层域标签 → 全局默认」；provide 落点取首个候选。效果：域成员的同名服务互不碰撞且域内优先；域未提供之名回退全局；全局消费者看不到域内服务。loader 的 `isolate` 字段即声明 realm（`Context::isolate_realm`）。`Context::isolate`/`isolate_with_label` 的按名语义保持不变。配套测试 `realm_scope_namespaces_services_with_global_fallback`（kernel_semantics）。
 
+### D16 dylib 出站能力 = ABI v3 HostExports vtable（setup 携带 + 同线程重入环检测）
+2026-10-23，用户四项裁决（需求文档 doc/maintenance/function_requirements.md §4 的 D-V3-1/3/4/5，均采纳推荐项；§5.8 同日显式推翻）：
+
+- **D-V3-1 vtable 传递 = a) setup 携带**：`setup(host: *const HostExports) -> *mut c_void`，`HostExports { host_handle, require, emit }` 在 setup 期间按值复制。理由：vtable 先于 setup 首指令可用，setup 期 require（G5）天然满足；ABI 版本本已必 bump，无兼容包袱；失败模式最少。
+- **D-V3-3 重入策略 = b') 同线程环检测**：thread-local 激活栈覆盖全部外来入口（setup/call/on_event/on_next/teardown，guard 不跨 await——任务迁移会破坏线程配对）；环 = 确定性 `reentrancy_cycle` 错误（`STATUS_REENTRANCY`），永不死锁。合法 service→service 链（call 处理器内 require 其他服务）放行；插件自有线程空栈出发，永不入环。否决项：a) 全禁令会禁掉 fr 侧审批→session 落账的合法链（不可用）；c) 嵌套派发独立执行体帧跳跃 + 跨执行体锁等待，复杂度最高。
+- **D-V3-4 require 执行器 = 实现期基准**：基线 = `rt.enter()` + 调用线程本地自写 parker `block_on`——不依赖调用线程恰在 tokio 内（B1 定性满足）、不消耗 runtime worker、current_thread 兼容、对 future 无 Send 要求、重入栈在该路径上精确。驱动器收敛为 dougong-dylib 内部单个函数，缝后可换（备选：spawn-to-runtime + 调用线程 park oneshot）。
+- **D-V3-5 错误模型 = 状态码 + 详情载荷**：新增 `STATUS_UNDECLARED(-3)`/`INACTIVE(-4)`/`REENTRANCY(-5)`/`HOST_ERROR(-6)`/`INVALID_PAYLOAD(-7)`/`INVALID_EVENT(-8)`；任何非 OK/CAPACITY 状态可在 out buffer 携带 `{"code","message"}` JSON 详情，`STATUS_FAILED` 的详情 = 目标业务错误透传。与内核两级能力检查（undeclared vs inactive，TS Alg. 6）同名对齐。
+- **§5.8 推翻（附带裁决）**：事件派发队列化（bounded 队列 + worker pool + per-event-type 并发上限 + 背压 + 按事件名 opt-in 可丢弃）全量入 v0.3.0 范围；默认语义不变（不丢弃、五次序承诺照旧）。
+- 生命周期与纪律：vtable 按激活期构造（A3），旧激活回滚后其 vtable 死亡，其后调用 = 文档化 UB（不检测）；插件自有线程须在本次 teardown 返回前终止并 join（A6，成文不强制）；宿主全部 vtable 入口 catch_unwind（A4，panic 不跨界）；emit 不取发射方实例锁（C6 恒合法）；teardown 后在途派发不撤销（C7）。
+- 验证锚：E1.1–11 矩阵（`dougong-dylib::outbound_tests`）+ `outbound_demo` 两臂；内核本体零改动（桥全走既有公共面：`ctx.get::<Invoker>` / `ctx.emit` / `Error::new`）；dougong-loader 经 `dougong_dylib::load` 同源复用（D3）。语义差异落附录 A 等价表。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。
@@ -134,3 +145,17 @@ dougong = 内核（约 3k 行级）+ ABI 契约与 dylib 宿主（数百行级�
 - **R2** 平台 = Linux（一等公民）+ Windows + macOS，支持 musl 静态链接；内核恒为宿主侧，不编译进 wasm。
 - **R3** ABI 契约 crate 命名 = `dougong-abi`。
 - **R4 工具链纪律**（2026-10-21）：仓库工件一律且仅由 `rust-toolchain.toml` 钉定的工具链（1.99.1）编译；禁止以任何其他工具链构建或替换 `target/` 内的工件（含一次性实验）。MSRV 声明已整体移除（2026-10-21 追记）——未实测过的兼容下限一律不宣称；如需版本证明，走隔离环境（独立 worktree/CI）实测后再写进清单。
+
+## 附录 A：语义等价表（in-process vs dylib-v3，D16/F2）
+
+| 面 | in-process | dylib v3 | 锚 |
+|---|---|---|---|
+| require 能力检查基准 | fiber 兴趣集（声明注入解析承诺） | 实例 descriptor `inject` 集（常量，激活期捕获进 vtable 闭包） | B2；两级语义（undeclared/inactive）一致，检查对象不同 |
+| require 载荷 | 类型化键（`Any` 下转）与动态通道字节并存 | 仅动态通道字节，对宿主不透明（编码归服务契约） | B6 |
+| emit 载荷 | `serde_json::Value` | 必须合法 JSON 字节，非法 = `STATUS_INVALID_PAYLOAD` | C2（显式非对称） |
+| `internal/*` 事件 | 桥禁订（`on_dispatch` 拒绝） | 出站禁发（`STATUS_INVALID_EVENT`） | C3 |
+| 重入行为 | 每 fiber 单驱动循环，同 fiber 无锁可环 | 同线程激活栈；环 = 确定性 `reentrancy_cycle` 错误 | B4 / D-V3-3 |
+| teardown 后在途派发 | 监听方集随其 fiber 回滚自然收缩 | 发射方 teardown 不撤销已入队派发（内核任务独立于发射方寿命完成） | C7 |
+| require 执行器 | fiber 任务上 await | 调用线程本地 `block_on`（`rt.enter` 供 tokio 上下文） | D-V3-4 |
+| 错误形态 | `Error { code, message }`（undeclared_dependency / inactive_dependency） | 状态码 + `{"code","message"}` JSON 详情（同名 code 对齐） | D-V3-5 |
+| 解析作用域 | fiber 激活 realm（D15 候选链） | 激活 realm（vtable 闭包捕获同一 ctx，同源） | B3 / A3 |

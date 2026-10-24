@@ -1,14 +1,18 @@
-// Rust guideline compliant 2026-10-20
+// Rust guideline compliant 2026-10-24
 //! End-to-end dylib plugin demo: loads `libgreeter_plugin`, binds an
 //! in-process consumer through the dynamic channel, and verifies the call
-//! plus the teardown ordering.
+//! plus the teardown ordering. On the ABI v3 surface it also proves the
+//! plugin's outbound legs: greeter's own worker thread requires the
+//! in-process `greeter.oracle` service during activation and publishes
+//! `greeter/ready` on the kernel bus when done.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use dougong::{Context, Invoker, LogLevel, plugin};
+use dougong::{Context, Invoke, Invoker, LogLevel, plugin};
 use dougong_dylib::load;
-use greeter_plugin::GREETER_HELLO;
+use greeter_plugin::{GREETER_HELLO, GREETER_WORKER_REPLY};
 
 fn plugin_path() -> PathBuf {
     // The cdylib lands next to the other workspace artifacts.
@@ -22,6 +26,17 @@ fn plugin_path() -> PathBuf {
         "libgreeter_plugin.so"
     };
     path.join(name)
+}
+
+/// Satisfies greeter's declared `greeter.oracle` inject: echoes back
+/// `oracle:<payload>`. The reentrancy arm lives in `outbound_demo`; here the
+/// oracle only needs the success path.
+struct Oracle;
+
+impl Invoke for Oracle {
+    fn call(&self, _method: u32, payload: Vec<u8>) -> dougong::BoxFuture<dougong::Result<Vec<u8>>> {
+        Box::pin(async move { Ok([b"oracle:".as_ref(), &payload].concat()) })
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +55,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         log("-- loaded dylib plugin --".to_string());
+
+        // The oracle must be committed before greeter activates: the plugin's
+        // worker thread requires it from `setup` time onward.
+        let oracle = plugin("oracle", vec![], |ctx, _config| {
+            Box::pin(async move {
+                ctx.provide("greeter.oracle", Invoker::new(Arc::new(Oracle)))
+                    .await?;
+                Ok(())
+            })
+        });
+        let oracle_fiber = ctx.plugin(oracle, None)?;
+        oracle_fiber.join().await?;
+
+        // Registered before greeter loads: the worker's `greeter/ready` emit
+        // is fire-and-forget, so the listener must already be in place. The
+        // oneshot buffers the payload until the demo awaits it below.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+        let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
+        ctx.on(
+            "greeter/ready",
+            Arc::new(move |_ctx, payload, _next| {
+                let ready_tx = Arc::clone(&ready_tx);
+                Box::pin(async move {
+                    if let Ok(mut slot) = ready_tx.lock()
+                        && let Some(tx) = slot.take()
+                    {
+                        let _dropped = tx.send(payload);
+                    }
+                    Ok(serde_json::Value::Null)
+                })
+            }),
+        )
+        .await?;
 
         // Consumer declares `greeting` before the provider exists: it parks
         // in Pending and rewires when the dylib fiber provides.
@@ -66,6 +114,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         greeter_fiber.join().await?;
         consumer_fiber.join().await?;
+
+        // ABI v3 outbound leg 1: the worker thread's `greeter/ready` emit
+        // arrived on the bus (it fires after the worker's require completed).
+        let ready = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .map_err(|err| dougong::Error::msg(format!("greeter/ready did not arrive: {err}")))?
+            .map_err(|err| dougong::Error::msg(format!("greeter/ready listener dropped: {err}")))?;
+        assert_eq!(
+            ready.get("source").and_then(serde_json::Value::as_str),
+            Some("greeter-worker")
+        );
+        log("-- own-thread emit reached the bus --".to_string());
+
+        // Outbound leg 2: the worker's synchronous `require` reply is read
+        // back through the plugin's own service.
+        let greeting = ctx
+            .get::<Invoker>("greeting")
+            .ok_or_else(|| dougong::Error::msg("greeting is not committed"))?;
+        let reply = greeting.call(GREETER_WORKER_REPLY, Vec::new()).await?;
+        assert_eq!(reply, b"oracle:worker-hello");
+        log("-- own-thread require reply read back --".to_string());
 
         // ABI v2 event surface: the dylib greeter listens to `ping` (echo)
         // and `upper` (waterfall pull through STATUS_DEFERRED -> on_next).

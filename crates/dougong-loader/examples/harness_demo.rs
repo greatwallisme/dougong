@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-21
+// Rust guideline compliant 2026-10-24
 //! Multi-plugin composition demo (deepseek-harness parity).
 //!
 //! Real harnesses are not one plugin: they are many plugins with declared
@@ -10,9 +10,9 @@
 //!
 //! 1. **Pending** - apply a partial document (agents without their llm
 //!    providers): the agents park in `Pending` and wait;
-//! 2. **Load** - apply the full document: ten slots come up in one pass -
-//!    8 in-process plugins (settings, telemetry, tools, guard, two llm
-//!    seam providers, agent-a, agent-b) plus the greeter dylib and wasm
+//! 2. **Load** - apply the full document: eleven slots come up in one pass -
+//!    9 in-process plugins (settings, telemetry, tools, guard, oracle, two
+//!    llm seam providers, agent-a, agent-b) plus the greeter dylib and wasm
 //!    component - and both agents converge automatically;
 //! 3. **Realms** - `llm-a` and `agent-a` share `session-a`; `llm-b` and
 //!    `agent-b` share `session-b`. The SAME service name `harness.llm`
@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use dougong::{Context, Error, Injection, Result};
+use dougong::{Context, Error, Injection, Invoke, Invoker, Result};
 use dougong_loader::{Config, Reconciler, Source};
 use dougong_wasm::{WasmHost, WasmLimits};
 use serde_json::{Value, json};
@@ -126,6 +126,29 @@ fn settings_plugin() -> Arc<dyn dougong::Plugin> {
             // Registered at the global default label: every realm falls back
             // to it for names its realm does not provide.
             ctx.provide("harness.settings", json!({ "persona": persona }))
+                .await?;
+            Ok(())
+        })
+    })
+}
+
+/// Satisfies the greeter dylib's declared `greeter.oracle` inject (ABI v3):
+/// greeter's own worker thread requires it on activation, so both harness
+/// documents carry the `oracle` row or greeter parks in Pending.
+fn oracle_plugin() -> Arc<dyn dougong::Plugin> {
+    dougong::plugin("oracle", vec![], |ctx, _config| {
+        Box::pin(async move {
+            struct Oracle;
+            impl Invoke for Oracle {
+                fn call(
+                    &self,
+                    _method: u32,
+                    payload: Vec<u8>,
+                ) -> dougong::BoxFuture<dougong::Result<Vec<u8>>> {
+                    Box::pin(async move { Ok([b"oracle:".as_ref(), &payload].concat()) })
+                }
+            }
+            ctx.provide("greeter.oracle", Invoker::new(Arc::new(Oracle)))
                 .await?;
             Ok(())
         })
@@ -357,6 +380,7 @@ fn builtins() -> HashMap<String, Arc<dyn dougong::Plugin>> {
         ("telemetry", telemetry_plugin()),
         ("tools", tools_plugin()),
         ("guard", guard_plugin()),
+        ("oracle", oracle_plugin()),
         ("agent", agent_plugin()),
         ("llm", llm_plugin()),
     ]
@@ -382,6 +406,33 @@ async fn dispatch_turn(ctx: &Context, realm: &str, prompt: &str) -> Result<Value
     .await
 }
 
+/// Phase 3 - realms: the same seam name resolves per session. Realm A
+/// answers with the echo adapter, realm B with the upper adapter.
+async fn verify_realms(ctx: &Context, log: &(impl Fn(String) + Sync)) -> Result<()> {
+    let realm_a = dispatch_turn(ctx, "A", "hello harness").await?;
+    assert_eq!(
+        realm_a.get("adapter").and_then(Value::as_str),
+        Some("echo"),
+        "realm A runs the echo adapter"
+    );
+    assert_eq!(
+        realm_a
+            .get("tool_result")
+            .and_then(|t| t.get("vetoed"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "the guard vetoed the destructive tool without any import"
+    );
+    let realm_b = dispatch_turn(ctx, "B", "hello harness").await?;
+    assert_eq!(
+        realm_b.get("adapter").and_then(Value::as_str),
+        Some("upper"),
+        "realm B runs the upper adapter"
+    );
+    log("phase 3: per-realm capability sets verified (A=echo, B=upper)".to_string());
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = WasmHost::new(WasmLimits::default())?;
@@ -400,7 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .retain(|spec| !spec.name.starts_with("llm-"));
     reconciler.replace(partial);
     let report = reconciler.apply(&ctx).await;
-    assert_eq!(report.inserted.len(), 8, "eight slots without the llm seam");
+    assert_eq!(report.inserted.len(), 9, "nine slots without the llm seam");
     let agent_a = handle(&reconciler, "agent-a")?;
     let agent_b = handle(&reconciler, "agent-b")?;
     for agent in [&agent_a, &agent_b] {
@@ -425,36 +476,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec!["llm-a".to_string(), "llm-b".to_string()],
         "exactly the two llm rows inserted"
     );
-    for name in ["settings", "telemetry", "tools", "guard", "llm-a", "llm-b"] {
+    for name in [
+        "settings",
+        "telemetry",
+        "tools",
+        "guard",
+        "oracle",
+        "llm-a",
+        "llm-b",
+    ] {
         handle(&reconciler, name)?.join().await?;
     }
     agent_a.join().await?;
     agent_b.join().await?;
     log("phase 2: both agents converged with their realm llm seams".to_string());
 
-    // Phase 3 - realms: the same seam name resolves per session. Realm A
-    // answers with the echo adapter, realm B with the upper adapter.
-    let realm_a = dispatch_turn(&ctx, "A", "hello harness").await?;
-    assert_eq!(
-        realm_a.get("adapter").and_then(Value::as_str),
-        Some("echo"),
-        "realm A runs the echo adapter"
-    );
-    assert_eq!(
-        realm_a
-            .get("tool_result")
-            .and_then(|t| t.get("vetoed"))
-            .and_then(Value::as_bool),
-        Some(true),
-        "the guard vetoed the destructive tool without any import"
-    );
-    let realm_b = dispatch_turn(&ctx, "B", "hello harness").await?;
-    assert_eq!(
-        realm_b.get("adapter").and_then(Value::as_str),
-        Some("upper"),
-        "realm B runs the upper adapter"
-    );
-    log("phase 3: per-realm capability sets verified (A=echo, B=upper)".to_string());
+    // Phase 3 - realms: per-session capability sets (extracted helper).
+    verify_realms(&ctx, &log).await?;
 
     // Phase 4 - swap: realm A's llm config selects `upper`. Only that row
     // hot-restarts; realm A's next turn is post-processed - no consumer

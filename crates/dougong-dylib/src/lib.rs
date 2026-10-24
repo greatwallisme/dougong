@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-21
+// Rust guideline compliant 2026-10-23
 //! dylib/so plugin host for the dougong kernel.
 //!
 //! Loads a [`dougong_abi::PluginExports`] table from a shared library and
@@ -12,6 +12,19 @@
 //! The plugin descriptor declares `provide` names; for each of them the host
 //! registers a [`dougong::Invoker`] service so any consumer can call the
 //! plugin through the dynamic channel (`method` selector + byte payload).
+//!
+//! # Outbound surface (ABI v3)
+//!
+//! Each activation receives a [`dougong_abi::HostExports`] vtable at `setup`:
+//! `require` performs a synchronous blocking call into another plugin's
+//! service (capability-checked against the descriptor `inject` set, resolved
+//! in the activation's realm), and `emit` publishes a JSON event to the
+//! kernel bus. Reentrancy is governed by a per-thread activation stack
+//! (design decision D-V3-3 option b'): any foreign entry — `setup`, `call`,
+//! `on_event`/`on_next`, `teardown` — records its instance for the duration
+//! of the synchronous FFI segment, and a service call that would re-enter an
+//! instance already executing on the calling thread fails deterministically
+//! with `reentrancy_cycle` instead of deadlocking the per-instance lock.
 //!
 //! # Event surface (ABI v2, design decision D14)
 //!
@@ -39,10 +52,15 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Poll, Wake, Waker};
 
-use dougong::{BoxFuture, DispatchListener, DispatchMode, Error, Plugin, Result};
+use dougong::{BoxFuture, DispatchListener, DispatchMode, Error, Invoker, Plugin, Result};
 use dougong_abi::{
-    ABI_VERSION, MODE_BAIL, MODE_EMIT, MODE_PARALLEL, MODE_SERIAL, MODE_WATERFALL, PluginExports,
+    ABI_VERSION, HostExports, MODE_BAIL, MODE_EMIT, MODE_PARALLEL, MODE_SERIAL, MODE_WATERFALL,
+    PluginExports, STATUS_CAPACITY, STATUS_FAILED, STATUS_HOST_ERROR, STATUS_INACTIVE,
+    STATUS_INVALID_EVENT, STATUS_INVALID_PAYLOAD, STATUS_OK, STATUS_REENTRANCY, STATUS_UNDECLARED,
+    write_out,
 };
 use libloading::Library;
 use serde_json::Value;
@@ -51,6 +69,351 @@ use tokio::sync::Mutex as AsyncMutex;
 /// Serializes every foreign call into one plugin instance (see the crate
 /// documentation: cross-fiber callers are not ordered by the kernel).
 type InstanceLock = Arc<AsyncMutex<()>>;
+
+/// Per-process activation identity source for the reentrancy stack. A static
+/// counter is the minimal correct tool: ids must be unique across
+/// independently loaded libraries and carry no state beyond uniqueness, so
+/// `Relaxed` ordering is sufficient.
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_instance_id() -> u64 {
+    NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+std::thread_local! {
+    /// Instances whose foreign entries are executing on this thread right
+    /// now (reentrancy policy D-V3-3 option b'). A deadlock needs one thread
+    /// to re-acquire an instance lock it already holds, which is exactly
+    /// "this instance is on this thread's stack". Guards never span `.await`
+    /// points — each covers one synchronous FFI segment — so push/pop pairing
+    /// always stays on one thread even when the surrounding task migrates.
+    static ENTRY_STACK: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// True when `id` is executing a foreign entry on this thread right now.
+fn entered_on_this_thread(id: u64) -> bool {
+    ENTRY_STACK.with(|stack| stack.borrow().contains(&id))
+}
+
+/// RAII guard: pushes the instance id on creation, pops it on drop. Open it
+/// after the last `.await` and drop it before the next one.
+struct EntryGuard(u64);
+
+impl EntryGuard {
+    fn enter(id: u64) -> Self {
+        ENTRY_STACK.with(|stack| stack.borrow_mut().push(id));
+        Self(id)
+    }
+}
+
+impl Drop for EntryGuard {
+    fn drop(&mut self) {
+        ENTRY_STACK.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(popped, Some(self.0), "entry stack pairing broken");
+        });
+    }
+}
+
+/// Host-side state of one plugin activation backing the v3 [`HostExports`]
+/// vtable: built per activation, dead once that activation's `teardown`
+/// returns (the vtable's documented lifetime bound).
+struct Activation {
+    /// The owning fiber's context: capability resolution and event dispatch
+    /// run through it, so realm binding matches the in-process form (D15).
+    ctx: dougong::Context,
+    /// Runtime captured during `apply`; `enter`ing it gives foreign threads
+    /// (plugin-owned, never inside tokio) a valid runtime context.
+    rt: tokio::runtime::Handle,
+    /// Descriptor `inject` names: the constant capability-check basis for
+    /// outbound `require` (the in-process form uses the fiber interest set;
+    /// the boundary form uses the descriptor set — see the equivalence table
+    /// in `doc/research/dougong-design.md`).
+    inject: Vec<String>,
+}
+
+/// `Send`/`Sync` wrapper for the raw `Activation` reference carried by
+/// [`HostExports::host_handle`].
+struct ActivationPtr(*mut std::ffi::c_void);
+
+// SAFETY: the pointee is a shared, immutable `Activation` kept alive by the
+// teardown disposer until that activation's `teardown` has returned; vtable
+// calls after that moment are outside the contract (documented UB).
+unsafe impl Send for ActivationPtr {}
+// SAFETY: see `Send`; concurrent readers observe only immutable state.
+unsafe impl Sync for ActivationPtr {}
+
+impl ActivationPtr {
+    /// Reclaims the strong reference the raw pointer has carried since
+    /// construction.
+    ///
+    /// # Safety
+    ///
+    /// Call exactly once per pointer, only after the activation's `teardown`
+    /// has returned (or after a failed `setup` that never published the
+    /// vtable). A later vtable call through the copied `host_handle` is
+    /// undefined behavior by contract.
+    unsafe fn reclaim(self) {
+        // SAFETY: per the caller contract, this is the unique reclaim of the
+        // reference produced by the single `Arc::into_raw` at construction.
+        drop(unsafe { Arc::from_raw(self.0.cast::<Activation>()) });
+    }
+}
+
+/// Builds a byte slice from a vtable input pointer; null pairs with length 0
+/// and yields an empty slice.
+///
+/// # Safety
+///
+/// When non-null, `data` must be readable for `len` bytes (the vtable's
+/// caller-side contract).
+const unsafe fn input_slice<'a>(data: *const u8, len: usize) -> &'a [u8] {
+    if data.is_null() {
+        &[]
+    } else {
+        // SAFETY: the caller contract stated above.
+        unsafe { std::slice::from_raw_parts(data, len) }
+    }
+}
+
+/// Writes a JSON `{"code", "message"}` detail document into the caller's
+/// out-buffer, then reports `status` — or [`STATUS_CAPACITY`] when the
+/// detail does not fit, so the caller retries with a larger buffer.
+fn write_detail(
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    code: &str,
+    message: &str,
+    status: i32,
+) -> i32 {
+    let detail = serde_json::json!({ "code": code, "message": message });
+    // Serializing a string-only JSON object cannot fail; if it ever did,
+    // reporting the bare status stays contract-correct (detail is optional).
+    let Ok(bytes) = serde_json::to_vec(&detail) else {
+        return status;
+    };
+    // SAFETY: the host honors the same caller-owned buffer contract it
+    // requires of plugin exports.
+    if unsafe { write_out(&bytes, out_buf, cap, out_len) } {
+        status
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+/// Drives `future` to completion on the calling thread with the runtime
+/// context entered (D-V3-4 baseline). Polling never leaves the calling
+/// thread, which keeps the reentrancy stack exact on this path, works on
+/// plugin-owned threads and runtime workers alike, and never depends on the
+/// calling thread being inside tokio.
+fn drive<T>(rt: &tokio::runtime::Handle, future: impl Future<Output = T>) -> T {
+    let _runtime = rt.enter();
+    block_on(future)
+}
+
+/// Minimal std-only `block_on`: parks the current thread until the future's
+/// waker unparks it; spurious wakeups simply re-poll through the loop.
+fn block_on<F: Future>(future: F) -> F::Output {
+    struct ThreadWaker(std::thread::Thread);
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// vtable entry: one synchronous, blocking cross-plugin service call.
+///
+/// # Safety
+///
+/// Per the [`HostExports`] contract: `host` names a live activation,
+/// `service`/`in_data` are readable for their lengths, and `out_buf`/
+/// `out_len` follow the caller-owned buffer protocol.
+unsafe extern "C" fn host_require(
+    host: *mut std::ffi::c_void,
+    service: *const u8,
+    service_len: usize,
+    method: u32,
+    in_data: *const u8,
+    in_len: usize,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    // SAFETY: the vtable contract keeps `host` valid until this activation's
+    // teardown returns; the deref only reads shared immutable state.
+    let activation = unsafe { &*host.cast::<Activation>() };
+    // A host panic must never unwind across the FFI boundary (A4): contain it
+    // and report a host error instead.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        require_impl(
+            activation,
+            service,
+            service_len,
+            method,
+            in_data,
+            in_len,
+            out_buf,
+            cap,
+            out_len,
+        )
+    }))
+    .unwrap_or_else(|_| {
+        write_detail(
+            out_buf,
+            cap,
+            out_len,
+            "host_panic",
+            "host require entry panicked",
+            STATUS_HOST_ERROR,
+        )
+    })
+}
+
+/// The `require` bridge's prescribed steps: capability check, realm-scoped
+/// resolution, dynamic-channel invocation, result write-back.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the vtable signature is fixed by the ABI contract"
+)]
+fn require_impl(
+    activation: &Activation,
+    service: *const u8,
+    service_len: usize,
+    method: u32,
+    in_data: *const u8,
+    in_len: usize,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    // SAFETY: vtable input contract (null pairs with length 0).
+    let service_bytes = unsafe { input_slice(service, service_len) };
+    let Ok(service) = std::str::from_utf8(service_bytes) else {
+        return write_detail(
+            out_buf,
+            cap,
+            out_len,
+            "undeclared_dependency",
+            "service name is not valid UTF-8",
+            STATUS_UNDECLARED,
+        );
+    };
+    // Step 1: capability check against the descriptor `inject` set.
+    if !activation.inject.iter().any(|declared| declared == service) {
+        return write_detail(
+            out_buf,
+            cap,
+            out_len,
+            "undeclared_dependency",
+            &format!("cannot get property \"{service}\" without inject"),
+            STATUS_UNDECLARED,
+        );
+    }
+    // Step 2: resolution in the activation's realm; `None` here means the
+    // provider is not committed (step 1 already proved the declaration).
+    let Some(invoker) = activation.ctx.get::<Invoker>(service) else {
+        return write_detail(
+            out_buf,
+            cap,
+            out_len,
+            "inactive_dependency",
+            &format!("cannot get required service \"{service}\" in inactive context"),
+            STATUS_INACTIVE,
+        );
+    };
+    // SAFETY: vtable input contract.
+    let payload = unsafe { input_slice(in_data, in_len) }.to_vec();
+    // Steps 3-5: the reentrancy check fires at the target's entry
+    // (`DylibInvoke::call`) and surfaces as the `reentrancy_cycle` code;
+    // the invocation is driven on this thread.
+    match drive(&activation.rt, invoker.call(method, payload)) {
+        Ok(bytes) => {
+            // SAFETY: caller-owned buffer protocol.
+            if unsafe { write_out(&bytes, out_buf, cap, out_len) } {
+                STATUS_OK
+            } else {
+                STATUS_CAPACITY
+            }
+        }
+        Err(err) => {
+            let status = if err.code == "reentrancy_cycle" {
+                STATUS_REENTRANCY
+            } else {
+                STATUS_FAILED
+            };
+            write_detail(out_buf, cap, out_len, err.code, &err.message, status)
+        }
+    }
+}
+
+/// vtable entry: publishes one event to the kernel bus, enqueue-and-return.
+///
+/// # Safety
+///
+/// Per the [`HostExports`] contract: `host` names a live activation and
+/// `event`/`payload` are readable for their lengths.
+unsafe extern "C" fn host_emit(
+    host: *mut std::ffi::c_void,
+    event: *const u8,
+    event_len: usize,
+    payload: *const u8,
+    payload_len: usize,
+) -> i32 {
+    // SAFETY: see `host_require`.
+    let activation = unsafe { &*host.cast::<Activation>() };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        emit_impl(activation, event, event_len, payload, payload_len)
+    }))
+    .unwrap_or(STATUS_HOST_ERROR)
+}
+
+/// The `emit` bridge: validates the name and payload, then forwards to the
+/// kernel's fire-and-forget `emit` (listener failures are logged, never
+/// propagated — the caller neither expects nor receives them).
+fn emit_impl(
+    activation: &Activation,
+    event: *const u8,
+    event_len: usize,
+    payload: *const u8,
+    payload_len: usize,
+) -> i32 {
+    // SAFETY: vtable input contract.
+    let event_bytes = unsafe { input_slice(event, event_len) };
+    let Ok(event) = std::str::from_utf8(event_bytes) else {
+        return STATUS_INVALID_EVENT;
+    };
+    // Bridges never touch the framework-reserved prefix (aligned with the
+    // `on_dispatch` rejection rule).
+    if event.starts_with("internal/") {
+        return STATUS_INVALID_EVENT;
+    }
+    // SAFETY: vtable input contract.
+    let payload_bytes = unsafe { input_slice(payload, payload_len) };
+    let Ok(value) = serde_json::from_slice::<Value>(payload_bytes) else {
+        return STATUS_INVALID_PAYLOAD;
+    };
+    // `Context::emit` spawns the dispatch; entering the captured runtime
+    // makes that legal on plugin-owned threads too.
+    let _runtime = activation.rt.enter();
+    activation.ctx.emit(event, value);
+    STATUS_OK
+}
 
 /// Resolved export table plus the mapped library that backs it.
 ///
@@ -145,9 +508,11 @@ impl Exports {
             .map_err(|err| Error::msg(format!("dylib descriptor is not valid JSON: {err}")))
     }
 
-    fn setup(&self) -> Option<Handle> {
-        // SAFETY: setup takes no inputs and returns an owned opaque handle.
-        let handle = unsafe { ((*self.table).setup)() };
+    fn setup(&self, host: &HostExports) -> Option<Handle> {
+        // SAFETY: `host` points at a live `HostExports` for the duration of
+        // the call (the v3 contract); the returned handle is owned, opaque
+        // plugin state.
+        let handle = unsafe { ((*self.table).setup)(host) };
         if handle.is_null() {
             None
         } else {
@@ -155,23 +520,53 @@ impl Exports {
         }
     }
 
-    fn call(&self, handle: &Handle, method: u32, payload: &[u8]) -> Result<Vec<u8>> {
+    /// One service call: payload on success; on [`STATUS_FAILED`] the
+    /// callee's best-effort UTF-8 diagnostic rides the error message (v3
+    /// contract; failure is final, never retried).
+    fn call_full(&self, handle: &Handle, method: u32, payload: &[u8]) -> Result<Vec<u8>> {
         let table = self.table;
         let handle = handle.0;
         let op = format!("call(method={method})");
-        // SAFETY: handle came from `setup` and was not yet torn down; buffer
-        // contract as above.
-        Self::growable_call(&op, move |out, cap, len| unsafe {
-            ((*table).call)(
-                handle,
-                method,
-                payload.as_ptr(),
-                payload.len(),
-                out,
-                cap,
-                len,
-            )
-        })
+        let mut cap = 4096_usize;
+        loop {
+            let mut buf = vec![0_u8; cap];
+            let mut len = 0_usize;
+            // SAFETY: handle came from `setup` and was not yet torn down;
+            // buffer contract as above.
+            let status = unsafe {
+                ((*table).call)(
+                    handle,
+                    method,
+                    payload.as_ptr(),
+                    payload.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &raw mut len,
+                )
+            };
+            match status {
+                STATUS_OK => return Ok(buf[..len].to_vec()),
+                STATUS_CAPACITY => {
+                    cap = cap.saturating_mul(2);
+                    if cap > Self::MAX_OUTPUT_BYTES {
+                        return Err(Error::msg(format!(
+                            "dylib {op} output exceeds {} bytes",
+                            Self::MAX_OUTPUT_BYTES
+                        )));
+                    }
+                }
+                STATUS_FAILED => {
+                    let detail = String::from_utf8_lossy(&buf[..len]);
+                    return Err(Error::new(
+                        "service_error",
+                        format!("dylib {op} failed: {detail}"),
+                    ));
+                }
+                other => {
+                    return Err(Error::msg(format!("dylib {op} failed with status {other}")));
+                }
+            }
+        }
     }
 
     /// One event dispatch result: the plugin's status plus its output.
@@ -306,6 +701,7 @@ struct DylibInvoke {
     exports: Exports,
     handle: Handle,
     lock: InstanceLock,
+    instance_id: u64,
 }
 
 // SAFETY: the raw handle targets plugin-private state; every access is
@@ -320,11 +716,101 @@ impl dougong::Invoke for DylibInvoke {
         let exports = self.exports.clone();
         let handle = self.handle.clone();
         let lock = Arc::clone(&self.lock);
+        let instance_id = self.instance_id;
         Box::pin(async move {
+            // Reentrancy check before touching the lock (D-V3-3 b'): firing
+            // means this thread is already executing inside this instance, so
+            // awaiting its non-reentrant mutex would self-deadlock. On the
+            // outbound-`require` path the whole future is polled on one
+            // thread (`drive`), so the check is exact there.
+            if entered_on_this_thread(instance_id) {
+                return Err(Error::new(
+                    "reentrancy_cycle",
+                    "dylib service call would re-enter an instance already executing on this thread",
+                ));
+            }
             let _instance = lock.lock().await;
-            exports.call(&handle, method, &payload)
+            // The guard opens after the last `.await` and closes before the
+            // next one, keeping push/pop pairing on this thread.
+            let _entry = EntryGuard::enter(instance_id);
+            exports.call_full(&handle, method, &payload)
         })
     }
+}
+
+/// Builds the mode-aware bridge for one listened event (ABI v2 CPS, D14).
+///
+/// The instance lock spans the whole invocation including a deferred
+/// waterfall continuation, so plugin state cannot observe interleaving; the
+/// reentrancy guard covers each synchronous FFI segment separately, since a
+/// guard must never cross an `.await` (task migration would break the
+/// thread-local push/pop pairing).
+fn event_bridge(
+    exports: Exports,
+    handle: Handle,
+    lock: InstanceLock,
+    event_id: u32,
+    instance_id: u64,
+) -> DispatchListener {
+    Arc::new(move |_ctx, payload, next, mode| {
+        let exports = exports.clone();
+        let handle = handle.clone();
+        let lock = Arc::clone(&lock);
+        Box::pin(async move {
+            let _instance = lock.lock().await;
+            let bytes = serde_json::to_vec(&payload)
+                .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
+            let waterfall = mode == DispatchMode::Waterfall;
+            let (status, reply) = {
+                let _entry = EntryGuard::enter(instance_id);
+                exports.dispatch_event(
+                    &handle,
+                    event_id,
+                    abi_mode(mode),
+                    &bytes,
+                    u32::from(waterfall),
+                )?
+            };
+            match status {
+                dougong_abi::STATUS_DEFERRED => {
+                    if !waterfall {
+                        return Err(Error::msg(format!(
+                            "dylib plugin deferred event {event_id} outside waterfall"
+                        )));
+                    }
+                    // DEFERRED output, when present, is the payload the chain
+                    // continues with; empty output continues with the
+                    // original.
+                    let value: Value = if reply.is_empty() {
+                        serde_json::from_slice(&bytes)
+                            .map_err(|err| Error::msg(format!("decode payload: {err}")))?
+                    } else {
+                        serde_json::from_slice(&reply)
+                            .map_err(|err| Error::msg(format!("decode payload: {err}")))?
+                    };
+                    let continued = next.call(value).await?;
+                    let chain_bytes = serde_json::to_vec(&continued)
+                        .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
+                    let processed = {
+                        let _entry = EntryGuard::enter(instance_id);
+                        exports.deliver_next(
+                            &handle,
+                            event_id,
+                            dougong_abi::STATUS_OK,
+                            &chain_bytes,
+                        )?
+                    };
+                    serde_json::from_slice(&processed)
+                        .map_err(|err| Error::msg(format!("decode payload: {err}")))
+                }
+                STATUS_FAILED => Err(Error::msg(format!(
+                    "dylib on_event(event={event_id}) failed"
+                ))),
+                _ => serde_json::from_slice(&reply)
+                    .map_err(|err| Error::msg(format!("decode payload: {err}"))),
+            }
+        })
+    })
 }
 
 /// A plugin loaded from a shared library.
@@ -360,93 +846,84 @@ impl Plugin for DynPlugin {
         let provide = self.provide.clone();
         let listen = self.listen.clone();
         let plugin_name = self.name.clone();
+        let inject_names: Vec<String> = self
+            .inject
+            .iter()
+            .map(|injection| injection.service.to_string())
+            .collect();
         Box::pin(async move {
-            let Some(handle) = exports.setup() else {
+            let instance: InstanceLock = Arc::new(AsyncMutex::new(()));
+            let instance_id = next_instance_id();
+            // The outbound vtable is per-activation (A3): it captures this
+            // fiber's context (realm-scoped resolution), the runtime handle
+            // (foreign-thread driving), and the descriptor inject set
+            // (capability basis). `apply` runs on a fiber task, so
+            // `Handle::current` always succeeds here.
+            let activation = ActivationPtr(
+                Arc::into_raw(Arc::new(Activation {
+                    ctx: ctx.clone(),
+                    rt: tokio::runtime::Handle::current(),
+                    inject: inject_names,
+                }))
+                .cast_mut()
+                .cast::<std::ffi::c_void>(),
+            );
+            // Setup runs under the instance lock on the reentrancy stack
+            // (uniform entry discipline); a fresh id cannot cycle. The
+            // vtable is built inside the block: raw pointers are not `Send`
+            // and must not be held across the `await` in a local.
+            let setup = {
+                let _instance = instance.lock().await;
+                let _entry = EntryGuard::enter(instance_id);
+                let host_exports = HostExports {
+                    host_handle: activation.0,
+                    require: host_require,
+                    emit: host_emit,
+                };
+                exports.setup(&host_exports)
+            };
+            let Some(handle) = setup else {
+                // SAFETY: setup failed, the vtable was never published; this
+                // is the unique reclaim of the raw activation reference.
+                unsafe { activation.reclaim() };
                 return Err(Error::msg(format!(
                     "dylib plugin \"{plugin_name}\" setup returned null"
                 )));
             };
-            let instance: InstanceLock = Arc::new(AsyncMutex::new(()));
 
             // Teardown runs exactly once per successful setup, after every
             // other effect (provide disposers, bridges) has drained — LIFO
             // places it first in the queue because it is registered here,
-            // before the effects below.
+            // before the effects below. It also reclaims the activation:
+            // vtable calls after teardown returns are outside the contract.
             let teardown_exports = exports.clone();
             let teardown_handle = Handle(handle.0);
             let teardown_lock = Arc::clone(&instance);
+            let teardown_activation = activation;
             let disposer: dougong::Disposer = Box::new(move || {
                 Box::pin(async move {
-                    let _instance = teardown_lock.lock().await;
-                    teardown_exports.teardown(&teardown_handle);
+                    {
+                        let _instance = teardown_lock.lock().await;
+                        let _entry = EntryGuard::enter(instance_id);
+                        teardown_exports.teardown(&teardown_handle);
+                    }
+                    // SAFETY: teardown has returned, so the vtable is dead;
+                    // this is the unique reclaim of the activation reference.
+                    unsafe { teardown_activation.reclaim() };
                 })
             });
             ctx.effect("dylib.teardown", async move { Ok(Some(disposer)) })
                 .await?;
 
-            // Mode-aware bridges: one per declared listened event. The lock
-            // spans the whole invocation, including a deferred waterfall
-            // continuation, so plugin state cannot observe interleaving.
+            // Mode-aware bridges: one per declared listened event.
             for (event_name, event_id) in &listen {
-                let bridge_exports = exports.clone();
-                let bridge_handle = Handle(handle.0);
-                let bridge_lock = Arc::clone(&instance);
-                let event_id = *event_id;
-                let bridge: DispatchListener = Arc::new(move |_ctx, payload, next, mode| {
-                    let exports = bridge_exports.clone();
-                    let handle = bridge_handle.clone();
-                    let lock = Arc::clone(&bridge_lock);
-                    Box::pin(async move {
-                        let _instance = lock.lock().await;
-                        let bytes = serde_json::to_vec(&payload)
-                            .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
-                        let waterfall = mode == DispatchMode::Waterfall;
-                        let (status, reply) = exports.dispatch_event(
-                            &handle,
-                            event_id,
-                            abi_mode(mode),
-                            &bytes,
-                            u32::from(waterfall),
-                        )?;
-                        match status {
-                            dougong_abi::STATUS_DEFERRED => {
-                                if !waterfall {
-                                    return Err(Error::msg(format!(
-                                        "dylib plugin deferred event {event_id} outside waterfall"
-                                    )));
-                                }
-                                // DEFERRED output, when present, is the
-                                // payload the chain continues with; empty
-                                // output continues with the original.
-                                let value: Value = if reply.is_empty() {
-                                    serde_json::from_slice(&bytes).map_err(|err| {
-                                        Error::msg(format!("decode payload: {err}"))
-                                    })?
-                                } else {
-                                    serde_json::from_slice(&reply).map_err(|err| {
-                                        Error::msg(format!("decode payload: {err}"))
-                                    })?
-                                };
-                                let continued = next.call(value).await?;
-                                let chain_bytes = serde_json::to_vec(&continued)
-                                    .map_err(|err| Error::msg(format!("encode payload: {err}")))?;
-                                let processed = exports.deliver_next(
-                                    &handle,
-                                    event_id,
-                                    dougong_abi::STATUS_OK,
-                                    &chain_bytes,
-                                )?;
-                                serde_json::from_slice(&processed)
-                                    .map_err(|err| Error::msg(format!("decode payload: {err}")))
-                            }
-                            dougong_abi::STATUS_FAILED => Err(Error::msg(format!(
-                                "dylib on_event(event={event_id}) failed"
-                            ))),
-                            _ => serde_json::from_slice(&reply)
-                                .map_err(|err| Error::msg(format!("decode payload: {err}"))),
-                        }
-                    })
-                });
+                let bridge = event_bridge(
+                    exports.clone(),
+                    Handle(handle.0),
+                    Arc::clone(&instance),
+                    *event_id,
+                    instance_id,
+                );
                 ctx.on_dispatch(event_name, bridge).await?;
             }
 
@@ -457,6 +934,7 @@ impl Plugin for DynPlugin {
                     exports: invoker_exports,
                     handle: Handle(invoker_handle),
                     lock: Arc::clone(&instance),
+                    instance_id,
                 }));
                 ctx.provide(service, invoker).await?;
             }
@@ -568,10 +1046,12 @@ pub(crate) fn from_static(table: &'static PluginExports) -> Result<DynPlugin> {
 }
 
 #[cfg(test)]
+mod outbound_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use dougong::Context;
-    use dougong_abi::{STATUS_DEFERRED, STATUS_OK, write_out};
+    use dougong_abi::STATUS_DEFERRED;
     use serde_json::json;
 
     const FAKE_NAME: &[u8] = b"fake-plugin";
@@ -581,7 +1061,7 @@ mod tests {
         if unsafe { write_out(FAKE_NAME, out, cap, len) } {
             STATUS_OK
         } else {
-            dougong_abi::STATUS_CAPACITY
+            STATUS_CAPACITY
         }
     }
 
@@ -597,11 +1077,11 @@ mod tests {
         } {
             STATUS_OK
         } else {
-            dougong_abi::STATUS_CAPACITY
+            STATUS_CAPACITY
         }
     }
 
-    unsafe extern "C" fn fake_setup() -> *mut std::os::raw::c_void {
+    unsafe extern "C" fn fake_setup(_host: *const HostExports) -> *mut std::os::raw::c_void {
         // One live byte per activation; `fake_teardown` releases it, so the
         // full apply/unload cycle runs against a non-null handle.
         Box::into_raw(Box::new(0_u8)).cast::<std::os::raw::c_void>()
@@ -756,7 +1236,9 @@ mod tests {
     #[tokio::test]
     async fn call_forwards_through_the_exports() {
         let plugin = from_static(&GOOD_VERSION).expect("adapter builds");
-        let outcome = plugin.exports.call(&Handle(std::ptr::null_mut()), 0, b"hi");
+        let outcome = plugin
+            .exports
+            .call_full(&Handle(std::ptr::null_mut()), 0, b"hi");
         assert_eq!(outcome.expect("call ok"), b"echo");
     }
 
@@ -821,7 +1303,50 @@ mod tests {
     #[test]
     fn call_retries_after_status_capacity() {
         let plugin = from_static(&RETRY_TABLE).expect("adapter builds");
-        let outcome = plugin.exports.call(&Handle(std::ptr::null_mut()), 0, b"");
+        let outcome = plugin
+            .exports
+            .call_full(&Handle(std::ptr::null_mut()), 0, b"");
         assert_eq!(outcome.expect("retry succeeds"), b"second");
+    }
+
+    #[test]
+    fn entry_stack_pairs_and_detects_membership() {
+        let id = next_instance_id();
+        assert!(!entered_on_this_thread(id));
+        {
+            let _entry = EntryGuard::enter(id);
+            assert!(entered_on_this_thread(id));
+            {
+                let other = EntryGuard::enter(next_instance_id());
+                assert!(entered_on_this_thread(id));
+                drop(other);
+            }
+            assert!(entered_on_this_thread(id));
+        }
+        assert!(!entered_on_this_thread(id));
+    }
+
+    #[tokio::test]
+    async fn drive_runs_futures_on_foreign_threads() {
+        let rt = tokio::runtime::Handle::current();
+        // The sender lives on a plain thread, not a runtime task: the driven
+        // future cannot complete without a genuine park/wake cycle, and the
+        // test's runtime thread is never blocked on `join` while a runtime
+        // task is still pending (which would deadlock a current-thread
+        // runtime).
+        let (tx, rx) = tokio::sync::oneshot::channel::<u64>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _dropped = tx.send(41);
+        });
+        let outcome = std::thread::spawn(move || {
+            drive(&rt, async move {
+                let value = rx.await.expect("sender alive");
+                value + 1
+            })
+        })
+        .join()
+        .expect("driver thread did not panic");
+        assert_eq!(outcome, 42);
     }
 }
