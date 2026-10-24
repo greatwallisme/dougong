@@ -1100,6 +1100,8 @@ pub(crate) fn from_static(table: &'static PluginExports) -> Result<DynPlugin> {
 }
 
 #[cfg(test)]
+mod fault_tests;
+#[cfg(test)]
 mod outbound_tests;
 #[cfg(test)]
 mod tests {

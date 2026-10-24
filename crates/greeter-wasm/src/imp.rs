@@ -28,13 +28,28 @@ const LISTENER_UPPER: u64 = 2;
 struct State {
     invocations: u32,
     lifecycle: u64,
+    trap_teardown: bool,
 }
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
         invocations: 0,
         lifecycle: 0,
+        trap_teardown: false,
     });
+}
+
+/// Fault-injection hook (S7): a config carrying `"trap_teardown":true`
+/// arms the teardown trap. The guest intentionally depends on wit-bindgen
+/// only, so the compact host encoding is matched as raw bytes instead of
+/// pulling in a JSON parser.
+fn asks_trap_teardown(config: &[u8]) -> bool {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+    contains(config, b"trap_teardown") && contains(config, b"true")
 }
 
 /// The greeter wasm plugin.
@@ -73,8 +88,9 @@ impl Guest for Greeter {
         }
     }
 
-    fn apply(_site: CallContext, _config: Vec<u8>) -> Result<(), KernelError> {
+    fn apply(_site: CallContext, config: Vec<u8>) -> Result<(), KernelError> {
         log(LogLevel::Info, "greeter-wasm: applying; providing greeting");
+        STATE.with(|state| state.borrow_mut().trap_teardown = asks_trap_teardown(&config));
         host::provide_service(&service_key("greeting")).map_err(|_| {
             internal("host rejected provide-service for declared service \"greeting\"")
         })?;
@@ -91,7 +107,7 @@ impl Guest for Greeter {
     fn handle_service_call(
         key: ServiceKey,
         method: u32,
-        _payload: Vec<u8>,
+        payload: Vec<u8>,
     ) -> Result<Vec<u8>, KernelError> {
         if key.name != "greeting" || key.abi_hash != ABI_HASH {
             return Err(KernelError::CapabilityDenied(format!(
@@ -104,6 +120,11 @@ impl Guest for Greeter {
                 "unknown method selector {method}"
             )));
         }
+        // Fault-injection hook (S7): the "boom" payload traps the guest.
+        assert!(
+            payload != b"boom",
+            "fault-injection hook: service-call trap"
+        );
         let count = STATE.with(|state| {
             let mut state = state.borrow_mut();
             state.invocations += 1;
@@ -126,6 +147,16 @@ impl Guest for Greeter {
                         ev.name
                     )));
                 }
+                // Fault-injection hooks (S7): the JSON string "boom" traps
+                // the guest, "fail" returns a plain guest error (event
+                // payloads arrive JSON-encoded, hence the quotes).
+                assert!(
+                    payload != b"\"boom\"",
+                    "fault-injection hook: listener trap"
+                );
+                if payload == b"\"fail\"" {
+                    return Err(internal("fault-injection hook: listener failure"));
+                }
                 log(LogLevel::Info, "greeter-wasm: ping received");
                 // Event replies are JSON-encoded kernel values (a bare
                 // string must be quoted to stay valid JSON).
@@ -146,7 +177,12 @@ impl Guest for Greeter {
 
     fn run_disposer(handle: u64) -> Result<(), KernelError> {
         if handle == 0 {
-            let count = STATE.with(|state| state.borrow().invocations);
+            let (count, trap) = STATE.with(|state| {
+                let state = state.borrow();
+                (state.invocations, state.trap_teardown)
+            });
+            // Fault-injection hook (S7): armed by the apply config.
+            assert!(!trap, "fault-injection hook: teardown trap");
             log(
                 LogLevel::Info,
                 &format!("greeter-wasm: teardown after {count} invocation(s)"),

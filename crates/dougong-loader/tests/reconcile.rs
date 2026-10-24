@@ -161,3 +161,179 @@ fn parse_rejects_duplicate_and_empty_names() {
     let err = Config::parse(empty).expect_err("empty name rejected");
     assert!(err.to_string().contains("must not be empty"));
 }
+
+/// Test rail: any hang becomes a failure instead of a stuck suite.
+const RAIL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Polls the condition with a hard ceiling: a hang fails, never flakes.
+async fn wait_until(condition: impl Fn() -> bool + Send + Sync) {
+    tokio::time::timeout(RAIL, async {
+        while !condition() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("condition reached");
+}
+
+/// Fault injection (S7): repeated hot reload through the declarative path
+/// converges every single round, and the body observes each config exactly.
+#[tokio::test]
+async fn hot_reload_storm_converges_every_round() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let builtins = HashMap::from([("recorder".to_string(), recorder(Arc::clone(&log)))]);
+    let mut reconciler = Reconciler::new(builtins, None);
+    let ctx = Context::new();
+
+    let doc = r#"{"plugins":[{"name":"app","source":{"kind":"builtin","name":"recorder"},"config":{"v":0}}]}"#;
+    reconciler.replace(Config::parse(doc).expect("valid doc"));
+    let report = reconciler.apply(&ctx).await;
+    assert_eq!(report.inserted, vec!["app".to_string()]);
+    reconciler
+        .live()
+        .get("app")
+        .expect("app live")
+        .handle
+        .join()
+        .await
+        .expect("initial body settled");
+
+    for round in 1..=10_i32 {
+        let doc = format!(
+            r#"{{"plugins":[{{"name":"app","source":{{"kind":"builtin","name":"recorder"}},"config":{{"v":{round}}}}}]}}"#
+        );
+        reconciler.replace(Config::parse(&doc).expect("valid doc"));
+        let report = reconciler.apply(&ctx).await;
+        assert!(
+            report.failures.is_empty(),
+            "round {round} failures: {:?}",
+            report.failures
+        );
+        assert_eq!(
+            report.updated,
+            vec!["app".to_string()],
+            "round {round} hot-updates"
+        );
+        let handle = &reconciler.live().get("app").expect("app live").handle;
+        handle.join().await.expect("body ok");
+        let last = log.lock().expect("log lock").last().cloned();
+        assert_eq!(
+            last,
+            Some(json!({"v": round})),
+            "round {round} config landed"
+        );
+    }
+
+    // A pass over the unchanged document is a no-op after the storm.
+    let report = reconciler.apply(&ctx).await;
+    assert!(report.converged(), "settled after the storm: {report:?}");
+    let expected: Vec<Value> = (0..=10_i32).map(|v| json!({"v": v})).collect();
+    assert_eq!(*log.lock().expect("log lock"), expected);
+    ctx.stop().await;
+}
+
+/// Fault injection (S7): flipping a provider slot's scope retires and
+/// re-inserts it (scope is baked into the fiber at start); a consumer pinned
+/// to one realm activates and parks in lockstep, round after round.
+#[tokio::test]
+async fn scope_flip_storm_retires_reinserts_and_reconsumers() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let consumer_observed = Arc::clone(&observed);
+    let builtins: HashMap<String, Arc<dyn Plugin>> = [
+        (
+            "provider".to_string(),
+            plugin("provider", vec![], |ctx, _config| {
+                Box::pin(async move {
+                    ctx.provide("svc", "realm-value".to_string()).await?;
+                    Ok(())
+                })
+            }),
+        ),
+        (
+            "consumer".to_string(),
+            plugin(
+                "consumer",
+                vec![Injection::new("svc")],
+                move |ctx, _config| {
+                    let observed = Arc::clone(&consumer_observed);
+                    Box::pin(async move {
+                        let svc = ctx.require::<String>("svc")?;
+                        observed.lock().expect("log lock").push(svc.to_string());
+                        Ok(())
+                    })
+                },
+            ),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let mut reconciler = Reconciler::new(builtins, None);
+    let ctx = Context::new();
+
+    let doc_with_provider_in = |realm: &str| {
+        format!(
+            r#"{{"plugins":[
+                {{"name":"p","source":{{"kind":"builtin","name":"provider"}},"isolate":"{realm}"}},
+                {{"name":"c","source":{{"kind":"builtin","name":"consumer"}},"isolate":"realm-a"}}
+            ]}}"#
+        )
+    };
+
+    reconciler.replace(Config::parse(&doc_with_provider_in("realm-a")).expect("valid doc"));
+    let report = reconciler.apply(&ctx).await;
+    assert_eq!(report.inserted.len(), 2, "both slots start: {report:?}");
+    let consumer_handle = reconciler
+        .live()
+        .get("c")
+        .expect("consumer live")
+        .handle
+        .clone();
+    wait_until(|| consumer_handle.state() == dougong::FiberState::Active).await;
+
+    for round in 1..=3_i32 {
+        // Flip the provider out of the consumer's realm: retired here means
+        // "re-inserted elsewhere"; the consumer's dependency vanishes
+        // (realm services never leak) and it parks.
+        reconciler.replace(Config::parse(&doc_with_provider_in("realm-b")).expect("valid doc"));
+        let report = reconciler.apply(&ctx).await;
+        assert_eq!(
+            report.inserted,
+            vec!["p".to_string()],
+            "round {round} flip out"
+        );
+        assert_eq!(
+            report.unchanged,
+            vec!["c".to_string()],
+            "consumer slot untouched"
+        );
+        wait_until(|| consumer_handle.state() == dougong::FiberState::Pending).await;
+
+        // Flip back: re-insert into realm-a rewires the consumer.
+        reconciler.replace(Config::parse(&doc_with_provider_in("realm-a")).expect("valid doc"));
+        let report = reconciler.apply(&ctx).await;
+        assert_eq!(
+            report.inserted,
+            vec!["p".to_string()],
+            "round {round} flip back"
+        );
+        wait_until(|| consumer_handle.state() == dougong::FiberState::Active).await;
+        let count = observed.lock().expect("log lock").len();
+        assert_eq!(
+            count,
+            usize::try_from(round).expect("small") + 1,
+            "round {round} rewired"
+        );
+    }
+
+    // Every activation resolved the realm-local value; the uid of the
+    // provider fiber changed on every flip (retire + re-insert, never a
+    // config update).
+    assert!(
+        observed
+            .lock()
+            .expect("log lock")
+            .iter()
+            .all(|value| value == "realm-value")
+    );
+    ctx.stop().await;
+}

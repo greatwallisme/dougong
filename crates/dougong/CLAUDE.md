@@ -25,4 +25,4 @@ The composition kernel. Everything else in the workspace adapts to its semantics
 
 ## Tests
 
-`tests/kernel_semantics.rs` (behavior contract) and `tests/acceptance.rs` (paper §15 scenario mapping) are the regression net — any semantic change updates them, and any bug fix here should first reproduce as a failing case there. Run with `cargo test -p dougong`.
+`tests/kernel_semantics.rs` (behavior contract) and `tests/acceptance.rs` (paper §15 scenario mapping) are the regression net — any semantic change updates them, and any bug fix here should first reproduce as a failing case there. The stability tracks add one suite each: `cancel_scope.rs` (S2), `timeouts.rs` (S3), `lifecycle_guards.rs` (S4), `error_policy.rs` (S5), `ordering.rs` (S6), and `fault_injection.rs` (S7: repeated/concurrent hot updates, unload+inject+event races, dynamic realm fallback, panicking listeners pinned per dispatch mode). Run with `cargo test -p dougong`.

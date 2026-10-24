@@ -15,7 +15,7 @@ The `clippy::significant_drop_tightening` allowances on the store guards are int
 
 ## Wasmtime 48 API facts (verified empirically)
 
-`instantiate_async` returns the wrapper directly; component linkers are `wasmtime::component::Linker` bound via `add_to_linker::<T, HasSelf<T>>`; import trait methods return the flat WIT result (traps are impossible in their signatures — degrade failures to `kernel-error::internal`); imported resources need `HostRegistration::drop` implemented via `ResourceTable::delete`; `WasiView::ctx` returns `WasiCtxView{ctx, table}`. The bindgen output is generated into `mod bindings` in `lib.rs` — regenerate, never hand-edit. Note `gen` is a reserved keyword in edition 2024.
+`instantiate_async` returns the wrapper directly; component linkers are `wasmtime::component::Linker` bound via `add_to_linker::<T, HasSelf<T>>`; import trait methods return the flat WIT result (traps are impossible in their signatures — degrade failures to `kernel-error::internal`); imported resources need `HostRegistration::drop` implemented via `ResourceTable::delete`; `WasiView::ctx` returns `WasiCtxView{ctx, table}`. The bindgen output is generated into `mod bindings` in `lib.rs` — regenerate, never hand-edit. Note `gen` is a reserved keyword in edition 2024. A guest trap poisons its component instance: every later entry fails with `cannot enter component instance` (verified by the S7 fault-injection tests) — containment is per-instance, so a trapped guest's service/event failures are deterministic transport errors, and the S5 provider quarantine is the opt-in reaction.
 
 ## Contract
 
@@ -23,4 +23,4 @@ The `clippy::significant_drop_tightening` allowances on the store guards are int
 
 ## Testing
 
-`cargo test -p dougong-wasm` covers host-side mapping only. The full path is `examples/wasm_demo.rs`, which needs the guest artifact: `cargo build -p greeter-wasm --target wasm32-wasip2` (or point `DOUGONG_GREETER_WASM` at a component).
+`cargo test -p dougong-wasm` covers host-side mapping (unit) plus `tests/fault_injection.rs` (S7): guest trap poisons the instance (deterministic transport errors, fibers/kernel survive, disposal still completes), listener failure arms settling per class, and teardown trap never blocking unload. The fault tests need the guest artifact and skip when it is absent; build it with `cargo build -p greeter-wasm --target wasm32-wasip2` (or point `DOUGONG_GREETER_WASM` at a component). The green path is `examples/wasm_demo.rs`.

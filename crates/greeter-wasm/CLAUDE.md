@@ -14,3 +14,4 @@ Example dougong plugin as a wasm component. Depends **only** on `wit-bindgen` an
 - `apply` is where all registration happens (`provide_service`, `register_listener`, `effect_collect`); the host reverses them LIFO on withdrawal, with handle `0` = plugin teardown.
 - Consumed services must appear in the descriptor's `inject` or the host rejects `call-service` (capability check).
 - Guest state is a `thread_local` `RefCell` — wasm execution is single-threaded and the host serializes export calls.
+- Fault-injection hooks (S7, dormant unless triggered): service-call payload `boom` traps; `ping` payload `"boom"` (JSON string) traps, `"fail"` returns a guest error; config `{"trap_teardown":true}` makes `run_disposer(0)` trap. They power `dougong-wasm/tests/fault_injection.rs`; the demo paths never send those payloads.
