@@ -144,6 +144,17 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - 错误码 `apply_timeout` / `listener_timeout` 入 Error 稳定码；drain/cleanup/reap 产结构化日志行（含码词），S5 在此三分之上建分级。
 - 验证锚：`tests/timeouts.rs` 12 例（apply 超时/重试成功/重试耗尽、parallel plain 入聚合、parallel bridge detach 存活、serial 传播、waterfall 传播且 fallback 未触、emit 记日志、drain 两臂、cleanup 孤化续 LIFO、reap 看门狗告警后收口）；默认零配置下既有全套 17 套件回归即零回归证明。
 
+### D19 生命周期 API 幂等护栏 = 咽喉守卫 + 单 winner dispose + 入口状态拒绝（S4）
+
+2026-10-24，improve 二.4 落地（设计定稿见 `.planning/2026-10-23-v0-3-0-dylib-outbound-and-runtime-harden/findings.md` §13）：
+
+- **根因洞察**：一切激活请求（`restart`/`update` 的 refresh、provider 通知的 refresh）最终汇于 `request_epoch` 单一咽喉，而 driver 状态机没有终态概念——护栏加在咽喉而非逐调用点。实证缺口三处：并发双 dispose 双 winner（check-then-act 跨两次取锁）⇒ `internal/plugin` disposed 事件重复发射等污染；dispose 的 uid 认领先于 `remove_fiber`，窗口内 notify 收集到的 refresh 可把活跃 epoch 打回 ⇒ **已 dispose fiber 真被重新激活**；update 在 Loading 时返回 Ok 但在途激活早已 clone 旧配置（误导调用方）。
+- **咽喉守卫**：`DriveState` 增终态标志 `disposed`；dispose 同步头**先**置位（driver 锁内）**后**原子 `uid.take()` 认领（顺序不可颠倒，否则多线程下漏出「flag 未置位 + uid 已 None」窗口）。`request_epoch` 在 `disposed && desired != EPOCH_INACTIVE` 时直接拒——已 dispose fiber 永不再次收敛到活跃 epoch；INACTIVE 方向保持合法（dispose 自身经此收敛）。
+- **dispose 单 winner 幂等**：winner 独占 teardown（事件单次、remove_fiber 单次、post_dispose 检查点单次）；loser 不早退而是 request INACTIVE + join 收敛后返回——「多次调用返回同一状态」解释为**所有调用方返回时 fiber 均已收敛 Disposed**。loser join 无死锁：dispose 同步头保持无 await（S2「从本 fiber 监听任务内 dispose」语义不回归），driver 任务不属任何 scope 恒推进至落地。
+- **入口显式错误**（稳定码入 Error）：restart/update on disposed ⇒ `fiber_disposed(action)`（替代语义含糊的 `inactive_effect`，需求「error with explicit reason」）；update on Unloading ⇒ `fiber_unloading`（需求字面 reject）；update on Loading ⇒ `fiber_loading`（超字面扩展，依据：在途激活已 clone 配置，Ok 返回即谎言）。入口守卫是进入时刻的点读；waterfall 期间的流转由 driver 串行化 + 咽喉守卫兜底收敛（tail 的 restart 自带 disposed 检查）。
+- **Pending/Failed 的 update stash 臂保留**（loader 预配置通路）：清 error + 写 raw_config + refresh；原 `request_epoch(EPOCH_INACTIVE)` 在守卫后证明恒空转（parked fiber desired 已是 INACTIVE）⇒ 删除。零 API 签名变更；边界宿主透传安全（dylib 仅特判 reentrancy_cycle，其余码入详情载荷泛传；wasm 不枚举码）。
+- 验证锚：`tests/lifecycle_guards.rs` 6 例（顺序双 dispose 单 teardown / 并发 8× dispose 单 winner + disposed 事件恰一次 / restart+update on disposed 显式错 / update on Unloading（provider 撤回 + 受控门 disposer 确定性构造）/ update on Loading（受控门 body））+ fiber.rs 内联单测（dispose 后直接 refresh 不复活：driver 快照恒 INACTIVE + body 计数不变）；既有全套回归零改动通过 = 无既有流依赖 Loading/Unloading 期 update。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

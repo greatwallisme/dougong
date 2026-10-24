@@ -100,6 +100,36 @@ impl Error {
         )
     }
 
+    /// Creates a `fiber_disposed` error: `action` was requested on a fiber
+    /// whose disposal already completed (lifecycle guard, stability track S4).
+    #[must_use]
+    pub fn fiber_disposed(action: &str) -> Self {
+        Self::new(
+            "fiber_disposed",
+            format!("cannot {action} a disposed fiber"),
+        )
+    }
+
+    /// Creates a `fiber_unloading` error: `action` was requested while the
+    /// fiber is draining effects (lifecycle guard, stability track S4).
+    #[must_use]
+    pub fn fiber_unloading(action: &str) -> Self {
+        Self::new(
+            "fiber_unloading",
+            format!("cannot {action} a fiber that is unloading"),
+        )
+    }
+
+    /// Creates a `fiber_loading` error: `action` was requested while an
+    /// activation is in flight (lifecycle guard, stability track S4).
+    #[must_use]
+    pub fn fiber_loading(action: &str) -> Self {
+        Self::new(
+            "fiber_loading",
+            format!("cannot {action} a fiber that is loading"),
+        )
+    }
+
     /// Builds a generic message-only error.
     #[must_use]
     pub fn msg(message: impl Into<String>) -> Self {

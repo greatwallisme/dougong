@@ -155,6 +155,11 @@ pub struct DriveState {
     /// Apply-timeout retries already spent on the current desired epoch (S3);
     /// reset whenever the desired epoch changes or a load succeeds.
     retries_used: u32,
+    /// Terminal flag (S4): set by `dispose` before the uid claim. Once set,
+    /// `request_epoch` refuses any activatable epoch, so no race — a provider
+    /// notification collected before disposal, a `restart` in flight — can
+    /// ever re-activate a disposed fiber.
+    disposed: bool,
 }
 
 /// Live instance of one plugin application.
@@ -221,6 +226,7 @@ impl Fiber {
                 force: false,
                 task: None,
                 retries_used: 0,
+                disposed: false,
             }),
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
@@ -257,6 +263,7 @@ impl Fiber {
                 force: false,
                 task: None,
                 retries_used: 0,
+                disposed: false,
             }),
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
@@ -690,6 +697,15 @@ impl Fiber {
 
     fn request_epoch(self: &Arc<Self>, desired: String) {
         let mut driver = self.driver.lock();
+        // Lifecycle guard (S4): a disposed fiber never converges on an
+        // activatable epoch again. Every activation request funnels through
+        // here — `restart`'s refresh, provider notifications collected before
+        // disposal, update re-arms — so this single choke point closes the
+        // re-activation race class. The inactive direction stays legal:
+        // `dispose` itself converges the fiber through this method.
+        if driver.disposed && desired != EPOCH_INACTIVE {
+            return;
+        }
         if driver.desired == desired && !driver.dirty {
             return;
         }
@@ -1156,9 +1172,12 @@ impl Fiber {
     ///
     /// # Errors
     ///
-    /// Fails on disposed fibers; rethrows startup errors after the round trip.
+    /// Fails with [`Error::fiber_disposed`] on disposed fibers; rethrows
+    /// startup errors after the round trip.
     pub async fn restart(self: &Arc<Self>) -> Result<()> {
-        self.assert_active()?;
+        if self.uid_value().is_none() {
+            return Err(Error::fiber_disposed("restart"));
+        }
         self.error.lock().take();
         {
             let mut driver = self.driver.lock();
@@ -1186,17 +1205,40 @@ impl Fiber {
     /// Runs the `internal/update` waterfall first: an update hook that never
     /// calls `next` vetoes the change (HMR extension point).
     ///
+    /// Lifecycle guards (S4): the call is rejected up front on disposed and
+    /// mid-transition fibers. The guards read the state at entry; a
+    /// transition that begins during the waterfall converges through the
+    /// driver loop instead (the tail's restart re-checks disposal).
+    ///
     /// # Errors
     ///
-    /// Fails on disposed fibers, waterfall failures, or startup errors.
+    /// Fails with [`Error::fiber_disposed`] on disposed fibers,
+    /// [`Error::fiber_loading`] while an activation is in flight,
+    /// [`Error::fiber_unloading`] while effects are draining, on waterfall
+    /// failures, or on startup errors after the round trip.
     pub async fn update(self: &Arc<Self>, config: Value) -> Result<Value> {
-        self.assert_active()?;
-        if self.state() != FiberState::Active {
-            self.error.lock().take();
-            *self.raw_config.lock() = config;
-            self.request_epoch(crate::fiber::EPOCH_INACTIVE.to_string());
-            self.refresh();
-            return Ok(Value::Null);
+        if self.uid_value().is_none() {
+            return Err(Error::fiber_disposed("update"));
+        }
+        match self.state() {
+            FiberState::Active => {}
+            // A loading fiber's in-flight activation already cloned the
+            // previous config: accepting the stash here would report success
+            // while the old config keeps running. An unloading fiber is
+            // draining and must not be re-armed. Retry once settled.
+            FiberState::Loading => return Err(Error::fiber_loading("update")),
+            FiberState::Unloading => return Err(Error::fiber_unloading("update")),
+            FiberState::Disposed => return Err(Error::fiber_disposed("update")),
+            // Pending/Failed: park the new config for the next activation
+            // attempt (the loader pre-configuration path) and re-arm
+            // convergence. A parked fiber already desires the inactive epoch,
+            // so a refresh alone re-evaluates it against live candidates.
+            FiberState::Pending | FiberState::Failed => {
+                self.error.lock().take();
+                *self.raw_config.lock() = config;
+                self.refresh();
+                return Ok(Value::Null);
+            }
         }
         let fiber = Arc::clone(self);
         crate::events::waterfall_internal(
@@ -1222,13 +1264,30 @@ impl Fiber {
 
     /// Disposes this fiber: unload the plugin, settle once cleanup finished.
     ///
-    /// Idempotent; a second call is a no-op.
+    /// Idempotent, including under concurrency (S4): exactly one caller wins
+    /// the atomic uid claim and runs the teardown; every other caller joins
+    /// the convergence the winner requested and returns once this fiber has
+    /// settled, so all callers observe the same terminal state.
     pub async fn dispose(self: &Arc<Self>) {
-        let old_uid = self.uid_value();
+        // Set the terminal driver flag BEFORE claiming the uid: from this
+        // instant `request_epoch` refuses activatable epochs, so a provider
+        // notification or restart racing ahead of the claim can no longer
+        // re-activate the fiber (the reverse order would leave that window
+        // open on multi-threaded runtimes). The whole head stays await-free:
+        // a dispose invoked from one of this fiber's own listener tasks still
+        // completes the claim before its first cancellation point.
+        self.driver.lock().disposed = true;
+        let old_uid = self.uid.lock().take();
         let Some(old_uid) = old_uid else {
+            // Another dispose won the claim (or disposal completed earlier):
+            // converge the same way the winner does, then settle. The
+            // winner's head is await-free, so its inactive epoch request
+            // always lands; the driver task lives outside every scope and
+            // always reaches its landing, so this join cannot deadlock.
+            self.request_epoch(EPOCH_INACTIVE.to_string());
+            let _ = self.join().await;
             return;
         };
-        *self.uid.lock() = None;
         self.cache_state();
         if old_uid != 0 {
             crate::registry::remove_from_runtime(self);
@@ -1320,7 +1379,8 @@ impl FiberHandle {
     ///
     /// # Errors
     ///
-    /// Rethrows startup errors after the round trip.
+    /// Fails with [`Error::fiber_disposed`] on disposed fibers; rethrows
+    /// startup errors after the round trip.
     pub async fn restart(&self) -> Result<()> {
         self.0.restart().await
     }
@@ -1329,12 +1389,17 @@ impl FiberHandle {
     ///
     /// # Errors
     ///
-    /// Fails on disposed fibers, waterfall failures, or startup errors.
+    /// Fails with [`Error::fiber_disposed`] on disposed fibers,
+    /// [`Error::fiber_loading`] / [`Error::fiber_unloading`] while a
+    /// transition is in flight, on waterfall failures, or on startup errors.
     pub async fn update(&self, config: Value) -> Result<Value> {
         self.0.update(config).await
     }
 
     /// Unloads the plugin and settles after cleanup finished.
+    ///
+    /// Idempotent, including under concurrency: concurrent callers all return
+    /// once the single winning teardown has settled (S4).
     pub async fn dispose(&self) {
         self.0.dispose().await;
     }
@@ -1379,5 +1444,39 @@ impl EffectGuard {
                 .iter()
                 .any(|slot| matches!(slot, Some((id, _, _, _)) if *id == self.id))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::plugin;
+
+    /// The S4 choke-point guard: a disposed fiber must never converge on an
+    /// activatable epoch again, no matter who re-requests one.
+    #[tokio::test]
+    async fn refresh_after_dispose_never_reactivates() {
+        let activations = Arc::new(AtomicU64::new(0));
+        let activations_in_body = Arc::clone(&activations);
+        let plugin = plugin("doomed", vec![], move |_ctx, _config| {
+            let activations = Arc::clone(&activations_in_body);
+            Box::pin(async move {
+                activations.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        let ctx = Context::new();
+        let handle = ctx.plugin(plugin, None).expect("spawn");
+        handle.join().await.expect("active");
+        handle.dispose().await;
+        // A dependency-less fiber's refresh always computes an activatable
+        // epoch; before the S4 guard this re-armed the driver and re-ran the
+        // body on a disposed fiber (the notify-race re-activation hole).
+        handle.0.refresh();
+        let (desired, dirty) = handle.0.driver_snapshot();
+        assert_eq!(desired, EPOCH_INACTIVE);
+        assert!(!dirty);
+        assert_eq!(handle.state(), FiberState::Disposed);
+        assert_eq!(activations.load(Ordering::Relaxed), 1);
     }
 }
