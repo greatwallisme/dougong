@@ -57,6 +57,8 @@ pub struct RootState {
     pub(crate) policies: crate::policy::ErrorPolicies,
     /// Per-service-group serial sections for dependency updates (S6, D21).
     pub(crate) ordering: crate::ordering::UpdateSerializers,
+    /// Bounded fire-and-forget listener scheduling (P2, D22).
+    pub(crate) dispatcher: crate::event_queue::EventDispatcher,
 }
 
 impl std::fmt::Debug for RootState {
@@ -150,18 +152,21 @@ impl Default for Context {
     }
 }
 
-/// Construction-time options of a root context: timeout budgets (S3) plus
-/// per-class error policies (S5).
+/// Construction-time options of a root context: timeout budgets (S3),
+/// per-class error policies (S5), and event queue policies (P2).
 ///
 /// Every field defaults to the pre-policy behavior (all budgets unbounded,
 /// all errors logged at `Error`, no listener-failure reactions, no provider
-/// quarantine), so a default-constructed root behaves exactly as before.
+/// quarantine, lossless unbounded reliable events), so a default-constructed
+/// root behaves exactly as before.
 #[derive(Debug, Clone, Default)]
 pub struct ContextOptions {
     /// Timeout budgets for the critical async paths.
     pub timeouts: crate::timeout::TimeoutConfig,
     /// Per-class error reactions.
     pub policies: crate::policy::ErrorPolicies,
+    /// Event queue capacity, overflow, and concurrency policies.
+    pub events: crate::event_queue::EventQueueConfig,
 }
 
 impl Context {
@@ -185,6 +190,7 @@ impl Context {
         Self::new_with_options(ContextOptions {
             timeouts,
             policies: crate::policy::ErrorPolicies::default(),
+            events: crate::event_queue::EventQueueConfig::default(),
         })
     }
 
@@ -205,6 +211,7 @@ impl Context {
             timeouts: options.timeouts,
             policies: options.policies,
             ordering: crate::ordering::UpdateSerializers::default(),
+            dispatcher: crate::event_queue::EventDispatcher::new(options.events),
         });
         let handle = Self {
             root: Arc::clone(&root),
@@ -604,6 +611,20 @@ impl Context {
     /// Fire-and-forget dispatch; failures are logged.
     pub fn emit(&self, name: &str, payload: Value) {
         events::emit(self, name, payload);
+    }
+
+    /// Enqueues an event with async backpressure or explicit drop policy.
+    ///
+    /// Reliable synchronous [`emit`](Self::emit) remains non-blocking and
+    /// lossless. Use this async API when a bounded backpressure policy must
+    /// wait for queue capacity; drop policies report dropped listener work.
+    #[must_use]
+    pub async fn emit_with_policy(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> crate::event_queue::EmitOutcome {
+        events::emit_with_policy(self, name, payload).await
     }
 
     /// Sequential dispatch until the first bail value.

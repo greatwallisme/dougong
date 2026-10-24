@@ -176,9 +176,20 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - **机制**：`RootState::ordering`（新模块 `ordering.rs`，crate 私有，零公共 API）= 按 `(label, name)` 键控的串行段表。四处段落点全部同步无 await：provide/accessor 的 apply 臂 `{insert + commit_self + (Active ⇒ notify)}` 与撤回 disposer 同步前缀 `{remove + notify}`；consumer 的 **drain 等待留在段外**（Thm 63 等待不持键——卡死 consumer 不得堵死同组后续更新；无缝换绑路径保留）。键以 provide 落槽的 `primary_label` 同源计算 ⇒ key↔slot 精确对应；键表常驻形态与 reflect/events 的按名驻留同型。
 - **机制选型诚实说明**：段体无 await ⇒ keyed parking_lot mutex 即充分；真并发提交者的相对顺序本就由调度器定义，任务队列不改变该事实（承诺 = 同组**全序且连贯**：无撕裂、无丢失撤销事件、事件生成序 == 提交序，而非预定顺序）。coalescing 队列留作 P3 缝（语义不变可换）。
 - **不包段的面（附依据）**：加载成功批通知（fiber.rs:976）——槽位所有权 ⇒ 同键写者唯 owner fiber 自身，driver 已串行；registry 初始探针 / `Context::set` / 一切读路径——只读或本 fiber 轴。同 fiber 并发 `update()`（config）交错 = **范围外**（非依赖/事件刷新；S4 已钉入口边界；loader reconcile 串行调用；记录 findings §15 N2 备查）。
-- **锁序**：update-key → reflect/index/fibers/candidates/driver，反向路径不存在（读路径不取键；段内 emit 全 spawn 无内联执行 ⇒ 无 re-entry）⇒ 无环。
+- **锁序**：update-key → reflect/index/fibers/candidates/driver，反向路径不存在（读路径不取键；段内 emit 只入队、不在段内执行 listener ⇒ 无 re-entry）⇒ 无环。
 - **保证表**：G1 同组全序连贯（无半态/无丢失事件/生成序==提交序）；G2 同 fiber 收敛全序（既有 D4 机制，风暴测试钉死）；G3 并发负载重复运行终态逐字节相同（验收锚）；G4 异组互不阻塞（单测直证）；G5 五派发模式 / C5 无次序承诺 / C7 / S1–S5 语义零改动，always-on 无旋钮（确定性是机制不是策略）。事件**观察**序仍属 C5/C7 契约面（spawn 派发，执行序不承诺）——承诺止于生成序，载荷在段内读取（与提交态一致）。
 - 验证锚：`ordering.rs` 单测 3 例（同键零重叠 / 异键不互堵 / 同键锁复用）+ `tests/ordering.rs` 4 例（同槽替换风暴 30 轮逐轮精确终态（multi_thread 4 线程）/ 4 service × 3 consumer 替换风暴 10 轮不动点逐字节精确 / 同 fiber 双 service 并发替换 20 轮无一新一陈 / current_thread 生成序==观察序交替断言）；既有全套零改动通过 = always-on 机制零回归实证。
+
+### D22 事件派发 = 固定 worker + per-event ready lanes（P2）
+
+2026-10-24，improve 一.2 落地（勘察与基准见 `.planning/2026-10-23-v0-3-0-dylib-outbound-and-runtime-harden/findings.md` §18）：
+
+- **任务扩散治理**：emit/emit_internal 不再为每次发射/每个 listener 直接 `tokio::spawn`。listener invocation 进入按 event name 分 lane 的队列，由 construction-fixed worker pool（默认 4）执行；同一 lane 仅在 `active < max_concurrency` 时进入 ready-name FIFO，worker 每次取一个就绪 lane 的一个 job。热点事件达到 per-event cap 后不持 worker 等 semaphore，异事件名不被全局队头阻塞。
+- **有界与背压的诚实边界**：现有 `emit(&self, ...) -> ()` 是同步无返回 API，队列满时无法同时满足不阻塞、不丢弃、有界；`blocking_send` 可堵死 current_thread runtime，overflow spawn 又重建无界任务。故默认可靠同步 emit/emit_internal 走**无界可靠 lane**（语义与 C7 不变），有界背压由新增 `Context::emit_with_policy(...).await` 提供，`OverflowPolicy::Drop` 才允许满队丢弃。不得把隐式 drop 或阻塞 runtime 当作默认兼容。
+- **配置面**：`ContextOptions.events: EventQueueConfig { workers, queue_capacity, policies }`；`queue_capacity = None` 默认无界，`Some` 限定有界 lane 的**待执行 listener invocation 数**（不含正在执行者）；`EventPolicy { max_concurrency, overflow }` 按 event name 精确匹配，cap 默认仅受 worker 数限制，overflow 默认 Backpressure。`emit_with_policy` 在 Backpressure 下异步等空位，在 Drop 下立即返回 `Dropped`；返回 `Queued` 表示所有匹配 listener job 已接受，`Dropped` 表示至少一个被满队拒绝。
+- **S2/S3/S5 语义保持**：`CancelScope::run/run_tracked` 把既有准入计数、取消广播与 reap 泛化到 worker 上 scoped execute；plain listener 在 yield 点取消，bridge tracked-only 至完成，listener budget 与 S5 失败反应仍在原 `run_fire_and_forget`  seam。parallel/serial/bail/waterfall 不排队、不改传播；C5 不承诺观察次序，C7 由 root-owned worker 保发射方独立。
+- **生命周期与 panic**：queued job 只持 `Weak<RootState>` + scope/fiber 弱键，消费时升级重建 Context；RootState 释放时关闭队列并唤醒等待者，避免 root→queue→job→root 强环。listener panic 在 worker 的 poll 边界收容，lane active 计数仍释放，后续 job 与其他 listener 继续。
+- 验证锚：`tests/event_queue.rs` 7 例（固定 worker 上界 / 异事件不受 per-event cap 队头阻塞 / capacity=1 背压零丢失 / Drop 满队才丢 / panic 后 worker 续跑 / 出队前 dispose 跳过 listener / 多生产者风暴投递与 cap 精确）+ 既有全套（S1–S7、五模式、dylib/wasm 边界）回归。`tests/bench_events.rs` 同机两跑：改造前 wall 13/13ms、max_active 2952/3635；改造后 wall 11/11ms、max_active 4/4，16000 次投递均精确。
 
 ## 3. 剩余真实待决（产品判断，非工程回避）
 

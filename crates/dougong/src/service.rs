@@ -211,6 +211,7 @@ impl DependencyIndex {
 
     /// True when `uid` is registered as interested in `name` (invariant
     /// checks).
+    #[cfg(debug_assertions)]
     pub(crate) fn interest_has(&self, name: &str, uid: u64) -> bool {
         self.key_interest.read(name, |interest| {
             interest.is_some_and(|set| set.contains(&uid))
@@ -218,6 +219,7 @@ impl DependencyIndex {
     }
 
     /// True when any interest set still references `uid` (invariant checks).
+    #[cfg(debug_assertions)]
     pub(crate) fn any_interest_has(&self, uid: u64) -> bool {
         let mut found = false;
         self.key_interest.for_each_shard(|interest| {
@@ -296,6 +298,7 @@ impl DependencyIndex {
     }
 
     /// The consumer's provider set, cloned (invariant checks).
+    #[cfg(debug_assertions)]
     pub(crate) fn consumer_providers_of(&self, uid: u64) -> Option<HashSet<u64>> {
         self.consumer_providers
             .read(&uid, |entry: Option<&HashSet<u64>>| entry.cloned())
@@ -303,6 +306,7 @@ impl DependencyIndex {
 
     /// True when `provider`'s consumer set references `uid` (invariant
     /// checks).
+    #[cfg(debug_assertions)]
     pub(crate) fn provider_has_consumer(&self, provider: u64, uid: u64) -> bool {
         self.provider_consumers.read(&provider, |consumers| {
             consumers.is_some_and(|set| set.contains(&uid))
@@ -310,12 +314,14 @@ impl DependencyIndex {
     }
 
     /// True when `uid` exists as a provider key (invariant checks).
+    #[cfg(debug_assertions)]
     pub(crate) fn has_provider_entry(&self, uid: u64) -> bool {
         self.provider_consumers.read(&uid, |entry| entry.is_some())
     }
 
     /// True when any provider's consumer set references `uid` (invariant
     /// checks).
+    #[cfg(debug_assertions)]
     pub(crate) fn any_provider_references(&self, uid: u64) -> bool {
         let mut found = false;
         self.provider_consumers.for_each_shard(|consumers| {

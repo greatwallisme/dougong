@@ -113,7 +113,7 @@ struct Hook {
 
 /// One resolvable listener: plain, or a mode-aware bridge.
 #[derive(Clone)]
-struct DispatchEntry {
+pub struct DispatchEntry {
     callback: Listener,
     bridge: Option<DispatchListener>,
     /// The owning fiber's cancel-scope generation at snapshot time (S2).
@@ -160,6 +160,21 @@ impl DispatchEntry {
             scope.spawn_tracked(future)
         } else {
             scope.spawn(future)
+        }
+    }
+
+    /// Runs queued listener work on the current worker under the same scope
+    /// admission and cancellation rules as [`Self::spawn_scoped`].
+    pub(crate) async fn run_scoped<F, T>(self, future: F) -> Option<T>
+    where
+        F: Future<Output = T> + Send,
+        T: Send,
+    {
+        let scope = Arc::clone(self.scope.as_ref()?);
+        if self.bridge.is_some() {
+            scope.run_tracked(future).await
+        } else {
+            scope.run(future).await
         }
     }
 }
@@ -350,7 +365,7 @@ async fn invoke_bounded_inner(
 /// class's listener-failure reaction. One invocation reacts at most once: a
 /// bridge that first misses its budget reacts to the timeout; a later
 /// completion error of the same call is only logged.
-async fn run_fire_and_forget(
+pub async fn run_fire_and_forget(
     entry: DispatchEntry,
     name: String,
     ctx: Context,
@@ -395,29 +410,53 @@ async fn run_fire_and_forget(
     }
 }
 
-/// Fire-and-forget dispatch. Listener failures are logged, never propagated.
+/// Fire-and-forget dispatch through the root's bounded worker pool.
+///
+/// Reliable synchronous events use the lossless unbounded lane (C7); explicit
+/// drop policies use the bounded lane. Listener failures remain logged only.
 pub fn emit(ctx: &Context, name: &str, payload: Value) {
-    let ctx = ctx.clone();
-    let name = name.to_string();
-    // The dispatch task itself stays emitter-independent (C7): an emitter
-    // teardown never revokes in-flight delivery to *other* listeners. Each
-    // listener task belongs to its owning fiber's cancel scope instead (S2).
-    tokio::spawn(async move {
-        let budget = ctx.root.timeouts.listener;
-        let dispatch = begin_dispatch(&ctx, "emit", &name);
-        for entry in dispatch.entries {
-            let work = run_fire_and_forget(
-                entry.clone(),
-                name.clone(),
-                ctx.clone(),
-                payload.clone(),
-                budget,
-            );
-            // Detached on purpose: fire-and-forget. `None` means the
-            // listener's fiber vanished between snapshot and spawn — skipped.
-            let _ = entry.spawn_scoped(work);
+    let dispatch = begin_dispatch(ctx, "emit", name);
+    let mut entries = dispatch.entries.into_iter();
+    let Some(mut entry) = entries.next() else {
+        return;
+    };
+    for next in entries {
+        let _ = ctx
+            .root
+            .dispatcher
+            .enqueue_sync(ctx, name, entry, payload.clone());
+        entry = next;
+    }
+    let _ = ctx.root.dispatcher.enqueue_sync(ctx, name, entry, payload);
+}
+
+/// Policy-aware fire-and-forget dispatch with async backpressure.
+///
+/// Unlike synchronous [`emit`], backpressure policies wait for bounded queue
+/// capacity. Drop policies return [`EmitOutcome::Dropped`](crate::EmitOutcome)
+/// when any matched listener invocation cannot be queued.
+pub async fn emit_with_policy(
+    ctx: &Context,
+    name: &str,
+    payload: Value,
+) -> crate::event_queue::EmitOutcome {
+    let entries = if name.starts_with("internal/") {
+        ctx.root.events.lock().matching(name, None).entries
+    } else {
+        begin_dispatch(ctx, "emit", name).entries
+    };
+    let mut outcome = crate::event_queue::EmitOutcome::Queued;
+    for entry in entries {
+        let queued = ctx
+            .root
+            .dispatcher
+            .enqueue_async(ctx, name, entry, payload.clone())
+            .await;
+        if queued == crate::event_queue::EmitOutcome::Dropped {
+            outcome = crate::event_queue::EmitOutcome::Dropped;
         }
-    });
+    }
+    outcome
 }
 
 /// Concurrent dispatch; waits for every listener and aggregates failures.
@@ -652,17 +691,11 @@ pub fn emit_internal(
         let store = ctx.root.events.lock();
         store.matching(name, filter).entries
     };
-    let budget = ctx.root.timeouts.listener;
     for entry in entries {
-        let work = run_fire_and_forget(
-            entry.clone(),
-            name.to_string(),
-            ctx.clone(),
-            payload.clone(),
-            budget,
-        );
-        // Detached fire-and-forget, bound to the listener fiber's scope (S2).
-        let _ = entry.spawn_scoped(work);
+        let _ = ctx
+            .root
+            .dispatcher
+            .enqueue_sync(ctx, name, entry, payload.clone());
     }
 }
 

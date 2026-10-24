@@ -151,6 +151,7 @@ async fn log_level_follows_the_error_class() {
             },
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let ctx = install_logger(&ctx, &capture).await;
 
@@ -213,6 +214,7 @@ async fn listener_failure_can_restart_the_offender() {
             },
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let bodies = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&bodies);
@@ -245,6 +247,7 @@ async fn listener_failure_can_dispose_the_offender() {
             },
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let handle = ctx
         .plugin(
@@ -268,6 +271,7 @@ async fn parallel_still_aggregates_while_the_policy_reacts() {
             },
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let handle = ctx
         .plugin(
@@ -306,6 +310,7 @@ async fn serial_propagates_and_restarts_the_offender() {
             },
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let bodies = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&bodies);
@@ -359,6 +364,7 @@ async fn quarantine_disposes_a_provider_on_transport_failure() {
             provider_quarantine: ProviderQuarantine::DisposeOnTransportError,
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let provider = ctx
         .plugin(
@@ -386,6 +392,7 @@ async fn quarantine_ignores_logic_failures() {
             provider_quarantine: ProviderQuarantine::DisposeOnTransportError,
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let provider = ctx
         .plugin(
@@ -432,6 +439,7 @@ async fn the_root_fiber_is_never_a_reaction_target() {
             },
             ..ErrorPolicies::default()
         },
+        ..ContextOptions::default()
     });
     let ctx = install_logger(&ctx, &capture).await;
     // A listener registered directly on the (root-fiber) context: the uid-0

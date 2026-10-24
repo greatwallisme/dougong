@@ -51,6 +51,7 @@
 mod cancel;
 mod context;
 mod error;
+mod event_queue;
 mod events;
 mod fiber;
 mod invariant;
@@ -67,6 +68,8 @@ mod timeout;
 
 pub use context::{Context, ContextOptions};
 pub use error::{Error, ErrorClass, Result};
+#[doc(inline)]
+pub use event_queue::{EmitOutcome, EventPolicy, EventQueueConfig, OverflowPolicy};
 pub use events::{DispatchListener, DispatchMode, Listener, Next, is_bailed};
 pub use fiber::{
     Disposer, EPOCH_INACTIVE, EffectGuard, Fiber, FiberHandle, FiberState, ProviderSnapshot,

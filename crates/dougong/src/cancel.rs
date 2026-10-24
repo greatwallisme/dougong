@@ -103,6 +103,49 @@ impl CancelScope {
         }
     }
 
+    /// Executes abort-safe work on the current task under this scope.
+    ///
+    /// This is the queue-worker counterpart of [`Self::spawn`]: admission and
+    /// reap accounting are identical, and cancellation drops the future at its
+    /// next yield point without requiring a per-listener task.
+    pub async fn run<F, T>(self: &Arc<Self>, future: F) -> Option<T>
+    where
+        F: Future<Output = T> + Send,
+        T: Send,
+    {
+        if !self.enter() {
+            return None;
+        }
+        let guard = TaskGuard(Arc::clone(self));
+        let notified = guard.0.cancel_signal.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if guard.0.is_cancelled() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            () = &mut notified => None,
+            result = future => Some(result),
+        }
+    }
+
+    /// Executes tracked work on the current task without dropping it mid-call.
+    ///
+    /// Cancellation closes admission only; the reap still waits for the
+    /// foreign call to finish on the queue worker.
+    pub async fn run_tracked<F, T>(self: &Arc<Self>, future: F) -> Option<T>
+    where
+        F: Future<Output = T> + Send,
+        T: Send,
+    {
+        if !self.enter() {
+            return None;
+        }
+        let _guard = TaskGuard(Arc::clone(self));
+        Some(future.await)
+    }
+
     /// Spawns abort-safe work: once the scope is cancelled the future is
     /// dropped at its next yield point and the handle resolves to `None`.
     /// Returns `None` without spawning when the scope is already cancelled.
