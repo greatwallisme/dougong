@@ -72,7 +72,7 @@ mod timeout;
 #[doc(inline)]
 pub use budget::BudgetConfig;
 pub use context::{Context, ContextOptions};
-pub use error::{Error, ErrorClass, Result};
+pub use error::{Error, ErrorCategory, ErrorClass, Result};
 pub use event_queue::{EmitOutcome, EventPolicy, EventQueueConfig, OverflowPolicy};
 pub use events::{DispatchListener, DispatchMode, Listener, Next, is_bailed};
 pub use fiber::{
@@ -84,6 +84,9 @@ pub use invoke::{Invoke, Invoker};
 pub use logger::{LogLevel, LogRecord, Logger, LoggerHandle, StderrLogger};
 pub use metrics::{LatencySummary, MetricsConfig, MetricsSnapshot, RecentError};
 pub use plugin::{BoxFuture, Injection, Plugin, plugin};
-pub use policy::{ClassPolicy, ErrorPolicies, ListenerFailurePolicy, ProviderQuarantine};
+pub use policy::{
+    AlertPolicies, CategoryAlert, ClassPolicy, ErrorPolicies, ListenerFailurePolicy,
+    ProviderQuarantine,
+};
 pub use scope::{DEFAULT_LABEL, ScopeNode};
 pub use timeout::{ApplyPolicy, ApplyTimeout, DrainPolicy, DrainTimeout, TimeoutConfig};

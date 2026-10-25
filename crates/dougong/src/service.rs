@@ -634,6 +634,7 @@ async fn drain_consumers_measured(ctx: &Context, touched: Vec<Arc<Fiber>>) {
             &*ctx.logger(),
             &ctx.root.metrics,
             crate::ErrorClass::Timeout,
+            crate::error::ErrorCategory::Timeout,
             LogRecord::new(
                 LogLevel::Error,
                 "service",

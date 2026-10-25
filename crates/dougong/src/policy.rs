@@ -28,12 +28,55 @@
 
 use std::sync::{Arc, Weak};
 
+use std::time::Duration;
+
 use crate::context::{Context, RootState};
-use crate::error::{Error, ErrorClass, Result};
+use crate::error::{Error, ErrorCategory, ErrorClass, Result};
 use crate::fiber::Fiber;
 use crate::invoke::{Invoke, Invoker};
 use crate::logger::{LogLevel, LogRecord, Logger};
+use crate::metrics::Metrics;
 use crate::plugin::BoxFuture;
+
+/// Per-category alerting and noise knobs (O6, improve 三.6).
+///
+/// Every field defaults to pass-through: without `max_logged` nothing is
+/// rate limited, without `alert_at` nothing alerts, without `severity` the
+/// class-graded level stands.
+#[derive(Debug, Clone)]
+pub struct CategoryAlert {
+    /// The rolling window the counters live in.
+    pub window: Duration,
+    /// At most this many log lines per window; further errors of the
+    /// category are silent (the O5 ring still records them).
+    pub max_logged: Option<u32>,
+    /// When this many errors accumulate in one window, one `alert` record
+    /// fires (exactly once per window, at the crossing).
+    pub alert_at: Option<u32>,
+    /// Overrides the class-graded log level for this category.
+    pub severity: Option<LogLevel>,
+}
+
+/// The O6 alert table: per-category rules, matched by
+/// [`ErrorCategory`]. An empty table (the default) reproduces the pre-O6
+/// behavior — every error logs, nothing is rate limited or alerted.
+#[derive(Debug, Clone, Default)]
+pub struct AlertPolicies {
+    /// Rules keyed by category; at most one per category is honored (the
+    /// first match wins). Construction-fixed.
+    pub rules: Vec<(ErrorCategory, CategoryAlert)>,
+}
+
+impl AlertPolicies {
+    /// The rule of `category`, if any.
+    #[must_use]
+    pub fn for_category(&self, category: ErrorCategory) -> Option<&CategoryAlert> {
+        self.rules
+            .iter()
+            .find(|(cat, _)| *cat == category)
+            .map(|(_, alert)| alert)
+    }
+}
 
 /// What the runtime does with the fiber whose listener invocation failed.
 ///
@@ -101,6 +144,8 @@ pub struct ErrorPolicies {
     pub transport: ClassPolicy,
     /// Isolation reaction for transport-class failures of provided services.
     pub provider_quarantine: ProviderQuarantine,
+    /// Per-category alerting, severity overrides, and rate limits (O6).
+    pub alerts: AlertPolicies,
 }
 
 impl ErrorPolicies {
@@ -114,18 +159,27 @@ impl ErrorPolicies {
         }
     }
 
-    /// Stamps the class-graded level and the class onto `record`, then
-    /// writes it through the structured face (O1). Every kernel error log
-    /// line funnels here so grading stays single-sourced.
+    /// Stamps the class-graded level, the class, and the alerting group onto
+    /// `record`, then writes it through the structured face (O1). Every
+    /// kernel error log line funnels here so grading stays single-sourced.
+    /// With an O6 rule for the category, the line may be rate limited (the
+    /// O5 ring still captured it) and a window alert may follow it.
     pub(crate) fn emit(
         &self,
         logger: &dyn Logger,
-        metrics: &crate::metrics::Metrics,
+        metrics: &Metrics,
         class: ErrorClass,
+        category: ErrorCategory,
         mut record: LogRecord,
     ) {
         record.level = self.for_class(class).log_level;
+        if let Some(alert) = self.alerts.for_category(category)
+            && let Some(severity) = alert.severity
+        {
+            record.level = severity;
+        }
         record.class = Some(class);
+        record.category = Some(category);
         // O2 class counters: every graded error record tallies its class.
         let counter = match class {
             ErrorClass::Logic => &metrics.logic_errors,
@@ -135,7 +189,29 @@ impl ErrorPolicies {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // O5 recent-errors ring: every graded kernel error lands here.
         metrics.push_error(class, &record);
-        logger.log_record(&record);
+        let admit = self
+            .alerts
+            .for_category(category)
+            .map_or(crate::metrics::Admit::Log, |alert| {
+                metrics.admit_alert(category, alert)
+            });
+        if !matches!(admit, crate::metrics::Admit::Suppress) {
+            logger.log_record(&record);
+        }
+        if let crate::metrics::Admit::Alert(count) = admit {
+            logger.log_record(
+                &LogRecord::new(
+                    record.level,
+                    "policy",
+                    "alert",
+                    format!(
+                        "category {} crossed its alert threshold: {count} errors in window",
+                        category.as_str()
+                    ),
+                )
+                .with_category(Some(category)),
+            );
+        }
     }
 
     /// Logs `err` at the level the policy assigns to its class.
@@ -149,6 +225,7 @@ impl ErrorPolicies {
             logger,
             metrics,
             err.class,
+            ErrorCategory::of(err.class, err.code),
             LogRecord::new(
                 self.for_class(err.class).log_level,
                 "dougong",
@@ -232,6 +309,7 @@ impl Invoke for QuarantineInvoke {
                 &*fiber.ctx().logger(),
                 &root.metrics,
                 ErrorClass::Transport,
+                ErrorCategory::of(err.class, err.code),
                 LogRecord::new(
                     LogLevel::Error,
                     "policy",

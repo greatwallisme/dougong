@@ -19,8 +19,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
 
-use crate::error::ErrorClass;
+use crate::error::{ErrorCategory, ErrorClass};
 use crate::logger::LogRecord;
+use crate::policy::CategoryAlert;
 
 /// How many graded error records the recent-errors ring (O5) retains. Errors
 /// are a cold path (a few per anomaly at most), so a fixed 64 covers every
@@ -33,6 +34,8 @@ const RECENT_ERROR_CAP: usize = 64;
 pub struct RecentError {
     /// Error class stamped by the policy table.
     pub class: ErrorClass,
+    /// Alerting group (O6), stamped next to the class.
+    pub category: Option<ErrorCategory>,
     /// Fiber / plugin name, when the record has one.
     pub fiber: Option<String>,
     /// Fiber uid (`None` also covers dispose-complete sites).
@@ -137,6 +140,32 @@ pub struct Metrics {
     pub drain: LatencyStat,
     /// Recent-errors ring (O5), oldest first, capped at [`RECENT_ERROR_CAP`].
     recent: Mutex<VecDeque<RecentError>>,
+    /// Per-category alert/rate-limit windows (O6), touched only from the
+    /// emit funnel (a cold path); one slot per [`ErrorCategory::COUNT`].
+    alerts: Mutex<[AlertWindow; ErrorCategory::COUNT]>,
+}
+
+/// Rolling-window bookkeeping for one error category (O6): how many errors
+/// were seen, how many log lines were admitted, and whether the alert
+/// threshold already fired in the current window.
+#[derive(Debug, Default, Clone, Copy)]
+struct AlertWindow {
+    count: u32,
+    logged: u32,
+    window_started: Option<Instant>,
+    alerted: bool,
+}
+
+/// The emit funnel's per-error admission decision (O6).
+#[derive(Debug, Clone, Copy)]
+pub enum Admit {
+    /// Log the record normally.
+    Log,
+    /// The window's log budget is spent: skip the log line (the ring and
+    /// the counters already captured the error).
+    Suppress,
+    /// Log the record, then emit one window alert with this error count.
+    Alert(u32),
 }
 
 impl Metrics {
@@ -154,6 +183,7 @@ impl Metrics {
             cleanup: LatencyStat::default_stat(),
             drain: LatencyStat::default_stat(),
             recent: Mutex::new(VecDeque::new()),
+            alerts: Mutex::new(std::array::from_fn(|_| AlertWindow::default())),
         }
     }
 
@@ -177,6 +207,7 @@ impl Metrics {
     pub(crate) fn push_error(&self, class: ErrorClass, record: &LogRecord) {
         let entry = RecentError {
             class,
+            category: record.category,
             fiber: record.fiber.clone(),
             uid: record.uid,
             trace: record.trace,
@@ -194,6 +225,46 @@ impl Metrics {
     /// Ring snapshot, oldest first (O5).
     pub(crate) fn recent_errors(&self) -> Vec<RecentError> {
         self.recent.lock().iter().cloned().collect()
+    }
+
+    /// Admits one error of `category` under the category's alert policy
+    /// (O6): rolls the window when expired, counts the error, and decides
+    /// whether the log line runs, is suppressed, or crosses the alert
+    /// threshold. The alert fires exactly once per window, at the crossing.
+    pub(crate) fn admit_alert(&self, category: ErrorCategory, alert: &CategoryAlert) -> Admit {
+        let now = Instant::now();
+        {
+            let mut slots = self.alerts.lock();
+            let slot = &mut slots[category.index()];
+            let expired = slot
+                .window_started
+                .is_none_or(|started| now.duration_since(started) >= alert.window);
+            if expired {
+                *slot = AlertWindow::default();
+                slot.window_started = Some(now);
+            }
+            slot.count = slot.count.saturating_add(1);
+            let crossed = alert.alert_at.is_some_and(|at| slot.count == at);
+            let budget_spent = alert.max_logged.is_some_and(|max| slot.logged >= max);
+            let admit = if budget_spent {
+                if crossed && !slot.alerted {
+                    slot.alerted = true;
+                    Admit::Alert(slot.count)
+                } else {
+                    Admit::Suppress
+                }
+            } else {
+                slot.logged = slot.logged.saturating_add(1);
+                if crossed && !slot.alerted {
+                    slot.alerted = true;
+                    Admit::Alert(slot.count)
+                } else {
+                    Admit::Log
+                }
+            };
+            drop(slots);
+            admit
+        }
     }
 }
 

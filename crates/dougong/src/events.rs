@@ -417,6 +417,7 @@ pub async fn run_fire_and_forget(
             &*ctx.logger(),
             &ctx.root.metrics,
             err.class,
+            crate::error::ErrorCategory::of(err.class, err.code),
             LogRecord::new(
                 LogLevel::Error,
                 "events",

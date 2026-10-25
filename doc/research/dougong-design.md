@@ -363,6 +363,36 @@ failed 空 && stale 空，宿主可覆盖**（2026-10-25）。
   报 long_task 且完成清零）+ cancel 单测（年龄飞行中增长/完成清零）；
   health_demo 出 /healthz 体。四关 + 锚点逐字节 + 五 demo 全绿。
 
+### D29 错误八分组 = class+code 上的视图函数 + emit 漏斗限噪/告警（O6）
+
+improve 三.6 要八分组（configuration/dependency/provider-missing/boundary/
+timeout/panic/resource-exhaustion/lifecycle-violation）+ 每组严重级别、告警
+阈值、限噪 rate limit。**裁决：不建新分类法——分组是 class+code 上的纯函数
+视图 `ErrorCategory::of`（九值，Other 兜底 code="internal"）；策略面挂在
+ErrorPolicies.alerts（构造固定，空默认 = 逐字行为不变）；限噪只丢日志线，
+O5 环与交付计数不受影响**（2026-10-25）。
+
+- 映射：Timeout/Transport 类整归 Timeout/Boundary；Logic 按码——
+  configuration=undeclared_dependency/duplicate_provide/not_provider/
+  capability_denied；provider_missing=inactive_dependency；dependency=
+  aggregate；panic=plugin_panicked/listener_panicked；
+  resource_exhaustion=budget_exceeded；lifecycle_violation=fiber_disposed/
+  fiber_unloading/fiber_loading/plugin_cancelled/inactive_effect。
+- LogRecord/RecentError 加 category 字段（emit 盖章，与 class 并列；细粒度
+  身份仍是 Error::code）。
+- CategoryAlert{window, max_logged, alert_at, severity}：severity 覆盖类分级
+  （组精化类）；max_logged 超出丢原始日志线（环仍收）；alert_at 在窗口内
+  精确跨越时于原线后追加一条 event="alert" 汇总（每窗口一次，P7 单条防风暴
+  同哲学）。窗口状态 = Metrics 固定 [AlertWindow; 9] 单锁（emit 已持
+  &Metrics，冷路径）。
+- 调用点 ×10 全部显式传 category：有 err 用 of(err.class, err.code)，合成
+  记录按语义直给（cleanup_error 与 apply_timeout panic 臂 =Panic，超时族
+  =Timeout，budget_breach=ResourceExhaustion）。
+- 默认零规则 ⇒ 不限噪不告警 ⇒ 既有全部测试/锚点逐字不变。
+- 验证：tests/alerts.rs 4 用例（全码映射表、severity 覆盖 Panic→Warn、
+  max_logged=2 时 5 错只落 2 线且类计数照记、alert_at=3 每窗口恰好一条
+  alert 且原线不受限）。四关 + 锚点逐字节 + 六 demo 全绿。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

@@ -774,6 +774,7 @@ impl Fiber {
                     &*logger,
                     &ctx.root.metrics,
                     crate::ErrorClass::Logic,
+                    crate::error::ErrorCategory::Panic,
                     self.base_record(
                         "fiber",
                         "cleanup_error",
@@ -788,6 +789,7 @@ impl Fiber {
                     &*logger,
                     &ctx.root.metrics,
                     crate::ErrorClass::Timeout,
+                    crate::error::ErrorCategory::Timeout,
                     self.base_record(
                         "fiber",
                         "cleanup_timeout",
@@ -859,6 +861,7 @@ impl Fiber {
                 &*ctx.logger(),
                 &ctx.root.metrics,
                 crate::ErrorClass::Logic,
+                crate::error::ErrorCategory::ResourceExhaustion,
                 self.base_record(
                     "fiber",
                     "budget_breach",
@@ -1099,6 +1102,7 @@ impl Fiber {
                         &*ctx.logger(),
                         &ctx.root.metrics,
                         crate::ErrorClass::Timeout,
+                        crate::error::ErrorCategory::Timeout,
                         self.base_record(
                             "fiber",
                             "reap_blocked",
@@ -1298,6 +1302,7 @@ impl Fiber {
                         &*ctx.logger(),
                         &ctx.root.metrics,
                         crate::ErrorClass::Timeout,
+                        crate::error::ErrorCategory::Panic,
                         self.base_record(
                             "fiber",
                             "apply_timeout",
@@ -1334,6 +1339,7 @@ impl Fiber {
             &*ctx.logger(),
             &ctx.root.metrics,
             err.class,
+            crate::error::ErrorCategory::of(err.class, err.code),
             self.base_record("fiber", "fail_load", err.to_string()),
         );
         self.error.lock().replace(err);

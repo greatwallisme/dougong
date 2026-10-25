@@ -18,7 +18,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::error::{Error, ErrorClass};
+use crate::error::{Error, ErrorCategory, ErrorClass};
 use crate::events::DispatchMode;
 use crate::fiber::FiberState;
 
@@ -73,6 +73,9 @@ pub struct LogRecord {
     pub timestamp: SystemTime,
     /// Error class, stamped by `ErrorPolicies::emit`.
     pub class: Option<ErrorClass>,
+    /// Alerting group (O6), stamped by `ErrorPolicies::emit` next to the
+    /// class — the fine-grained identity stays in the message's error code.
+    pub category: Option<ErrorCategory>,
     /// Fiber / plugin name.
     pub fiber: Option<String>,
     /// Fiber uid; `None` also covers dispose-complete sites (uid cleared).
@@ -119,6 +122,7 @@ impl LogRecord {
             message,
             timestamp: SystemTime::now(),
             class: None,
+            category: None,
             fiber: None,
             uid: None,
             trace: None,
@@ -138,6 +142,13 @@ impl LogRecord {
     #[must_use]
     pub const fn with_class(mut self, class: ErrorClass) -> Self {
         self.class = Some(class);
+        self
+    }
+
+    /// Attaches the alerting group (O6).
+    #[must_use]
+    pub const fn with_category(mut self, category: Option<ErrorCategory>) -> Self {
+        self.category = category;
         self
     }
 
@@ -267,6 +278,9 @@ impl LogRecord {
         }
         if let Some(class) = self.class {
             push("class", class.as_str().to_string());
+        }
+        if let Some(category) = self.category {
+            push("category", category.as_str().to_string());
         }
         if let Some(cause) = &self.cause {
             push("cause", format!("{cause:?}"));

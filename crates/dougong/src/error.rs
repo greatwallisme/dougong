@@ -36,6 +36,84 @@ impl ErrorClass {
     }
 }
 
+/// The eight alerting groups of improve 三.6 plus the catch-all (O6, D29).
+///
+/// A grouping view for alerting and rate limiting derived from an error's
+/// class and code — not a new taxonomy: the [`Error::code`] stays the
+/// fine-grained identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorCategory {
+    /// Misconfiguration of declares, provides, or capabilities.
+    Configuration,
+    /// The dependency mechanism itself reported a compound failure.
+    Dependency,
+    /// A declared dependency has no active provider.
+    ProviderMissing,
+    /// Boundary mechanics failed (dylib FFI, wasm traps, load, codec).
+    Boundary,
+    /// A wait missed its budget.
+    Timeout,
+    /// A plugin body or listener panicked.
+    Panic,
+    /// A plugin budget was exceeded (P7).
+    ResourceExhaustion,
+    /// An action hit a lifecycle guard (disposed/loading/unloading) or ran
+    /// outside an active fiber.
+    LifecycleViolation,
+    /// Business and generic errors (code `"internal"` and any unmapped
+    /// code).
+    Other,
+}
+
+impl ErrorCategory {
+    /// How many categories exist; the alert window table is this long.
+    pub const COUNT: usize = 9;
+
+    /// Slot index of this category in fixed per-category tables.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Derives the category from the error's class and code.
+    #[must_use]
+    pub fn of(class: ErrorClass, code: &str) -> Self {
+        match class {
+            ErrorClass::Timeout => Self::Timeout,
+            ErrorClass::Transport => Self::Boundary,
+            ErrorClass::Logic => match code {
+                "undeclared_dependency"
+                | "duplicate_provide"
+                | "not_provider"
+                | "capability_denied" => Self::Configuration,
+                "inactive_dependency" => Self::ProviderMissing,
+                "aggregate" => Self::Dependency,
+                "plugin_panicked" | "listener_panicked" => Self::Panic,
+                "budget_exceeded" => Self::ResourceExhaustion,
+                "fiber_disposed" | "fiber_unloading" | "fiber_loading" | "plugin_cancelled"
+                | "inactive_effect" => Self::LifecycleViolation,
+                _ => Self::Other,
+            },
+        }
+    }
+
+    /// The stable lowercase name used in structured output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::Dependency => "dependency",
+            Self::ProviderMissing => "provider_missing",
+            Self::Boundary => "boundary",
+            Self::Timeout => "timeout",
+            Self::Panic => "panic",
+            Self::ResourceExhaustion => "resource_exhaustion",
+            Self::LifecycleViolation => "lifecycle_violation",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Kernel error with a stable machine-readable code.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{code}: {message}")]
