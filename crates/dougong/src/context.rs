@@ -10,7 +10,7 @@
 
 use parking_lot::Mutex;
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -30,7 +30,7 @@ use crate::shard::ShardMap;
 ///
 /// The hot structures (`reflect`, `index`, `fibers`) are striped internally
 /// (P1, `shard.rs`); the plugin registry and event store keep a single lock
-/// (cold path / P6 scope), and the active set is an O(1)-per-flip mirror.
+/// (cold path), and the active set is the P4 lock-free bitmap mirror.
 ///
 /// Lock-order rule: no root-state structure lock (stripe or single) is ever
 /// held while acquiring another structure's lock or a fiber-internal lock —
@@ -49,7 +49,7 @@ pub struct RootState {
     /// Reverse indexes (design decision D12).
     pub(crate) index: DependencyIndex,
     /// Lock-free-friendly mirror of which fiber uids are `Active`.
-    pub(crate) active: Mutex<HashSet<u64>>,
+    pub(crate) active: crate::shard::ActiveSet,
     /// Timeout budgets for the critical async paths (S3); fixed at
     /// construction so every reader sees one consistent policy set.
     pub(crate) timeouts: crate::timeout::TimeoutConfig,
@@ -87,15 +87,15 @@ impl RootState {
         if uid == 0 {
             return true;
         }
-        self.active.lock().contains(&uid)
+        self.active.contains(uid)
     }
 
     pub(crate) fn mark_active(&self, uid: u64) {
-        self.active.lock().insert(uid);
+        self.active.mark(uid);
     }
 
     pub(crate) fn mark_inactive(&self, uid: u64) {
-        self.active.lock().remove(&uid);
+        self.active.unmark(uid);
     }
 
     pub(crate) fn register_fiber(&self, fiber: &Arc<Fiber>) {
@@ -113,7 +113,7 @@ impl RootState {
         });
         // The disposed fiber cannot refresh its own mirror any more (its uid
         // is cleared first), so drop the active-set entry here.
-        self.active.lock().remove(&uid);
+        self.active.unmark(uid);
         self.index.remove_fiber(uid, inject_names);
     }
 
@@ -207,7 +207,7 @@ impl Context {
             counter: AtomicU64::new(0),
             label_seed: AtomicU64::new(1),
             index: DependencyIndex::default(),
-            active: Mutex::new(HashSet::new()),
+            active: crate::shard::ActiveSet::new(),
             timeouts: options.timeouts,
             policies: options.policies,
             ordering: crate::ordering::UpdateSerializers::default(),

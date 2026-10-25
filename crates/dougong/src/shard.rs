@@ -16,8 +16,10 @@
 use parking_lot::Mutex;
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Stripes per sharded structure. Sixteen spreads the hot maps across
 /// typical worker counts (4–16 threads) while a full scan (invariant deep
@@ -111,10 +113,100 @@ impl<K: Hash + Eq, V> std::fmt::Debug for ShardMap<K, V> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Active-fiber membership mirror (performance track P4, improve 一.4)
+// ---------------------------------------------------------------------------
+
+/// Bitmap words: 4096 × 64 = 262,144 dense uids resolved lock-free; the
+/// 32 KiB boxed array is a one-time fixed allocation per root state (same
+/// fixed-count philosophy as [`SHARD_COUNT`]).
+const ACTIVE_WORDS: usize = 4096;
+/// Bits per bitmap word: an `AtomicU64` is 64 bits wide by definition.
+const WORD_BITS: u64 = 64;
+/// uid bound covered by the bitmap; uids at or beyond it use the tail set.
+const ACTIVE_BITS: u64 = ACTIVE_WORDS as u64 * WORD_BITS;
+
+/// Lock-free membership mirror of the active-fiber set (P4).
+///
+/// Fiber uids are dense, monotonic, and never reused (S3), so membership
+/// maps onto a fixed bitmap indexed directly by uid; uids at or beyond the
+/// bitmap capacity fall back to a mutex-guarded tail set (cold by
+/// construction: reachable only after 262,144 fibers).
+///
+/// Ordering contract: the set is a *mirror* — authoritative liveness lives
+/// in each fiber's own state. Strict resolution carries its happens-before
+/// through the reflect store's stripe locks (the provider's insert releases
+/// the stripe, the reader acquires it), so flips only need per-operation
+/// atomicity: `AcqRel` read-modify-writes and `Acquire` reads, never
+/// `SeqCst`. A transient stale read (the provider's `mark_active` landing
+/// after its store insert) exists identically in the pre-P4 mutex version
+/// and self-heals through the post-load republish-before-notify order plus
+/// `check_impl` re-resolution.
+pub struct ActiveSet {
+    words: Box<[AtomicU64]>,
+    tail: Mutex<HashSet<u64>>,
+}
+
+impl ActiveSet {
+    pub fn new() -> Self {
+        Self {
+            words: (0..ACTIVE_WORDS).map(|_| AtomicU64::new(0)).collect(),
+            tail: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Marks `uid` active (idempotent).
+    pub fn mark(&self, uid: u64) {
+        if uid < ACTIVE_BITS {
+            let (word, bit) = Self::locate(uid);
+            self.words[word].fetch_or(bit, Ordering::AcqRel);
+        } else {
+            self.tail.lock().insert(uid);
+        }
+    }
+
+    /// Marks `uid` inactive (idempotent; a no-op for unknown uids).
+    pub fn unmark(&self, uid: u64) {
+        if uid < ACTIVE_BITS {
+            let (word, bit) = Self::locate(uid);
+            self.words[word].fetch_and(!bit, Ordering::AcqRel);
+        } else {
+            self.tail.lock().remove(&uid);
+        }
+    }
+
+    /// True when `uid` is currently marked active.
+    #[must_use]
+    pub fn contains(&self, uid: u64) -> bool {
+        if uid < ACTIVE_BITS {
+            let (word, bit) = Self::locate(uid);
+            self.words[word].load(Ordering::Acquire) & bit != 0
+        } else {
+            self.tail.lock().contains(&uid)
+        }
+    }
+
+    /// Splits `uid` into its bitmap word index and bit. Callers pass
+    /// `uid < ACTIVE_BITS`, so the word index is below `ACTIVE_WORDS` and
+    /// always fits `usize`.
+    fn locate(uid: u64) -> (usize, u64) {
+        let word = usize::try_from(uid >> 6).unwrap_or_else(|_| {
+            unreachable!("word index out of bitmap range") // cannot happen: callers pass uid < ACTIVE_BITS (word index < ACTIVE_WORDS)
+        });
+        (word, 1_u64 << (uid % WORD_BITS))
+    }
+}
+
+impl Default for ActiveSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn disjoint_keys_land_independent_stripes() {
@@ -178,5 +270,43 @@ mod tests {
             map.read("missing", |entry: Option<&u64>| entry.copied()),
             None
         );
+    }
+
+    #[test]
+    fn active_set_roundtrip_and_neighbor_bits() {
+        let set = ActiveSet::new();
+        assert!(!set.contains(5));
+        set.mark(5);
+        set.mark(5);
+        assert!(set.contains(5), "mark is idempotent");
+        set.mark(6);
+        set.unmark(5);
+        assert!(!set.contains(5));
+        assert!(
+            set.contains(6),
+            "unmarking one uid must not clear its neighbor"
+        );
+        set.unmark(6);
+        assert!(!set.contains(6));
+        set.unmark(6);
+        assert!(!set.contains(6), "unmark is idempotent");
+    }
+
+    #[test]
+    fn active_set_bitmap_boundary_and_overflow_tail() {
+        let set = ActiveSet::new();
+        let last_bitmap = ACTIVE_BITS - 1;
+        set.mark(last_bitmap);
+        assert!(set.contains(last_bitmap), "last bitmap uid stays in words");
+        assert!(!set.contains(ACTIVE_BITS), "first tail uid starts empty");
+        set.mark(ACTIVE_BITS);
+        set.mark(ACTIVE_BITS + 42);
+        assert!(set.contains(ACTIVE_BITS));
+        assert!(set.contains(ACTIVE_BITS + 42));
+        set.unmark(ACTIVE_BITS);
+        assert!(!set.contains(ACTIVE_BITS));
+        assert!(set.contains(ACTIVE_BITS + 42), "tail removals are per-uid");
+        set.unmark(last_bitmap);
+        assert!(!set.contains(last_bitmap));
     }
 }

@@ -424,8 +424,7 @@ fn post_dispose_deep(fiber: &Fiber, old_uid: u64) {
     }
     let violation = root
         .active
-        .lock()
-        .contains(&old_uid)
+        .contains(old_uid)
         .then(|| format!("active set still holds {old_uid}"));
     if let Some(what) = violation {
         breach(fiber, "post_dispose", &what);
