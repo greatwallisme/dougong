@@ -1378,9 +1378,14 @@ pub fn from_exports(exports: Exports) -> Result<DynPlugin> {
     })
 }
 
-/// Test-support constructor wrapping a static export table.
-#[cfg(test)]
-pub(crate) fn from_static(table: &'static PluginExports) -> Result<DynPlugin> {
+/// Adapts a statically-resolved export table: tests, demos, and hosts that
+/// embed their tables in the binary. Runs the same ABI-gate and descriptor
+/// checks as [`load`].
+///
+/// # Errors
+///
+/// Fails when the ABI version mismatches or the descriptor is malformed.
+pub fn from_static(table: &'static PluginExports) -> Result<DynPlugin> {
     from_exports(Exports { table, _lib: None })
 }
 

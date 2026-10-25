@@ -9,14 +9,22 @@
 //! - reentrancy: requiring a service that calls back into greeter on the
 //!   same thread fails with `STATUS_REENTRANCY` instead of deadlocking the
 //!   per-instance lock.
+//! - cross-instance: two dylib-form instances whose gated handlers require
+//!   through an in-process relay close a wait cycle across threads; the
+//!   arming that completes the cycle fails with `STATUS_REENTRANCY` while
+//!   the other leg unwinds (D-V3-3, 2026-10-25 amendment).
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use dougong::{Context, Error, Invoke, Invoker, LogLevel, plugin};
-use dougong_abi::{STATUS_REENTRANCY, STATUS_UNDECLARED};
-use dougong_dylib::load;
+use dougong_abi::{
+    HostExports, PluginExports, STATUS_CAPACITY, STATUS_OK, STATUS_REENTRANCY, STATUS_UNDECLARED,
+    write_out,
+};
+use dougong_dylib::{from_static, load};
 use greeter_plugin::{GREETER_HELLO, GREETER_REQUIRE, GREETER_WORKER_REPLY};
 use serde_json::Value;
 
@@ -78,11 +86,324 @@ fn detail_code(payload: &[u8]) -> dougong::Result<String> {
         .ok_or_else(|| Error::msg("detail document lacks a \"code\" field"))
 }
 
+// ---------------------------------------------------------------------------
+// Cross-instance arm fixtures: two statically-resolved dylib-form instances
+// (`from_static` runs the same ABI gate and descriptor checks as `load`)
+// whose gated call handlers require through the relay service below.
+// ---------------------------------------------------------------------------
+
+/// Gate shared with a ring handler: the handler parks inside its gated
+/// export until the demo opens the gate (after both instance locks are
+/// held).
+struct RingCtl {
+    proceed: (Mutex<bool>, Condvar),
+}
+
+impl RingCtl {
+    const fn new() -> Self {
+        Self {
+            proceed: (Mutex::new(false), Condvar::new()),
+        }
+    }
+
+    fn wait(&self) {
+        let (lock, gate) = &self.proceed;
+        drop(
+            gate.wait_while(lock.lock().expect("gate lock"), |open| !*open)
+                .expect("gate wait"),
+        );
+    }
+
+    fn open(&self) {
+        *self.proceed.0.lock().expect("gate lock") = true;
+        self.proceed.1.notify_all();
+    }
+}
+
+/// `Send` wrapper for a copied vtable: the ABI contract lets `require` run
+/// from any plugin thread, concurrently (A5).
+struct SendVtable(HostExports);
+// SAFETY: the vtable contract states the host entries are callable from any
+// thread concurrently; the host implementations contain their panics.
+unsafe impl Send for SendVtable {}
+
+static RING1_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: ring1_name,
+    descriptor: ring1_descriptor,
+    setup: ring1_setup,
+    call: ring1_call,
+    on_event: ring_on_event,
+    on_next: ring_on_next,
+    teardown: ring_teardown,
+};
+
+static RING2_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: ring2_name,
+    descriptor: ring2_descriptor,
+    setup: ring2_setup,
+    call: ring2_call,
+    on_event: ring_on_event,
+    on_next: ring_on_next,
+    teardown: ring_teardown,
+};
+
+static RING1_HOST: Mutex<Option<SendVtable>> = Mutex::new(None);
+static RING2_HOST: Mutex<Option<SendVtable>> = Mutex::new(None);
+static RING1_CTL: Mutex<Option<Arc<RingCtl>>> = Mutex::new(None);
+static RING2_CTL: Mutex<Option<Arc<RingCtl>>> = Mutex::new(None);
+static RING1_ENTERED: AtomicBool = AtomicBool::new(false);
+static RING2_ENTERED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn ring1_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: caller-owned buffer contract.
+    if unsafe { write_out(b"ring1", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring1_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: caller-owned buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"ring1","provide":["svc-ring1"],"inject":["svc-bridge"]}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring2_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: caller-owned buffer contract.
+    if unsafe { write_out(b"ring2", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring2_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: caller-owned buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"ring2","provide":["svc-ring2"],"inject":["svc-bridge"]}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring1_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+    // SAFETY: valid for the duration of `setup`; copied by value (v3).
+    *RING1_HOST.lock().expect("ring1 vtable slot") = Some(SendVtable(unsafe { *host }));
+    Box::into_raw(Box::new(0u8)).cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn ring2_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+    // SAFETY: as `ring1_setup`.
+    *RING2_HOST.lock().expect("ring2 vtable slot") = Some(SendVtable(unsafe { *host }));
+    Box::into_raw(Box::new(0u8)).cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn ring_teardown(handle: *mut std::ffi::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: allocated by the ring setup for this activation; teardown
+    // runs exactly once per successful setup.
+    drop(unsafe { Box::from_raw(handle.cast::<u8>()) });
+}
+
+/// Gated ring handler: announce entry, park until the gate opens, then
+/// require through the relay and frame the require outcome back.
+unsafe extern "C" fn ring1_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _data: *const u8,
+    _len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    let host = RING1_HOST
+        .lock()
+        .expect("ring1 vtable slot")
+        .as_ref()
+        .expect("ring1 vtable copied at setup")
+        .0;
+    let ctl = Arc::clone(
+        RING1_CTL
+            .lock()
+            .expect("ring1 gate slot")
+            .as_ref()
+            .expect("ring1 gate armed"),
+    );
+    RING1_ENTERED.store(true, Ordering::SeqCst);
+    ctl.wait();
+    let (status, reply) = plugin_require(&host, b"svc-bridge", 0, b"ring1");
+    pack_framed(status, &reply, out, cap, out_len)
+}
+
+unsafe extern "C" fn ring2_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _data: *const u8,
+    _len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    let host = RING2_HOST
+        .lock()
+        .expect("ring2 vtable slot")
+        .as_ref()
+        .expect("ring2 vtable copied at setup")
+        .0;
+    let ctl = Arc::clone(
+        RING2_CTL
+            .lock()
+            .expect("ring2 gate slot")
+            .as_ref()
+            .expect("ring2 gate armed"),
+    );
+    RING2_ENTERED.store(true, Ordering::SeqCst);
+    ctl.wait();
+    let (status, reply) = plugin_require(&host, b"svc-bridge", 1, b"ring2");
+    pack_framed(status, &reply, out, cap, out_len)
+}
+
+const unsafe extern "C" fn ring_on_event(
+    _handle: *mut std::ffi::c_void,
+    _event: u32,
+    _mode: u32,
+    _data: *const u8,
+    _len: usize,
+    _next_available: u32,
+    _out: *mut u8,
+    _cap: usize,
+    _out_len: *mut usize,
+) -> i32 {
+    STATUS_OK
+}
+
+const unsafe extern "C" fn ring_on_next(
+    _handle: *mut std::ffi::c_void,
+    _event: u32,
+    _chain_status: i32,
+    _data: *const u8,
+    _len: usize,
+    _out: *mut u8,
+    _cap: usize,
+    _out_len: *mut usize,
+) -> i32 {
+    STATUS_OK
+}
+
+/// Plugin-side growable `require`: retries with a doubled buffer whenever
+/// the host asks for more room (the caller-owned buffer protocol).
+fn plugin_require(
+    host: &HostExports,
+    service: &[u8],
+    method: u32,
+    payload: &[u8],
+) -> (i32, Vec<u8>) {
+    let mut cap = 4096;
+    loop {
+        let mut buf = vec![0u8; cap];
+        let mut len = 0usize;
+        // SAFETY: the vtable is live until this activation's teardown
+        // returns (the demo holds both instances until after the
+        // assertions); buffers are caller-owned.
+        let status = unsafe {
+            (host.require)(
+                host.host_handle,
+                service.as_ptr(),
+                service.len(),
+                method,
+                payload.as_ptr(),
+                payload.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
+            )
+        };
+        if status != STATUS_CAPACITY {
+            buf.truncate(len);
+            return (status, buf);
+        }
+        cap *= 2;
+    }
+}
+
+/// Packs `i32 little-endian status || payload` into the caller-owned out
+/// buffer (the framing the ring handlers document for their replies).
+fn pack_framed(status: i32, payload: &[u8], out: *mut u8, cap: usize, out_len: *mut usize) -> i32 {
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&status.to_le_bytes());
+    framed.extend_from_slice(payload);
+    // SAFETY: caller-owned buffer contract.
+    if unsafe { write_out(&framed, out, cap, out_len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+/// In-process relay: method 0 requires `svc-ring2`, method 1 requires
+/// `svc-ring1` — the shared leg both ring handlers route through.
+struct BridgeSvc {
+    ctx: Context,
+}
+
+impl Invoke for BridgeSvc {
+    fn call(&self, method: u32, payload: Vec<u8>) -> dougong::BoxFuture<dougong::Result<Vec<u8>>> {
+        let target = if method == 0 {
+            "svc-ring2"
+        } else {
+            "svc-ring1"
+        };
+        let Some(invoker) = self.ctx.get::<Invoker>(target) else {
+            return Box::pin(async move { Err(Error::msg(format!("{target} is not committed"))) });
+        };
+        invoker.call(0, payload)
+    }
+}
+
+/// Polls `check` until it holds (bounded: a demo arm that never settles
+/// must fail, not hang).
+async fn wait_for(check: impl Fn() -> bool) -> dougong::Result<()> {
+    for _ in 0..500 {
+        if check() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(Error::msg("arm did not settle within the poll budget"))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = plugin_path();
     let greeter: Arc<dyn dougong::Plugin> = load(&path)?;
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    // Multi-threaded on purpose: the cross-instance arm parks foreign
+    // calls inside gates that this body opens afterwards, so the runtime
+    // needs workers beside the one blocked in a synchronous export (the
+    // vtable contract's blocking model).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()?;
 
@@ -173,10 +494,117 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(detail_code(detail)?, "reentrancy_cycle");
         log("-- reentrancy arm: cycle rejected deterministically --".to_string());
 
+        cross_instance_arm(&ctx, &log).await?;
+
         greeter_fiber.dispose().await;
         ctx.stop().await;
         log("-- outbound demo done --".to_string());
         Ok::<(), Error>(())
     })?;
+    Ok(())
+}
+
+/// The cross-instance arm: two gated dylib-form instances whose handlers
+/// require through the relay, closing a wait cycle across threads. Asserts
+/// the deterministic outcomes (exactly one reentrancy status; the other
+/// leg unwinds through the relay with the nested detail inside) and logs
+/// the arm result.
+async fn cross_instance_arm(
+    ctx: &Context,
+    log: &(dyn Fn(String) + Send + Sync),
+) -> dougong::Result<()> {
+    // Cross-instance arm: both ring handlers park inside their gated
+    // exports holding their instance locks; opening the gates builds
+    // the wait cycle ring1 -> ring2 -> ring1. The arming that completes
+    // the cycle must fail with STATUS_REENTRANCY on that thread while
+    // the other leg unwinds through the relay — never a deadlock.
+    let bridge = plugin("bridge", vec![], |ctx, _config| {
+        Box::pin(async move {
+            let svc = BridgeSvc { ctx: ctx.clone() };
+            ctx.provide("svc-bridge", Invoker::new(Arc::new(svc)))
+                .await?;
+            Ok(())
+        })
+    });
+    ctx.plugin(bridge, None)?.join().await?;
+    *RING1_CTL.lock().expect("ring1 gate slot") = Some(Arc::new(RingCtl::new()));
+    let ring1: Arc<dyn dougong::Plugin> = Arc::new(from_static(&RING1_TABLE)?);
+    ctx.plugin(ring1, None)?.join().await?;
+    *RING2_CTL.lock().expect("ring2 gate slot") = Some(Arc::new(RingCtl::new()));
+    let ring2: Arc<dyn dougong::Plugin> = Arc::new(from_static(&RING2_TABLE)?);
+    ctx.plugin(ring2, None)?.join().await?;
+
+    let leg1 = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            let invoker = ctx
+                .get::<Invoker>("svc-ring1")
+                .ok_or_else(|| Error::msg("svc-ring1 is not committed"))?;
+            let reply = invoker.call(0, b"ping".to_vec()).await?;
+            unpack_framed(&reply).map(|(status, payload)| (status, payload.to_vec()))
+        }
+    });
+    let leg2 = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            let invoker = ctx
+                .get::<Invoker>("svc-ring2")
+                .ok_or_else(|| Error::msg("svc-ring2 is not committed"))?;
+            let reply = invoker.call(0, b"ping".to_vec()).await?;
+            unpack_framed(&reply).map(|(status, payload)| (status, payload.to_vec()))
+        }
+    });
+    wait_for(|| RING1_ENTERED.load(Ordering::SeqCst)).await?;
+    wait_for(|| RING2_ENTERED.load(Ordering::SeqCst)).await?;
+    RING1_CTL
+        .lock()
+        .expect("ring1 gate slot")
+        .as_ref()
+        .expect("ring1 gate armed")
+        .open();
+    RING2_CTL
+        .lock()
+        .expect("ring2 gate slot")
+        .as_ref()
+        .expect("ring2 gate armed")
+        .open();
+
+    let reply1 = tokio::time::timeout(Duration::from_secs(5), leg1)
+        .await
+        // timeout: the deadlock guard
+        .map_err(|err| Error::msg(format!("ring1 leg deadlocked: {err}")))?
+        // join: a panicked task must fail the arm, not pass silently
+        .map_err(|err| Error::msg(format!("ring1 leg panicked: {err}")))?
+        .map_err(|err| Error::msg(format!("ring1 leg failed: {err}")))?;
+    let (status1, payload1) = reply1;
+    let reply2 = tokio::time::timeout(Duration::from_secs(5), leg2)
+        .await
+        // timeout: the deadlock guard
+        .map_err(|err| Error::msg(format!("ring2 leg deadlocked: {err}")))?
+        // join: a panicked task must fail the arm, not pass silently
+        .map_err(|err| Error::msg(format!("ring2 leg panicked: {err}")))?
+        .map_err(|err| Error::msg(format!("ring2 leg failed: {err}")))?;
+    let (status2, payload2) = reply2;
+    // Exactly one arming completes the cycle: that leg gets the direct
+    // reentrancy status. The loser's parked leg unwinds through the
+    // relay, which carries the inner framing as opaque bytes — its
+    // top-level status stays OK with the nested detail inside.
+    let mut statuses = [status1, status2];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [STATUS_REENTRANCY, STATUS_OK]);
+    for (status, payload) in [(&status1, &payload1), (&status2, &payload2)] {
+        let detail: Value = if *status == STATUS_REENTRANCY {
+            serde_json::from_slice(payload)
+                .map_err(|err| Error::msg(format!("framed detail is not JSON: {err}")))?
+        } else {
+            serde_json::from_slice(&payload[4..])
+                .map_err(|err| Error::msg(format!("nested detail is not JSON: {err}")))?
+        };
+        assert_eq!(
+            detail.get("code").and_then(Value::as_str),
+            Some("reentrancy_cycle")
+        );
+    }
+    log("-- cross-instance arm: wait cycle closed deterministically --".to_string());
     Ok(())
 }
