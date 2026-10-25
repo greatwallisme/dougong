@@ -249,6 +249,28 @@ improve 三.1 要"结构化日志，不要只用 println"。两条路线：引�
   budget_breach event_name/listener_failure mode）；bench_notify 锚点逐字节不变
   （b3 status_events=762、service_events 245/183/244——转移只落日志不发事件）。
 
+### D25 运行时 metrics = 快照面 + 双成本模型（O2）
+
+improve 三.2 要 14 项运行时指标与分桶统计。**裁决：库内快照式采集，不引
+prometheus/otel 依赖**（2026-10-25）；导出是宿主接线（Phase 0 OBS 裁决形态）。
+
+- 双成本模型：计数器常开（Relaxed 原子，全部落在冷路径——转移/notify/边接线/
+  重试决策/错误分级点，一次 relaxed add 是噪声）；延迟仪器化选项门控
+  （`MetricsConfig.latencies` construction-fixed，默认关），因为 `Instant::now()`
+  在每次 strict resolve 都跑的路径上不可忽略——门关时计时点只做一次 bool 读。
+- 计数器语义：`dependency_rebuild_count` 数的是边接线事件（commit_edges 非空 +
+  uncommit），不是 provide 次数——无消费者的 provide 不接线不计数；
+  `apply_retry_count` 在 S3 重试决策点；重试中间态不构造 Error（只有 park 的
+  fail_load 有），所以 timeout 类错误计数 = 1 而重试计数 = 2，两计数器互补。
+- 延迟分桶：固定 log2 八桶（<1us..<1s + 兜底），每项 count/total/max——够答
+  "慢路径在哪"，不存逐样本。dispatch 延迟挂在 P2 worker 执行处（Queue 本地），
+  其余四项挂 RootState.metrics。
+- 快照：`Context::metrics()` 一次 registry 遍历出全部生命周期态分布 + provider_count
+  （store 跨条带、一次一锁）+ queue_depth/dropped（Queue::stats）+ 全部计数器。
+  快照不是跨并发转移的一致切面（文档写明）。
+- 验证：tests/metrics.rs 8 用例（态分布/常开计数器/门控零记录 vs 记录/桶不变量/
+  重试与类计数/容量拒弃）。bench_notify 锚点逐字节不变。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

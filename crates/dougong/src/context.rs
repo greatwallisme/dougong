@@ -61,6 +61,8 @@ pub struct RootState {
     pub(crate) ordering: crate::ordering::UpdateSerializers,
     /// Bounded fire-and-forget listener scheduling (P2, D22).
     pub(crate) dispatcher: crate::event_queue::EventDispatcher,
+    /// Runtime metrics (O2); counters always on, latency opt-in.
+    pub(crate) metrics: crate::metrics::Metrics,
 }
 
 impl std::fmt::Debug for RootState {
@@ -171,6 +173,8 @@ pub struct ContextOptions {
     pub policies: crate::policy::ErrorPolicies,
     /// Event queue capacity, overflow, and concurrency policies.
     pub events: crate::event_queue::EventQueueConfig,
+    /// Runtime metrics switches (O2); latency instrumentation is opt-in.
+    pub metrics: crate::metrics::MetricsConfig,
 }
 
 impl Context {
@@ -196,6 +200,7 @@ impl Context {
             budgets: crate::budget::BudgetConfig::default(),
             policies: crate::policy::ErrorPolicies::default(),
             events: crate::event_queue::EventQueueConfig::default(),
+            metrics: crate::metrics::MetricsConfig::default(),
         })
     }
 
@@ -217,7 +222,11 @@ impl Context {
             budgets: options.budgets,
             policies: options.policies,
             ordering: crate::ordering::UpdateSerializers::default(),
-            dispatcher: crate::event_queue::EventDispatcher::new(options.events),
+            metrics: crate::metrics::Metrics::new(options.metrics.latencies),
+            dispatcher: crate::event_queue::EventDispatcher::new(
+                options.events,
+                options.metrics.latencies,
+            ),
         });
         let handle = Self {
             root: Arc::clone(&root),
@@ -340,6 +349,58 @@ impl Context {
         None
     }
 
+    /// Takes a point-in-time metrics snapshot (O2).
+    ///
+    /// Latency summaries carry `count == 0` unless
+    /// [`MetricsConfig::latencies`](crate::MetricsConfig::latencies) was
+    /// enabled at construction. The fiber distribution walks the registry
+    /// under its lock; it is a snapshot, not a consistent cut across
+    /// concurrent transitions. Exporters (Prometheus/OpenTelemetry) are host
+    /// wiring over this face.
+    #[must_use]
+    pub fn metrics(&self) -> crate::metrics::MetricsSnapshot {
+        let root = &self.root;
+        let mut snapshot = crate::metrics::MetricsSnapshot::default();
+        {
+            let registry = root.registry.lock();
+            for runtime in registry.values() {
+                let guards = runtime.fibers.lock();
+                for fiber in guards.iter().filter_map(Weak::upgrade) {
+                    match fiber.state() {
+                        FiberState::Pending => snapshot.pending_fibers += 1,
+                        FiberState::Loading => snapshot.loading_fibers += 1,
+                        FiberState::Active => snapshot.active_fibers += 1,
+                        FiberState::Failed => snapshot.failed_fibers += 1,
+                        FiberState::Unloading => snapshot.unloading_fibers += 1,
+                        FiberState::Disposed => {}
+                    }
+                }
+            }
+        }
+        snapshot.live_fibers = snapshot.pending_fibers
+            + snapshot.loading_fibers
+            + snapshot.active_fibers
+            + snapshot.failed_fibers
+            + snapshot.unloading_fibers;
+        snapshot.provider_count = root.reflect.provider_count();
+        let (depth, dropped) = root.dispatcher.queue_stats();
+        snapshot.queue_depth = depth as u64;
+        snapshot.dropped_events = dropped;
+        let metrics = &root.metrics;
+        snapshot.state_transition_count = metrics.state_transitions.load(Ordering::Relaxed);
+        snapshot.notify_count = metrics.notifies.load(Ordering::Relaxed);
+        snapshot.dependency_rebuild_count = root.index.rebuild_count();
+        snapshot.apply_retry_count = metrics.apply_retries.load(Ordering::Relaxed);
+        snapshot.logic_error_count = metrics.logic_errors.load(Ordering::Relaxed);
+        snapshot.timeout_error_count = metrics.timeout_errors.load(Ordering::Relaxed);
+        snapshot.transport_error_count = metrics.transport_errors.load(Ordering::Relaxed);
+        snapshot.resolution = metrics.resolution.summarize();
+        snapshot.update = metrics.update.summarize();
+        snapshot.cleanup = metrics.cleanup.summarize();
+        snapshot.drain = metrics.drain.summarize();
+        snapshot
+    }
+
     // ------------------------------------------------------------------
     // Fiber access
     // ------------------------------------------------------------------
@@ -370,6 +431,19 @@ impl Context {
     /// fiber; the wrapper is transparent to callers otherwise.
     #[must_use]
     pub fn get<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
+        let started = self.root.metrics.instant_if();
+        let result = self.resolve_typed(name);
+        if let Some(started) = started {
+            self.root
+                .metrics
+                .record(|metrics| &metrics.resolution, started);
+        }
+        result
+    }
+
+    /// The `get` body, split out so the O2 latency wrapper measures exactly
+    /// one resolution including every early return.
+    fn resolve_typed<T: Any + Send + Sync>(&self, name: &str) -> Option<Arc<T>> {
         if let Some(fiber) = self.fiber() {
             let snapshot = fiber.store.lock().get(name).cloned();
             if let Some(snapshot) = snapshot {

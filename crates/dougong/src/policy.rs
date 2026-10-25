@@ -117,16 +117,35 @@ impl ErrorPolicies {
     /// Stamps the class-graded level and the class onto `record`, then
     /// writes it through the structured face (O1). Every kernel error log
     /// line funnels here so grading stays single-sourced.
-    pub(crate) fn emit(&self, logger: &dyn Logger, class: ErrorClass, mut record: LogRecord) {
+    pub(crate) fn emit(
+        &self,
+        logger: &dyn Logger,
+        metrics: &crate::metrics::Metrics,
+        class: ErrorClass,
+        mut record: LogRecord,
+    ) {
         record.level = self.for_class(class).log_level;
         record.class = Some(class);
+        // O2 class counters: every graded error record tallies its class.
+        let counter = match class {
+            ErrorClass::Logic => &metrics.logic_errors,
+            ErrorClass::Timeout => &metrics.timeout_errors,
+            ErrorClass::Transport => &metrics.transport_errors,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         logger.log_record(&record);
     }
 
     /// Logs `err` at the level the policy assigns to its class.
-    pub(crate) fn log_error(&self, logger: &dyn Logger, err: &Error) {
+    pub(crate) fn log_error(
+        &self,
+        logger: &dyn Logger,
+        metrics: &crate::metrics::Metrics,
+        err: &Error,
+    ) {
         self.emit(
             logger,
+            metrics,
             err.class,
             LogRecord::new(
                 self.for_class(err.class).log_level,
@@ -169,7 +188,9 @@ pub fn react_to_listener_failure(ctx: &Context, fiber: Option<&Weak<Fiber>>, err
             }
         };
         if let Err(action_err) = outcome {
-            ctx.root.policies.log_error(&*ctx.logger(), &action_err);
+            ctx.root
+                .policies
+                .log_error(&*ctx.logger(), &ctx.root.metrics, &action_err);
         }
     });
 }
@@ -207,6 +228,7 @@ impl Invoke for QuarantineInvoke {
             // the weak-root wrapper never keeps the provider alive itself.
             root.policies.emit(
                 &*fiber.ctx().logger(),
+                &root.metrics,
                 ErrorClass::Transport,
                 LogRecord::new(
                     LogLevel::Error,

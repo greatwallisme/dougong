@@ -380,6 +380,7 @@ pub async fn run_fire_and_forget(
         let owner = fiber.as_ref().and_then(std::sync::Weak::upgrade);
         ctx.root.policies.emit(
             &*ctx.logger(),
+            &ctx.root.metrics,
             err.class,
             LogRecord::new(
                 LogLevel::Error,

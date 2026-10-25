@@ -490,6 +490,10 @@ impl Fiber {
     /// refresh churn that leaves the state unchanged).
     fn log_transition(&self, from: FiberState, to: FiberState) {
         let ctx = self.ctx();
+        ctx.root
+            .metrics
+            .state_transitions
+            .fetch_add(1, Ordering::Relaxed);
         ctx.logger().log_record(
             &LogRecord::new(
                 LogLevel::Info,
@@ -656,19 +660,28 @@ impl Fiber {
     /// the timeout is logged and the drain continues while the disposer
     /// finishes in the background.
     async fn run_one_disposer(&self, label: String, teardown: Teardown, disposer: Disposer) {
-        let budget = self.ctx().root.timeouts.cleanup;
+        let ctx = self.ctx();
+        let started = ctx.root.metrics.instant_if();
+        let budget = ctx.root.timeouts.cleanup;
         let Some(budget) = budget.filter(|_| teardown == Teardown::Orphanable) else {
             disposer().await;
+            if let Some(started) = started {
+                ctx.root.metrics.record(|m| &m.cleanup, started);
+            }
             return;
         };
-        let ctx = self.ctx();
         let logger = ctx.logger();
         let task = tokio::spawn(disposer());
-        match tokio::time::timeout(budget, task).await {
+        let outcome = tokio::time::timeout(budget, task).await;
+        if let Some(started) = started {
+            ctx.root.metrics.record(|m| &m.cleanup, started);
+        }
+        match outcome {
             Ok(Ok(())) => {}
             Ok(Err(join_error)) => {
                 ctx.root.policies.emit(
                     &*logger,
+                    &ctx.root.metrics,
                     crate::ErrorClass::Logic,
                     self.base_record(
                         "fiber",
@@ -682,6 +695,7 @@ impl Fiber {
             Err(_elapsed) => {
                 ctx.root.policies.emit(
                     &*logger,
+                    &ctx.root.metrics,
                     crate::ErrorClass::Timeout,
                     self.base_record(
                         "fiber",
@@ -752,6 +766,7 @@ impl Fiber {
             let ctx = self.ctx();
             ctx.root.policies.emit(
                 &*ctx.logger(),
+                &ctx.root.metrics,
                 crate::ErrorClass::Logic,
                 self.base_record(
                     "fiber",
@@ -908,25 +923,33 @@ impl Fiber {
                     /// the new desired epoch).
                     Stale,
                 }
-                let after = {
-                    let policy = self
-                        .ctx()
-                        .root
-                        .timeouts
-                        .apply
-                        .map_or(crate::timeout::ApplyPolicy::Fail, |apply| apply.policy);
-                    let mut driver = self.driver.lock();
-                    if driver.desired != target {
-                        After::Stale
-                    } else if let crate::timeout::ApplyPolicy::Retry(max) = policy
-                        && driver.retries_used < max
-                    {
-                        driver.retries_used += 1;
-                        After::Retry
-                    } else {
-                        After::Park
-                    }
+                let mut retried = false;
+                let policy = self
+                    .ctx()
+                    .root
+                    .timeouts
+                    .apply
+                    .map_or(crate::timeout::ApplyPolicy::Fail, |apply| apply.policy);
+                let mut driver = self.driver.lock();
+                let after = if driver.desired != target {
+                    After::Stale
+                } else if let crate::timeout::ApplyPolicy::Retry(max) = policy
+                    && driver.retries_used < max
+                {
+                    driver.retries_used += 1;
+                    retried = true;
+                    After::Retry
+                } else {
+                    After::Park
                 };
+                drop(driver);
+                if retried {
+                    self.ctx()
+                        .root
+                        .metrics
+                        .apply_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 match after {
                     After::Retry | After::Stale => {}
                     After::Park => self.fail_load(Error::apply_timeout(&self.name())),
@@ -983,6 +1006,7 @@ impl Fiber {
                     let ctx = self.ctx();
                     ctx.root.policies.emit(
                         &*ctx.logger(),
+                        &ctx.root.metrics,
                         crate::ErrorClass::Timeout,
                         self.base_record(
                             "fiber",
@@ -1181,6 +1205,7 @@ impl Fiber {
                     let ctx = self.ctx();
                     ctx.root.policies.emit(
                         &*ctx.logger(),
+                        &ctx.root.metrics,
                         crate::ErrorClass::Timeout,
                         self.base_record(
                             "fiber",
@@ -1216,6 +1241,7 @@ impl Fiber {
         let ctx = self.ctx();
         ctx.root.policies.emit(
             &*ctx.logger(),
+            &ctx.root.metrics,
             err.class,
             self.base_record("fiber", "fail_load", err.to_string()),
         );
@@ -1353,6 +1379,15 @@ impl Fiber {
     /// [`Error::fiber_unloading`] while effects are draining, on waterfall
     /// failures, or on startup errors after the round trip.
     pub async fn update(self: &Arc<Self>, config: Value) -> Result<Value> {
+        let started = self.ctx().root.metrics.instant_if();
+        let outcome = self.update_measured(config).await;
+        if let Some(started) = started {
+            self.ctx().root.metrics.record(|m| &m.update, started);
+        }
+        outcome
+    }
+
+    async fn update_measured(self: &Arc<Self>, config: Value) -> Result<Value> {
         if self.uid_value().is_none() {
             return Err(Error::fiber_disposed("update"));
         }

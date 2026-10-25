@@ -1,0 +1,206 @@
+// Rust guideline compliant 2026-10-25
+//! Runtime metrics (observability track O2, improve 三.2).
+//!
+//! Two kinds of signals with two cost models. Counters are always-on
+//! `Relaxed` atomics on cold paths — a state transition or a notify is
+//! already a multi-hundred-nanosecond event, so one relaxed add is noise.
+//! Latency instrumentation is opt-in through [`MetricsConfig`] because
+//! `Instant::now()` is not free on the strict-resolution path, which runs
+//! on every strict `get`; the default (`latencies: false`) keeps that path
+//! untouched.
+//!
+//! The kernel only *collects*: hosts wire Prometheus/OpenTelemetry exporters
+//! from [`MetricsSnapshot`] (Phase 0 ruling OBS = library-level API + host
+//! wiring).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// Upper bounds (in nanoseconds) of the first seven latency buckets; an
+/// eighth bucket catches everything at or above one second. Log2-spaced so
+/// "slow path" shows up without storing per-sample data.
+const BUCKET_BOUNDS_NS: [u64; 7] = [
+    1_000, // < 1 us
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+
+/// Latency instrumentation switches (O2), fixed at root construction.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetricsConfig {
+    /// Times the five instrumented waits (service resolution, event
+    /// dispatch, plugin update, effect cleanup, provider drain). `false`
+    /// (the default) records no latency samples at all.
+    pub latencies: bool,
+}
+
+/// One latency metric: count, total, max, and a fixed log2 bucket
+/// histogram. Never read while running — snapshots copy it out.
+#[derive(Debug, Default)]
+pub struct LatencyStat {
+    count: AtomicU64,
+    total_ns: AtomicU64,
+    max_ns: AtomicU64,
+    buckets: [AtomicU64; 8],
+}
+
+impl LatencyStat {
+    #[must_use]
+    pub fn default_stat() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    pub fn record(&self, sample: Duration) {
+        let ns = u64::try_from(sample.as_nanos()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        // `position` cannot fail: bounds has 7 entries, so the fallback
+        // bucket index 7 is reachable exactly when every bound is smaller.
+        let index = BUCKET_BOUNDS_NS
+            .iter()
+            .position(|&bound| ns < bound)
+            .unwrap_or(7);
+        self.buckets[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn summarize(&self) -> LatencySummary {
+        let count = self.count.load(Ordering::Relaxed);
+        let mut buckets = [0_u64; 8];
+        for (target, bucket) in buckets.iter_mut().zip(&self.buckets) {
+            *target = bucket.load(Ordering::Relaxed);
+        }
+        LatencySummary {
+            count,
+            total: Duration::from_nanos(self.total_ns.load(Ordering::Relaxed)),
+            max: Duration::from_nanos(self.max_ns.load(Ordering::Relaxed)),
+            buckets,
+        }
+    }
+}
+
+/// Kernel-resident metrics block (O2): always-on counters plus the opt-in
+/// latency slots. All reads go through snapshots.
+#[derive(Debug)]
+pub struct Metrics {
+    /// Whether latency slots record (construction-fixed).
+    latencies: bool,
+    pub state_transitions: AtomicU64,
+    pub notifies: AtomicU64,
+    pub apply_retries: AtomicU64,
+    pub logic_errors: AtomicU64,
+    pub timeout_errors: AtomicU64,
+    pub transport_errors: AtomicU64,
+    pub resolution: LatencyStat,
+    pub update: LatencyStat,
+    pub cleanup: LatencyStat,
+    pub drain: LatencyStat,
+}
+
+impl Metrics {
+    pub fn new(latencies: bool) -> Self {
+        Self {
+            latencies,
+            state_transitions: AtomicU64::new(0),
+            notifies: AtomicU64::new(0),
+            apply_retries: AtomicU64::new(0),
+            logic_errors: AtomicU64::new(0),
+            timeout_errors: AtomicU64::new(0),
+            transport_errors: AtomicU64::new(0),
+            resolution: LatencyStat::default_stat(),
+            update: LatencyStat::default_stat(),
+            cleanup: LatencyStat::default_stat(),
+            drain: LatencyStat::default_stat(),
+        }
+    }
+
+    /// The gate for latency instrumentation: `Some` starts a sample, `None`
+    /// means instrumentation is off and the site skips timing entirely.
+    pub fn instant_if(&self) -> Option<Instant> {
+        self.latencies.then(Instant::now)
+    }
+
+    /// Records one latency sample for `slot`; a no-op when off (so callers
+    /// may hold an `Instant` from [`Metrics::instant_if`] unconditionally).
+    pub fn record(&self, slot: fn(&Self) -> &LatencyStat, started: Instant) {
+        if self.latencies {
+            slot(self).record(started.elapsed());
+        }
+    }
+}
+
+/// Count, total, max, and the fixed bucket histogram of one latency metric.
+///
+/// Buckets are upper-bounded by `BUCKET_BOUNDS_NS`: samples under 1us,
+/// 10us, 100us, 1ms, 10ms, 100ms, 1s, and the catch-all at one second or
+/// more. `count == 0` means no samples (latency instrumentation off, or the
+/// path never ran).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LatencySummary {
+    /// Recorded samples.
+    pub count: u64,
+    /// Sum of all samples (`total / count` is the mean when `count > 0`).
+    pub total: Duration,
+    /// Slowest observed sample.
+    pub max: Duration,
+    /// Per-bucket sample counts, bounds ascending.
+    pub buckets: [u64; 8],
+}
+
+/// Point-in-time runtime statistics (O2).
+///
+/// A consistent-enough read for capacity and bottleneck answers: the fiber
+/// distribution is one registry walk, counters are single atomics. Hosts
+/// poll this (e.g. behind an HTTP endpoint) and wire exporters from it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetricsSnapshot {
+    /// Fibers in any state other than [`FiberState::Disposed`](crate::FiberState).
+    pub live_fibers: u64,
+    /// Fibers currently in `Pending`.
+    pub pending_fibers: u64,
+    /// Fibers currently in `Loading`.
+    pub loading_fibers: u64,
+    /// Fibers currently `Active`.
+    pub active_fibers: u64,
+    /// Fibers currently `Failed` (parked on a startup error).
+    pub failed_fibers: u64,
+    /// Fibers currently `Unloading`.
+    pub unloading_fibers: u64,
+    /// `(name, label)` slots in the reflect store.
+    pub provider_count: u64,
+    /// Pending bounded listener invocations (P2 queue capacity accounting).
+    pub queue_depth: u64,
+    /// Listener invocations dropped by full bounded lanes since start.
+    pub dropped_events: u64,
+    /// Lifecycle transitions since start (O1 log stream carries the pairs).
+    pub state_transition_count: u64,
+    /// `notify` calls since start (one call may fan out to many fibers).
+    pub notify_count: u64,
+    /// Dependency-edge wiring events since start (commits + uncommits).
+    pub dependency_rebuild_count: u64,
+    /// S3 apply-budget retries since start.
+    pub apply_retry_count: u64,
+    /// Error-class counts, stamped at every policy-graded error record.
+    pub logic_error_count: u64,
+    /// Timeout-class error records since start (S5 emit site).
+    pub timeout_error_count: u64,
+    /// Transport-class error records since start (S5 emit site).
+    pub transport_error_count: u64,
+    /// Latency summaries; `count == 0` when instrumentation is off.
+    pub resolution: LatencySummary,
+    /// `Fiber::update` wall time (config round trip + convergence).
+    pub update: LatencySummary,
+    /// Effect-disposer wall time (per disposer, including timed-out ones).
+    pub cleanup: LatencySummary,
+    /// Consumer-drain wall time per withdrawal drain call.
+    pub drain: LatencySummary,
+}

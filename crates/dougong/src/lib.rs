@@ -58,6 +58,7 @@ mod fiber;
 mod invariant;
 mod invoke;
 mod logger;
+mod metrics;
 mod ordering;
 mod plugin;
 mod policy;
@@ -79,6 +80,7 @@ pub use fiber::{
 };
 pub use invoke::{Invoke, Invoker};
 pub use logger::{LogLevel, LogRecord, Logger, LoggerHandle, StderrLogger};
+pub use metrics::{LatencySummary, MetricsConfig, MetricsSnapshot};
 pub use plugin::{BoxFuture, Injection, Plugin, plugin};
 pub use policy::{ClassPolicy, ErrorPolicies, ListenerFailurePolicy, ProviderQuarantine};
 pub use scope::{DEFAULT_LABEL, ScopeNode};

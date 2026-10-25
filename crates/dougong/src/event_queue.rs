@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::task::Poll;
 
@@ -87,9 +88,14 @@ impl std::fmt::Debug for EventDispatcher {
 }
 
 impl EventDispatcher {
-    pub(crate) fn new(config: EventQueueConfig) -> Self {
+    /// Pending bounded invocations and lifetime drops (O2 snapshot).
+    pub(crate) fn queue_stats(&self) -> (usize, u64) {
+        self.queue.stats()
+    }
+
+    pub(crate) fn new(config: EventQueueConfig, latencies: bool) -> Self {
         Self {
-            queue: Arc::new(Queue::new(config)),
+            queue: Arc::new(Queue::new(config, latencies)),
             started: OnceLock::new(),
         }
     }
@@ -160,16 +166,30 @@ struct Queue {
     state: Mutex<QueueState>,
     work: Notify,
     space: Notify,
+    /// Listener invocations dropped by full bounded lanes (O2 counter).
+    dropped: AtomicU64,
+    /// Opt-in dispatch latency recording (O2), construction-fixed.
+    latencies: bool,
+    dispatch: crate::metrics::LatencyStat,
 }
 
 impl Queue {
-    fn new(config: EventQueueConfig) -> Self {
+    fn new(config: EventQueueConfig, latencies: bool) -> Self {
         Self {
             config,
             state: Mutex::new(QueueState::default()),
             work: Notify::new(),
             space: Notify::new(),
+            dropped: AtomicU64::new(0),
+            latencies,
+            dispatch: crate::metrics::LatencyStat::default_stat(),
         }
+    }
+
+    /// Pending bounded invocations and lifetime drops (O2 snapshot).
+    pub(crate) fn stats(&self) -> (usize, u64) {
+        let depth = self.state.lock().bounded_pending;
+        (depth, self.dropped.load(Ordering::Relaxed))
     }
 
     fn policy(&self, name: &str) -> EventPolicy {
@@ -189,6 +209,7 @@ impl Queue {
                     .queue_capacity
                     .is_some_and(|capacity| state.bounded_pending >= capacity.get())
             {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
                 return Err(EnqueueError::Full(Box::new(job)));
             }
             let name = job.name.clone();
@@ -391,6 +412,7 @@ async fn worker_loop(queue: Arc<Queue>) {
             continue;
         };
         let name = job.name.clone();
+        let started = queue.latencies.then(std::time::Instant::now);
         let mut work = Box::pin(job.run());
         std::future::poll_fn(|cx| {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.as_mut().poll(cx)))
@@ -400,6 +422,9 @@ async fn worker_loop(queue: Arc<Queue>) {
             }
         })
         .await;
+        if let Some(started) = started {
+            queue.dispatch.record(started.elapsed());
+        }
         queue.complete(&name);
     }
 }

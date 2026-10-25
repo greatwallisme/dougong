@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::context::{Context, RootState};
 use crate::error::{Error, Result};
 use crate::fiber::{Fiber, FiberState, ProviderSnapshot};
@@ -82,6 +84,17 @@ impl ReflectStore {
             bucket.insert(label, provided);
             Ok(())
         })
+    }
+
+    /// Counts every `(name, label)` slot across the stripes, one stripe
+    /// lock at a time (O2 snapshot; the lock-order rule forbids holding two
+    /// root-state stripes together).
+    pub(crate) fn provider_count(&self) -> u64 {
+        let mut total = 0_u64;
+        self.slots.for_each_shard(|slots| {
+            total += slots.values().map(HashMap::len).sum::<usize>() as u64;
+        });
+        total
     }
 
     /// Seeds a built-in implementation during context construction, bypassing
@@ -189,9 +202,20 @@ pub struct DependencyIndex {
     /// Consumer uid -> provider uids it currently depends on (cleanup mirror
     /// of `provider_consumers`).
     consumer_providers: ShardMap<u64, HashSet<u64>>,
+    /// Edge-wiring events (commits + uncommits), the O2 rebuild counter.
+    rebuilds: AtomicU64,
 }
 
 impl DependencyIndex {
+    /// The O2 rebuild counter: edge wiring events since start.
+    pub(crate) fn rebuild_count(&self) -> u64 {
+        self.rebuilds.load(Ordering::Relaxed)
+    }
+
+    fn metrics_bump(&self) {
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Registers a fiber's declared interest in its injected service names.
     pub(crate) fn add_interest(&self, uid: u64, names: &[String]) {
         for name in names {
@@ -255,6 +279,10 @@ impl DependencyIndex {
     /// written under one stripe lock at a time — two stripes are never held
     /// together, so concurrent commits for different fibers cannot deadlock.
     pub(crate) fn commit_edges(&self, uid: u64, providers: &HashMap<String, (u64, u64)>) {
+        // One wiring event per fiber commit, not per edge (O2).
+        if !providers.is_empty() {
+            self.metrics_bump();
+        }
         for &(_, provider) in providers.values() {
             self.provider_consumers.write(&provider, |consumers| {
                 consumers.entry(provider).or_default().insert(uid);
@@ -267,6 +295,8 @@ impl DependencyIndex {
 
     /// Drops a fiber's committed edges before its store is cleared.
     pub(crate) fn uncommit(&self, uid: u64) {
+        // Withdrawal/rollback: the other rebuild trigger (O2).
+        self.metrics_bump();
         let providers = self
             .consumer_providers
             .write(&uid, |edges| edges.remove(&uid));
@@ -554,6 +584,16 @@ pub fn set(ctx: &Context, name: &str, value: Arc<dyn Any + Send + Sync>) -> Resu
 /// `Failed` (a tracked foreign call is unaffected — the reap watchdog
 /// surfaces it).
 async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
+    let started = ctx.root.metrics.instant_if();
+    drain_consumers_measured(ctx, touched).await;
+    if let Some(started) = started {
+        ctx.root.metrics.record(|metrics| &metrics.drain, started);
+    }
+}
+
+/// The drain body, split out so the O2 latency wrapper measures exactly one
+/// full drain call including every early return.
+async fn drain_consumers_measured(ctx: &Context, touched: Vec<Arc<Fiber>>) {
     let drain = ctx.root.timeouts.drain;
     for fiber in touched {
         let Some(drain) = drain else {
@@ -568,6 +608,7 @@ async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
         }
         ctx.root.policies.emit(
             &*ctx.logger(),
+            &ctx.root.metrics,
             crate::ErrorClass::Timeout,
             LogRecord::new(
                 LogLevel::Error,
@@ -600,6 +641,7 @@ async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
 /// thread. A fiber disposed between upgrade and re-resolution is harmless:
 /// its `refresh` is refused by the disposed choke-point guard (S4).
 pub fn notify(ctx: &Context, names: &[String]) -> Vec<Arc<Fiber>> {
+    ctx.root.metrics.notifies.fetch_add(1, Ordering::Relaxed);
     let mut candidates: Vec<u64> = Vec::new();
     for name in names {
         ctx.root.index.interested(name, &mut candidates);
