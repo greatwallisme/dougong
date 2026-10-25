@@ -335,6 +335,34 @@ drain.started/finished）且每个事件带一致载荷。**裁决：全部以 `
   预算臂走 spawn 任务 JoinError 收容、dispatch 包络带发射方 trace、日志面与
   事件面不串）。四关 + 锚点逐字节 + 五 demo 全绿。
 
+### D28 健康面 = Context::health() 快照 + 三个专用信号源（O5）
+
+improve 三.5 要 /healthz /readyz 等端点与 runtime 状态快照。**裁决：HTTP 归
+宿主（Phase 0 OBS 裁决重申）；库出 `Context::health() -> HealthSnapshot`，
+端点体由宿主组装（examples/health_demo.rs 演示），healthy 默认判定 =
+failed 空 && stale 空，宿主可覆盖**（2026-10-25）。
+
+- 计数面（plugin/fiber 五态/live）复用 O2 的 registry 走查形态；P1 锁序纪律
+  保持：registry 锁下只取 Arc 快照与原子态，fiber 内锁（error、task_scope）
+  在锁释放后取；store 条带三元组与 fiber 表查证分段（一次一锁）。
+- **recent errors 环**：挂在 `Metrics`（emit 漏斗签名已含 &Metrics，policies
+  无根引用的设计红利）；`ErrorPolicies::emit` 分级后 push——每条内核错误恰好
+  入环一次。cap = 64（错误冷路径，固定环无界保留无必要）；RecentError 携
+  class/fiber/uid/trace/event/message/at，trace 即 O3 join 键。
+- **long tasks = tracked 调用年龄**：CancelScope 加 tracked_since 多重集
+  （track_start push / TrackedGuard drop pop），仅 run_tracked/spawn_tracked
+  挂——「长任务」的语义对象就是边界在飞调用（与 S3 reap 看门狗同一对象）；
+  健康面报持有 fiber + 最久年龄，「多长算长」归宿主阈值。普通 in-task 监听
+  不入册（abort-safe 工作随 scope 死亡，不是悬挂风险对象）。
+- **stale providers**：store 走查 `(service,label,provider_uid)` 三元组，
+  持有者 fiber 态 != Active 即 stale（含 fiber 已亡的槽位，state 报
+  Disposed）。按 LIFO 构造真实 stale 窗口仅存在于卸载中途——恰是本面要
+  暴露的异常；公共路径无确定性窗口可钉，验收 = 健康世界空 + 走查随行。
+- 验证：tests/health.rs 4 用例（健康世界计数+四空、失败插件进 failed 明细
+  且环/明细同 trace join、环 cap=64 挤出最旧六条、预算化 bridge 在飞调用
+  报 long_task 且完成清零）+ cancel 单测（年龄飞行中增长/完成清零）；
+  health_demo 出 /healthz 体。四关 + 锚点逐字节 + 五 demo 全绿。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

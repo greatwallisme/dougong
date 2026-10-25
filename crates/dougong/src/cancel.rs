@@ -22,7 +22,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -37,6 +39,11 @@ pub struct CancelScope {
     tasks: AtomicUsize,
     /// Broadcast whenever the count drains to zero.
     empty_signal: Notify,
+    /// Start instants of the in-flight tracked (boundary) calls (O5): a
+    /// multiset — `track_start` pushes, the guard's `Drop` pops one. Only
+    /// the tracked paths feed it; abort-safe work is not a long-task
+    /// candidate (it dies with the scope).
+    tracked_since: Mutex<Vec<Instant>>,
 }
 
 impl std::fmt::Debug for CancelScope {
@@ -56,6 +63,7 @@ impl CancelScope {
             cancel_signal: Notify::new(),
             tasks: AtomicUsize::new(0),
             empty_signal: Notify::new(),
+            tracked_since: Mutex::new(Vec::new()),
         }
     }
 
@@ -68,6 +76,24 @@ impl CancelScope {
     /// invariant layer's reaped check).
     pub fn task_count(&self) -> usize {
         self.tasks.load(Ordering::SeqCst)
+    }
+
+    /// Age of the longest-running in-flight tracked call, `None` when no
+    /// tracked work is executing (O5 long-task face).
+    pub fn longest_tracked(&self) -> Option<Duration> {
+        self.tracked_since
+            .lock()
+            .iter()
+            .map(std::time::Instant::elapsed)
+            .max()
+    }
+
+    /// Admits one tracked call into the age registry; the returned guard
+    /// removes it on every exit path. Call only after `enter` admitted the
+    /// task.
+    fn track_start(self: &Arc<Self>) -> TrackedGuard {
+        self.tracked_since.lock().push(Instant::now());
+        TrackedGuard(Arc::clone(self))
     }
 
     /// Cancels the scope: abort-safe tasks are dropped at their next yield
@@ -143,6 +169,7 @@ impl CancelScope {
             return None;
         }
         let _guard = TaskGuard(Arc::clone(self));
+        let _tracked = self.track_start();
         Some(future.await)
     }
 
@@ -189,7 +216,8 @@ impl CancelScope {
         }
         let scope = Arc::clone(self);
         Some(tokio::spawn(async move {
-            let _guard = TaskGuard(scope);
+            let _guard = TaskGuard(Arc::clone(&scope));
+            let _tracked = scope.track_start();
             Some(future.await)
         }))
     }
@@ -226,6 +254,16 @@ struct TaskGuard(Arc<CancelScope>);
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.leave();
+    }
+}
+
+/// Removes one tracked-call start instant on every exit path (multiset
+/// semantics: any element, the ages are only read as a whole).
+struct TrackedGuard(Arc<CancelScope>);
+
+impl Drop for TrackedGuard {
+    fn drop(&mut self) {
+        self.0.tracked_since.lock().pop();
     }
 }
 
@@ -371,6 +409,24 @@ mod tests {
         let err = handle.await.expect_err("panic surfaces as JoinError");
         assert!(err.is_panic());
         assert_eq!(scope.task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tracked_ages_grow_and_drain() {
+        let scope = Arc::new(CancelScope::new());
+        assert_eq!(scope.longest_tracked(), None);
+        let task = scope
+            .spawn_tracked(async {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            })
+            .expect("scope admits the tracked task");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            scope.longest_tracked().is_some(),
+            "an in-flight tracked call registers its age"
+        );
+        task.await.expect("tracked task joins");
+        assert_eq!(scope.longest_tracked(), None, "completion clears the age");
     }
 
     #[tokio::test]

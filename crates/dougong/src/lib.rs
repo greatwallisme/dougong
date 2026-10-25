@@ -55,6 +55,7 @@ mod error;
 mod event_queue;
 mod events;
 mod fiber;
+mod health;
 mod invariant;
 mod invoke;
 mod logger;
@@ -78,9 +79,10 @@ pub use fiber::{
     Disposer, EPOCH_INACTIVE, EffectGuard, Fiber, FiberHandle, FiberState, ProviderSnapshot,
     Runtime,
 };
+pub use health::{FailedFiber, HealthSnapshot, LongTask, StaleProvider};
 pub use invoke::{Invoke, Invoker};
 pub use logger::{LogLevel, LogRecord, Logger, LoggerHandle, StderrLogger};
-pub use metrics::{LatencySummary, MetricsConfig, MetricsSnapshot};
+pub use metrics::{LatencySummary, MetricsConfig, MetricsSnapshot, RecentError};
 pub use plugin::{BoxFuture, Injection, Plugin, plugin};
 pub use policy::{ClassPolicy, ErrorPolicies, ListenerFailurePolicy, ProviderQuarantine};
 pub use scope::{DEFAULT_LABEL, ScopeNode};

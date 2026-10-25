@@ -97,6 +97,19 @@ impl ReflectStore {
         total
     }
 
+    /// Visits every `(name, label, provided)` slot across the stripes, one
+    /// stripe lock at a time (O5 health walk; same discipline as
+    /// `provider_count`).
+    pub(crate) fn for_each_slot(&self, mut f: impl FnMut(&str, u64, &Provided)) {
+        self.slots.for_each_shard(|slots| {
+            for (name, bucket) in slots {
+                for (label, provided) in bucket {
+                    f(name, *label, provided);
+                }
+            }
+        });
+    }
+
     /// Seeds a built-in implementation during context construction, bypassing
     /// the duplicate check.
     ///

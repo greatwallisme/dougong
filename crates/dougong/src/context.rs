@@ -410,6 +410,95 @@ impl Context {
         snapshot
     }
 
+    /// Assembles the runtime health snapshot (O5).
+    ///
+    /// Lock discipline (P1): the registry lock covers only the strong-ref
+    /// snapshot and atomic state reads; fiber-internal locks (startup error,
+    /// task scope) are taken after it is released. Store stripes and the
+    /// fiber table are probed one lock at a time, never together.
+    #[must_use]
+    pub fn health(&self) -> crate::health::HealthSnapshot {
+        let root = &self.root;
+        let mut snapshot = crate::health::HealthSnapshot::default();
+        let mut fibers: Vec<Arc<Fiber>> = Vec::new();
+        {
+            let registry = root.registry.lock();
+            snapshot.plugin_count = registry.len() as u64;
+            for runtime in registry.values() {
+                let guards = runtime.fibers.lock();
+                for fiber in guards.iter().filter_map(Weak::upgrade) {
+                    fibers.push(fiber);
+                }
+            }
+        }
+        for fiber in &fibers {
+            match fiber.state() {
+                FiberState::Pending => snapshot.pending_fibers += 1,
+                FiberState::Loading => snapshot.loading_fibers += 1,
+                FiberState::Active => snapshot.active_fibers += 1,
+                FiberState::Failed => {
+                    snapshot.failed_fibers += 1;
+                    if let Some(error) = fiber.failure_text() {
+                        snapshot.failed.push(crate::health::FailedFiber {
+                            name: fiber.name(),
+                            uid: fiber.uid_value(),
+                            trace: fiber.trace_id(),
+                            error,
+                        });
+                    }
+                }
+                FiberState::Unloading => snapshot.unloading_fibers += 1,
+                FiberState::Disposed => {}
+            }
+            if let Some(longest) = fiber.longest_tracked() {
+                snapshot.long_tasks.push(crate::health::LongTask {
+                    name: fiber.name(),
+                    uid: fiber.uid_value(),
+                    trace: fiber.trace_id(),
+                    longest,
+                });
+            }
+        }
+        snapshot.live_fibers = snapshot.pending_fibers
+            + snapshot.loading_fibers
+            + snapshot.active_fibers
+            + snapshot.failed_fibers
+            + snapshot.unloading_fibers;
+        snapshot.recent_errors = root.metrics.recent_errors();
+        // Stale providers: collect the slots one store stripe at a time,
+        // then look the provider fibers up in the fiber table — the two
+        // structures are never locked together.
+        let mut slots: Vec<(String, u64, u64)> = Vec::new();
+        root.reflect.for_each_slot(|name, label, provided| {
+            slots.push((name.to_string(), label, provided.provider_uid));
+        });
+        for (service, label, uid) in slots {
+            match root.fiber_by_uid(uid) {
+                Some(fiber) => {
+                    let state = fiber.state();
+                    if state != FiberState::Active {
+                        snapshot.stale_providers.push(crate::health::StaleProvider {
+                            service,
+                            label,
+                            fiber: Some(fiber.name()),
+                            uid,
+                            state,
+                        });
+                    }
+                }
+                None => snapshot.stale_providers.push(crate::health::StaleProvider {
+                    service,
+                    label,
+                    fiber: None,
+                    uid,
+                    state: FiberState::Disposed,
+                }),
+            }
+        }
+        snapshot.healthy = snapshot.failed.is_empty() && snapshot.stale_providers.is_empty();
+        snapshot
+    }
+
     // ------------------------------------------------------------------
     // Fiber access
     // ------------------------------------------------------------------

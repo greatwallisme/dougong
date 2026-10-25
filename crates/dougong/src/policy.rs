@@ -133,6 +133,8 @@ impl ErrorPolicies {
             ErrorClass::Transport => &metrics.transport_errors,
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // O5 recent-errors ring: every graded kernel error lands here.
+        metrics.push_error(class, &record);
         logger.log_record(&record);
     }
 

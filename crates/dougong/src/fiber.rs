@@ -564,6 +564,17 @@ impl Fiber {
             .and_then(|rt| rt.plugin.boundary_tag())
     }
 
+    /// Age of the longest-running in-flight tracked (boundary) call on this
+    /// fiber's current scope generation (O5).
+    pub(crate) fn longest_tracked(&self) -> Option<Duration> {
+        self.task_scope.lock().longest_tracked()
+    }
+
+    /// The startup error text while the fiber is parked in `Failed` (O5).
+    pub(crate) fn failure_text(&self) -> Option<String> {
+        self.error.lock().as_ref().map(ToString::to_string)
+    }
+
     /// Emits `internal/status` with the current snapshot, preceded by the
     /// structured transition log and the O4 named state event when `from`
     /// differs from the new state.

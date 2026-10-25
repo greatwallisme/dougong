@@ -13,8 +13,39 @@
 //! from [`MetricsSnapshot`] (Phase 0 ruling OBS = library-level API + host
 //! wiring).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+use parking_lot::Mutex;
+
+use crate::error::ErrorClass;
+use crate::logger::LogRecord;
+
+/// How many graded error records the recent-errors ring (O5) retains. Errors
+/// are a cold path (a few per anomaly at most), so a fixed 64 covers every
+/// realistic inspection window without unbounded retention.
+const RECENT_ERROR_CAP: usize = 64;
+
+/// One graded error record, copied into the recent-errors ring at the S5
+/// emit funnel (O5 health face; `trace` is the O3 fiber trace id).
+#[derive(Debug, Clone)]
+pub struct RecentError {
+    /// Error class stamped by the policy table.
+    pub class: ErrorClass,
+    /// Fiber / plugin name, when the record has one.
+    pub fiber: Option<String>,
+    /// Fiber uid (`None` also covers dispose-complete sites).
+    pub uid: Option<u64>,
+    /// The fiber's O3 trace id.
+    pub trace: Option<u64>,
+    /// Stable record kind (`fail_load`, `listener_failure`, ...).
+    pub event: String,
+    /// Human-readable summary, verbatim from the record.
+    pub message: String,
+    /// When the record was graded.
+    pub at: SystemTime,
+}
 
 /// Upper bounds (in nanoseconds) of the first seven latency buckets; an
 /// eighth bucket catches everything at or above one second. Log2-spaced so
@@ -104,6 +135,8 @@ pub struct Metrics {
     pub update: LatencyStat,
     pub cleanup: LatencyStat,
     pub drain: LatencyStat,
+    /// Recent-errors ring (O5), oldest first, capped at [`RECENT_ERROR_CAP`].
+    recent: Mutex<VecDeque<RecentError>>,
 }
 
 impl Metrics {
@@ -120,6 +153,7 @@ impl Metrics {
             update: LatencyStat::default_stat(),
             cleanup: LatencyStat::default_stat(),
             drain: LatencyStat::default_stat(),
+            recent: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -135,6 +169,31 @@ impl Metrics {
         if self.latencies {
             slot(self).record(started.elapsed());
         }
+    }
+
+    /// Copies one graded error record into the ring (O5), dropping the
+    /// oldest entry beyond the cap. Called from the S5 emit funnel only —
+    /// every kernel error passes there exactly once.
+    pub(crate) fn push_error(&self, class: ErrorClass, record: &LogRecord) {
+        let entry = RecentError {
+            class,
+            fiber: record.fiber.clone(),
+            uid: record.uid,
+            trace: record.trace,
+            event: record.event.to_string(),
+            message: record.message.clone(),
+            at: record.timestamp,
+        };
+        let mut ring = self.recent.lock();
+        if ring.len() == RECENT_ERROR_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+    }
+
+    /// Ring snapshot, oldest first (O5).
+    pub(crate) fn recent_errors(&self) -> Vec<RecentError> {
+        self.recent.lock().iter().cloned().collect()
     }
 }
 
