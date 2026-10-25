@@ -884,6 +884,10 @@ impl Plugin for DynPlugin {
         self.inject.clone()
     }
 
+    fn boundary_tag(&self) -> Option<&'static str> {
+        Some("dylib")
+    }
+
     fn apply(&self, ctx: dougong::Context, _config: Value) -> BoxFuture<Result<()>> {
         let exports = self.exports.clone();
         let provide = self.provide.clone();

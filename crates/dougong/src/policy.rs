@@ -237,6 +237,8 @@ impl Invoke for QuarantineInvoke {
                     "disposing provider fiber after transport-class call failure".to_string(),
                 )
                 .with_fiber(fiber.name(), Some(provider_uid))
+                .with_trace(Some(fiber.trace_id()))
+                .with_boundary(fiber.boundary_tag())
                 .with_service(&*service)
                 .with_cause(err.to_string()),
             );

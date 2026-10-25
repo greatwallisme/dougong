@@ -77,6 +77,14 @@ pub struct LogRecord {
     pub fiber: Option<String>,
     /// Fiber uid; `None` also covers dispose-complete sites (uid cleared).
     pub uid: Option<u64>,
+    /// Trace id (O3): the fiber's uid as captured at construction, stable
+    /// across dispose — the join key that stitches a plugin's whole
+    /// lifecycle (start to fail to teardown) into one chain. `None` only on
+    /// records with no fiber context at all (the global error face).
+    pub trace: Option<u64>,
+    /// Boundary tag (O3): which plugin form owns the fiber (`"dylib"`,
+    /// `"wasm"`); `None` for in-process plugins.
+    pub boundary: Option<&'static str>,
     /// Isolation realm label; `None` = the default label.
     pub realm: Option<u64>,
     /// Service name.
@@ -113,6 +121,8 @@ impl LogRecord {
             class: None,
             fiber: None,
             uid: None,
+            trace: None,
+            boundary: None,
             realm: None,
             service: None,
             event_name: None,
@@ -152,6 +162,20 @@ impl LogRecord {
     #[must_use]
     pub const fn with_realm(mut self, realm: Option<u64>) -> Self {
         self.realm = realm;
+        self
+    }
+
+    /// Attaches the fiber's trace id.
+    #[must_use]
+    pub const fn with_trace(mut self, trace: Option<u64>) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    /// Attaches the boundary tag of the fiber's plugin form.
+    #[must_use]
+    pub const fn with_boundary(mut self, boundary: Option<&'static str>) -> Self {
+        self.boundary = boundary;
         self
     }
 
@@ -219,6 +243,12 @@ impl LogRecord {
         }
         if let Some(uid) = self.uid {
             push("uid", uid.to_string());
+        }
+        if let Some(trace) = self.trace {
+            push("trace", trace.to_string());
+        }
+        if let Some(boundary) = self.boundary {
+            push("boundary", boundary.to_string());
         }
         if let Some(realm) = self.realm {
             push("realm", realm.to_string());

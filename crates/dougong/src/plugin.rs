@@ -81,6 +81,13 @@ pub trait Plugin: Send + Sync + 'static {
         true
     }
 
+    /// Boundary tag of the plugin form (O3), stamped onto every kernel log
+    /// record of the fiber: `"dylib"` for the C-ABI host, `"wasm"` for the
+    /// component host. In-process plugins are `None` by default.
+    fn boundary_tag(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Runs the plugin body. Return an error to fail activation; collected
     /// effects are rolled back LIFO.
     fn apply(&self, ctx: Context, config: Value) -> BoxFuture<Result<()>>;

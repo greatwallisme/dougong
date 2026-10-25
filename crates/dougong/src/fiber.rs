@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -202,6 +203,17 @@ pub struct Fiber {
         tokio::sync::watch::Receiver<u64>,
     ),
     state_cache: AtomicU8,
+    /// Trace id (O3): the uid as captured at construction. Unlike `uid` it
+    /// is never retracted, so teardown records stay joinable to the fiber's
+    /// whole lifecycle chain ("start to fail to teardown").
+    trace: u64,
+    /// When the current state was entered (O3 span); read-and-reset by
+    /// `cache_state` on a real transition to timestamp the exited state's
+    /// duration. Driver-task private — no contention.
+    state_since: Mutex<Instant>,
+    /// Milliseconds spent in the state `cache_state` last exited (O3),
+    /// consumed by the next `log_transition`.
+    last_state_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for Fiber {
@@ -245,6 +257,9 @@ impl Fiber {
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Active as u8),
+            trace: 0,
+            state_since: Mutex::new(Instant::now()),
+            last_state_ms: AtomicU64::new(0),
         })
     }
 
@@ -285,6 +300,9 @@ impl Fiber {
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Pending as u8),
+            trace: uid,
+            state_since: Mutex::new(Instant::now()),
+            last_state_ms: AtomicU64::new(0),
         })
     }
 
@@ -471,6 +489,15 @@ impl Fiber {
     fn cache_state(&self) -> FiberState {
         let state = self.compute_state();
         let previous = self.state_cache.swap(state as u8, Ordering::AcqRel);
+        if previous != state as u8 {
+            // O3 span: on a real transition, record how long the exited
+            // state was held; the next `log_transition` attaches it.
+            let since = std::mem::replace(&mut *self.state_since.lock(), Instant::now());
+            self.last_state_ms.store(
+                u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
         let root = &self.ctx().root;
         if let Some(uid) = self.uid_value() {
             if state == FiberState::Active {
@@ -502,18 +529,39 @@ impl Fiber {
                 "fiber state changed".to_string(),
             )
             .with_fiber(self.name(), self.uid_value())
+            .with_trace(Some(self.trace))
+            .with_boundary(self.boundary_tag())
             .with_realm(ctx.realm_label())
-            .with_states(from, to),
+            .with_states(from, to)
+            .with_duration(Duration::from_millis(
+                self.last_state_ms.load(Ordering::Relaxed),
+            )),
         );
     }
 
     /// Base record carrying this fiber's identity fields (O1 field table):
-    /// name, uid, realm. Sites add what else they know; the level is a
-    /// placeholder — `ErrorPolicies::emit` stamps the graded value over it.
+    /// name, uid, trace, boundary, realm. Sites add what else they know; the
+    /// level is only a default — `ErrorPolicies::emit` stamps the graded
+    /// value over it.
     fn base_record(&self, target: &'static str, event: &'static str, message: String) -> LogRecord {
         LogRecord::new(LogLevel::Error, target, event, message)
             .with_fiber(self.name(), self.uid_value())
+            .with_trace(Some(self.trace))
+            .with_boundary(self.boundary_tag())
             .with_realm(self.ctx().realm_label())
+    }
+
+    /// The fiber's trace id (O3): its uid as captured at construction,
+    /// stable across dispose (where `uid_value` turns `None`).
+    pub(crate) const fn trace_id(&self) -> u64 {
+        self.trace
+    }
+
+    /// The plugin form's boundary tag (O3), for log attribution.
+    pub(crate) fn boundary_tag(&self) -> Option<&'static str> {
+        self.runtime
+            .as_ref()
+            .and_then(|rt| rt.plugin.boundary_tag())
     }
 
     /// Emits `internal/status` with the current snapshot, preceded by the
@@ -531,6 +579,7 @@ impl Fiber {
         let payload = serde_json::json!({
             "fiber": self.name(),
             "uid": self.uid_value(),
+            "trace": self.trace,
             "state": self.state().as_str(),
         });
         events::emit_internal(&self.ctx(), "internal/status", &payload, None);

@@ -1151,3 +1151,9 @@ async fn teardown_waits_for_in_flight_calls() {
     );
     ctx.stop().await;
 }
+
+#[test]
+fn dynplugin_declares_the_dylib_boundary_tag() {
+    let plugin = from_static(&TARGET_TABLE).expect("adapter from static table");
+    assert_eq!(Plugin::boundary_tag(&plugin), Some("dylib"));
+}

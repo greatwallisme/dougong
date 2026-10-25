@@ -271,6 +271,37 @@ prometheus/otel 依赖**（2026-10-25）；导出是宿主接线（Phase 0 OBS �
 - 验证：tests/metrics.rs 8 用例（态分布/常开计数器/门控零记录 vs 记录/桶不变量/
   重试与类计数/容量拒弃）。bench_notify 锚点逐字节不变。
 
+### D26 trace id = 构造期 uid 的不可变镜像 + boundary tag 上记录面（O3）
+
+improve 三.3 要"为插件和 fiber 绑定 trace ID"，每个 lifecycle 事件可追一条链
+（start / resolve / dispatch / update / provider change / dispose / cleanup /
+drain / fail load），跨边界保留 trace id 和 boundary tag。**裁决：trace id 就是
+fiber 构造期的 uid（独立不可变字段，永不清除），不另立计数器；boundary tag 走
+`Plugin::boundary_tag()` 默认方法上内核记录面，不在 ABI/wit 契约里穿传**（2026-10-25）。
+
+- uid 已是单调、唯一、不复用的 fiber 身份（S1）；另立全局 trace 计数器 = 同一点位
+  同值的纯重复。独立字段的唯一理由：S4 在 dispose 时撤收 uid，而 teardown/cleanup
+  记录必须仍可 join——"start 到 fail 到 teardown"全链的 join 键恰好在收尾处不能
+  失效。trace==uid 保证与 O1 既有记录/事件面零迁移 join。
+- `LogRecord` 加 `trace: Option<u64>`（None 仅限无 fiber 语境的全局错误线）与
+  `boundary: Option<&'static str>`；六个构造站点全归因（base_record/log_transition
+  漏斗带本 fiber 的，quarantine/drain_timeout/listener_failure 带当事 fiber 的）。
+- 生命周期 span 复用既有 `duration` 字段：`cache_state` 真实换态时读并重置
+  `state_since`（fiber 内私有无竞争），`log_transition` 附「离开态停留时长」——
+  Pending→Loading = 等依赖时长，Loading→Active = 装载时长，Active→Unloading =
+  服务寿命。`internal/status` 载荷加性补 `"trace"`（消费面按字段访问，计数锚点不受影响）。
+- boundary tag：`Plugin::boundary_tag()` 默认 `None`（dyn-safe，存量 impl 零涟漪），
+  DynPlugin=>"dylib"、WasmPlugin=>"wasm"；base_record 经 fiber.runtime 的 plugin
+  读出——dylib/wasm 插件的每条内核日志自动带 tag，零新日志点、零宿主接线。
+  契约（C-ABI vtable、WIT）不动：跨边界 *载荷内* 的 trace 透传需要调用方 fiber
+  身份进入调用缝（task-local 或 Invoker 传参，公共面语义变更），归 O7 的
+  boundary-call 记录统一设计。公开绑定面 = `Context::trace_id()`（root 为 0），
+  插件与宿主据此把自身 trace 写进自有记录。
+- 验证：tests/tracing.rs 6 用例（root=0 与 trace==uid、转移 span duration、
+  合成 boundary tag 上记录、dispose 后 uid 撤而 trace 存活、status 载荷 trace、
+  失败激活全记录同 trace）；dylib/wasm 各一条 tag 映射单测。bench_notify 锚点
+  逐字节不变（载荷加字段不改计数）。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

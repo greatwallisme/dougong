@@ -61,6 +61,10 @@ impl Plugin for WasmPlugin {
         self.inject.clone()
     }
 
+    fn boundary_tag(&self) -> Option<&'static str> {
+        Some("wasm")
+    }
+
     fn body_abort_safe(&self) -> bool {
         // The body holds the store mutex across awaited export calls and
         // wasmtime forbids abandoning an in-flight `call_async`, so the
@@ -124,5 +128,37 @@ impl Plugin for WasmPlugin {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use dougong::Plugin;
+    use wasmtime::{Engine, Store};
+
+    use super::WasmPlugin;
+    use crate::channel::{GuestChannel, StoreArc};
+    use crate::engine::WasmLimits;
+    use crate::state::PluginState;
+
+    #[test]
+    fn wasmplugin_declares_the_wasm_boundary_tag() {
+        let channel = Arc::new(GuestChannel::new());
+        let state = PluginState::new(Arc::clone(&channel), &WasmLimits::default());
+        let store: StoreArc = Arc::new(tokio::sync::Mutex::new(Store::new(
+            &Engine::default(),
+            state,
+        )));
+        let plugin = WasmPlugin::new(
+            "wasm-boundary".to_string(),
+            "0.1.0".to_string(),
+            Vec::new(),
+            Vec::new(),
+            channel,
+            store,
+        );
+        assert_eq!(Plugin::boundary_tag(&plugin), Some("wasm"));
     }
 }

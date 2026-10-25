@@ -392,6 +392,8 @@ pub async fn run_fire_and_forget(
                 owner.as_ref().map(|f| f.name()),
                 owner.as_ref().and_then(|f| f.uid_value()),
             )
+            .with_trace(owner.as_ref().map(|f| f.trace_id()))
+            .with_boundary(owner.as_ref().and_then(|f| f.boundary_tag()))
             .with_event_name(&name)
             .with_mode(DispatchMode::Emit),
         );

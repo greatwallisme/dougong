@@ -617,6 +617,8 @@ async fn drain_consumers_measured(ctx: &Context, touched: Vec<Arc<Fiber>>) {
                 format!("consumer missed the {:?} drain budget", drain.budget),
             )
             .with_fiber(fiber.name(), fiber.uid_value())
+            .with_trace(Some(fiber.trace_id()))
+            .with_boundary(fiber.boundary_tag())
             .with_duration(drain.budget),
         );
         if drain.policy == crate::timeout::DrainPolicy::CancelConsumer {

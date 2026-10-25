@@ -349,6 +349,15 @@ impl Context {
         None
     }
 
+    /// This context's trace id (O3): the owning fiber's uid as captured at
+    /// construction, stable across dispose. The root context traces as `0`.
+    /// Plugins and boundary hosts stamp it onto their own records to join
+    /// them with the kernel's lifecycle chain for the same fiber.
+    #[must_use]
+    pub fn trace_id(&self) -> u64 {
+        self.fiber.upgrade().map_or(0, |fiber| fiber.trace_id())
+    }
+
     /// Takes a point-in-time metrics snapshot (O2).
     ///
     /// Latency summaries carry `count == 0` unless
