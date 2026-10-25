@@ -53,6 +53,8 @@ pub struct RootState {
     /// Timeout budgets for the critical async paths (S3); fixed at
     /// construction so every reader sees one consistent policy set.
     pub(crate) timeouts: crate::timeout::TimeoutConfig,
+    /// Plugin resource budgets (P7); likewise fixed at construction.
+    pub(crate) budgets: crate::budget::BudgetConfig,
     /// Per-class error reactions (S5); likewise fixed at construction.
     pub(crate) policies: crate::policy::ErrorPolicies,
     /// Per-service-group serial sections for dependency updates (S6, D21).
@@ -163,6 +165,8 @@ impl Default for Context {
 pub struct ContextOptions {
     /// Timeout budgets for the critical async paths.
     pub timeouts: crate::timeout::TimeoutConfig,
+    /// Plugin resource budgets (P7).
+    pub budgets: crate::budget::BudgetConfig,
     /// Per-class error reactions.
     pub policies: crate::policy::ErrorPolicies,
     /// Event queue capacity, overflow, and concurrency policies.
@@ -189,6 +193,7 @@ impl Context {
     pub fn new_with_timeouts(timeouts: crate::timeout::TimeoutConfig) -> Self {
         Self::new_with_options(ContextOptions {
             timeouts,
+            budgets: crate::budget::BudgetConfig::default(),
             policies: crate::policy::ErrorPolicies::default(),
             events: crate::event_queue::EventQueueConfig::default(),
         })
@@ -209,6 +214,7 @@ impl Context {
             index: DependencyIndex::default(),
             active: crate::shard::ActiveSet::new(),
             timeouts: options.timeouts,
+            budgets: options.budgets,
             policies: options.policies,
             ordering: crate::ordering::UpdateSerializers::default(),
             dispatcher: crate::event_queue::EventDispatcher::new(options.events),

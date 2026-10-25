@@ -48,6 +48,7 @@
 //! # }
 //! ```
 
+mod budget;
 mod cancel;
 mod context;
 mod error;
@@ -66,9 +67,10 @@ mod service;
 mod shard;
 mod timeout;
 
+#[doc(inline)]
+pub use budget::BudgetConfig;
 pub use context::{Context, ContextOptions};
 pub use error::{Error, ErrorClass, Result};
-#[doc(inline)]
 pub use event_queue::{EmitOutcome, EventPolicy, EventQueueConfig, OverflowPolicy};
 pub use events::{DispatchListener, DispatchMode, Listener, Next, is_bailed};
 pub use fiber::{

@@ -16,7 +16,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use serde_json::Value;
@@ -185,6 +185,12 @@ pub struct Fiber {
     loaded: Mutex<String>,
     disposables: Mutex<Vec<Disposable>>,
     next_effect_id: AtomicU64,
+    /// Events emitted this activation window (P7 budget); reset at every
+    /// body start in `load_once`. Touched only when a budget is configured.
+    emitted_events: AtomicU64,
+    /// First-breach log latch for the emit budget (P7): one log line per
+    /// window, further breaches drop silently.
+    emit_breach_logged: AtomicBool,
     driver: Mutex<DriveState>,
     /// Current cancel-scope generation (S2): every task this fiber owns —
     /// listener invocations and the plugin body — is spawned into it, and
@@ -225,6 +231,8 @@ impl Fiber {
             loaded: Mutex::new(EPOCH_INACTIVE.to_string()),
             disposables: Mutex::new(Vec::new()),
             next_effect_id: AtomicU64::new(1),
+            emitted_events: AtomicU64::new(0),
+            emit_breach_logged: AtomicBool::new(false),
             driver: Mutex::new(DriveState {
                 desired: EPOCH_INACTIVE.to_string(),
                 dirty: false,
@@ -263,6 +271,8 @@ impl Fiber {
             loaded: Mutex::new(EPOCH_INACTIVE.to_string()),
             disposables: Mutex::new(Vec::new()),
             next_effect_id: AtomicU64::new(1),
+            emitted_events: AtomicU64::new(0),
+            emit_breach_logged: AtomicBool::new(false),
             driver: Mutex::new(DriveState {
                 desired: EPOCH_INACTIVE.to_string(),
                 dirty: false,
@@ -525,6 +535,26 @@ impl Fiber {
         let id = self.next_effect_id.fetch_add(1, Ordering::SeqCst);
         if let Some(disposer) = disposer {
             let mut list = self.disposables.lock();
+            // Live-slot count, not len: disposed slots stay as `None` holes
+            // until the LIFO drain pops them (P7).
+            if let Some(cap) = self.ctx().root.budgets.max_effects {
+                let live = list.iter().filter(|slot| slot.is_some()).count();
+                if live
+                    >= usize::try_from(cap).unwrap_or_else(|_| {
+                        unreachable!(
+                            // contract: BudgetConfig::max_effects is a u32 widened on
+                            // a 64-bit usize target; the kernel does not support
+                            // 16-bit usize
+                        )
+                    })
+                {
+                    return Err(Error::budget_exceeded(
+                        "effect",
+                        &self.name(),
+                        u64::from(cap),
+                    ));
+                }
+            }
             list.push(Some((id, effect_label, teardown, disposer)));
         }
         Ok(EffectGuard {
@@ -648,6 +678,32 @@ impl Fiber {
             .iter()
             .filter(|slot| slot.is_some())
             .count()
+    }
+
+    /// Emit-budget admission (P7): `false` when this activation window has
+    /// exhausted `BudgetConfig::max_event_emits`. The counter only moves
+    /// while a budget is configured; the first breach in a window logs once
+    /// and further breaches drop silently.
+    pub(crate) fn admit_emit(&self, name: &str) -> bool {
+        let Some(cap) = self.ctx().root.budgets.max_event_emits else {
+            return true;
+        };
+        let prev = self.emitted_events.fetch_add(1, Ordering::Relaxed);
+        if prev < cap {
+            return true;
+        }
+        if !self.emit_breach_logged.swap(true, Ordering::Relaxed) {
+            let ctx = self.ctx();
+            ctx.root.policies.log(
+                &*ctx.logger(),
+                crate::ErrorClass::Logic,
+                &format!(
+                    "event budget of {cap} exceeded on fiber \"{}\": dropping emissions of \"{name}\" for this activation window",
+                    self.name()
+                ),
+            );
+        }
+        false
     }
 }
 
@@ -954,6 +1010,9 @@ impl Fiber {
         // the JoinHandle as a startup failure so the rollback path runs
         // (self-evolving runtimes host generated code, paper §1.2).
         let scope = self.reset_scope();
+        // Fresh emit-budget window per activation (P7).
+        self.emitted_events.store(0, Ordering::Relaxed);
+        self.emit_breach_logged.store(false, Ordering::Relaxed);
         let body_ctx = self.ctx();
         let body = runtime.plugin.apply(body_ctx.clone(), config.clone());
         let spawned = if runtime.plugin.body_abort_safe() {

@@ -415,6 +415,13 @@ pub async fn run_fire_and_forget(
 /// Reliable synchronous events use the lossless unbounded lane (C7); explicit
 /// drop policies use the bounded lane. Listener failures remain logged only.
 pub fn emit(ctx: &Context, name: &str, payload: Value) {
+    // Plugin budget admission (P7) precedes dispatch: a refused emission is
+    // not a dispatch, so `internal/dispatch` observability stays truthful.
+    if let Some(fiber) = ctx.fiber()
+        && !fiber.admit_emit(name)
+    {
+        return;
+    }
     let dispatch = begin_dispatch(ctx, "emit", name);
     let mut entries = dispatch.entries.into_iter();
     let Some(mut entry) = entries.next() else {
@@ -440,6 +447,12 @@ pub async fn emit_with_policy(
     name: &str,
     payload: Value,
 ) -> crate::event_queue::EmitOutcome {
+    // Same admission as [`emit`] (P7); the refused emission reports Dropped.
+    if let Some(fiber) = ctx.fiber()
+        && !fiber.admit_emit(name)
+    {
+        return crate::event_queue::EmitOutcome::Dropped;
+    }
     let entries = if name.starts_with("internal/") {
         ctx.root.events.lock().matching(name, None).entries
     } else {

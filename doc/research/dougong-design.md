@@ -191,6 +191,38 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 - **生命周期与 panic**：queued job 只持 `Weak<RootState>` + scope/fiber 弱键，消费时升级重建 Context；RootState 释放时关闭队列并唤醒等待者，避免 root→queue→job→root 强环。listener panic 在 worker 的 poll 边界收容，lane active 计数仍释放，后续 job 与其他 listener 继续。
 - 验证锚：`tests/event_queue.rs` 7 例（固定 worker 上界 / 异事件不受 per-event cap 队头阻塞 / capacity=1 背压零丢失 / Drop 满队才丢 / panic 后 worker 续跑 / 出队前 dispose 跳过 listener / 多生产者风暴投递与 cap 精确）+ 既有全套（S1–S7、五模式、dylib/wasm 边界）回归。`tests/bench_events.rs` 同机两跑：改造前 wall 13/13ms、max_active 2952/3635；改造后 wall 11/11ms、max_active 4/4，16000 次投递均精确。
 
+### D23 插件预算 = 内核收口点计量，计算计量归沙箱（P7）
+
+2026-10-25，improve 一.7 落地（勘察与设计见 findings §23）：
+
+- **需求四项的覆盖映射**：最大执行时间 = S3 apply/listener/cleanup/drain 预算
+  （D18，已覆盖不重建）；只读/只写/调用计量排除——wasm 侧 fuel/epoch/StoreLimits
+  已全量（D5/D11），dylib = trusted（R1）、in-process 同地址空间无强制点；内核
+  只计量经过内核收口点的两类资源：effect 数与事件发射数。
+- **max_effects**（`BudgetConfig::max_effects`）：per-fiber 存活 effect 数上限，
+  收口在 `register_effect`（provide/accessor/on/once/on_bridge/用户 teardown 全经
+  此点；listener 注册本身即 Critical effect）。计量存活槽位而非 `len`（dispose
+  后留 `None` 洞）。breach = `budget_exceeded`（Logic 类）：激活期走既有 fail_load
+  回滚，运行期返回调用方。锁内检查 = 严格无超发。kernel 清理只 run 不 register，
+  cap 不会打断 teardown。
+- **max_event_emits**（`BudgetConfig::max_event_emits`）：per-fiber 每激活窗口
+  （`load_once` 每次 body 运行前重置，确定性锚点，拒绝计时器 rate-limit）发射数
+  上限。enforcement 在插件面 `emit`/`emit_with_policy` 入口；`emit_internal`
+  （internal/service、internal/status 等内核协议）豁免——否则插件预算可切断
+  withdrawal 协议的事件传播（`kernel_withdrawal_emissions_exempt_from_budget`
+  端到端钉死）。breach = 丢弃该次发射 + `ErrorPolicies.log`（Logic）每窗口仅
+  首次（AtomicBool 防日志风暴）；`emit_with_policy` 报告既有 `Dropped` 变体
+  （不扩枚举，日志区分原因）。并发准许 `fetch_add` 后 `prev < cap` → 有界软超发
+  ≤ 并发数-1（与 max_effects 的严格上限各自成文）。
+- **配置面与默认**：`budget.rs::BudgetConfig` 经 `ContextOptions.budgets` 注入，
+  全 None 默认 = 零行为变化且零原子操作（Option 读门控）；construction-fixed 同
+  S3/S5。root ctx（无 fiber）不计量；dylib/wasm 出站 emit 自动按插件 fiber 计量，
+  无 ABI/WIT 改动。
+- 验证锚：`tests/budgets.rs` 7 例（cap fail_load + 回滚无残留 / 精确边界 /
+  listener 覆盖 / emit 窗口丢弃 + 单条日志 / restart 重置窗口 /
+  emit_with_policy 报 Dropped / 内核豁免端到端）+ 既有全套回归 + bench_notify
+  锚点逐字节不变（b3=762）。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

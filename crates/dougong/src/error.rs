@@ -84,6 +84,16 @@ impl Error {
         )
     }
 
+    /// Creates a `budget_exceeded` error: `what` on fiber `name` crossed its
+    /// configured cap of `cap` (plugin budgets, P7).
+    #[must_use]
+    pub fn budget_exceeded(what: &str, name: &str, cap: u64) -> Self {
+        Self::new(
+            "budget_exceeded",
+            format!("{what} budget of {cap} exceeded on fiber \"{name}\""),
+        )
+    }
+
     /// Creates an "inactive dependency" error for `name`.
     #[must_use]
     pub fn inactive_dependency(name: &str) -> Self {
