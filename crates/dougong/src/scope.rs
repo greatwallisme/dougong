@@ -30,6 +30,52 @@ pub struct ScopeNode {
     pub intercept: HashMap<String, VecDeque<Value>>,
 }
 
+/// Resolution candidates for one service name, innermost precedence first.
+///
+/// A strict per-name isolation mapping yields the single isolation label;
+/// otherwise the innermost realm label (if any) is followed by the global
+/// default — at most two labels, so the fixed two-slot form (P5) never
+/// allocates on the strict-resolution read path.
+#[derive(Debug, Clone, Copy)]
+pub struct LabelCandidates {
+    labels: [u64; 2],
+    len: usize,
+}
+
+impl LabelCandidates {
+    const fn single(label: u64) -> Self {
+        Self {
+            labels: [label, 0],
+            len: 1,
+        }
+    }
+
+    const fn fallback(realm: Option<u64>) -> Self {
+        let mut candidates = Self {
+            labels: [DEFAULT_LABEL, 0],
+            len: 1,
+        };
+        if let Some(realm) = realm {
+            candidates.labels = [realm, DEFAULT_LABEL];
+            candidates.len = 2;
+        }
+        candidates
+    }
+
+    /// The innermost candidate — the label a provide from this scope lands
+    /// in.
+    #[must_use]
+    pub const fn primary(&self) -> u64 {
+        self.labels[0]
+    }
+
+    /// The candidates, innermost first.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u64] {
+        &self.labels[..self.len]
+    }
+}
+
 impl ScopeNode {
     /// Creates the root scope node.
     #[must_use]
@@ -92,29 +138,25 @@ impl ScopeNode {
     /// Resolution candidates for `name`, innermost precedence first (D15):
     /// an explicit per-name isolation mapping is strict (single candidate);
     /// otherwise the innermost realm label (if any) precedes the global
-    /// default.
+    /// default. Fixed-size (at most two labels) so the strict-resolution
+    /// read path stays allocation-free (P5).
     #[must_use]
-    pub fn label_candidates(node: Option<&Arc<Self>>, name: &str) -> Vec<u64> {
+    pub fn label_candidates(node: Option<&Arc<Self>>, name: &str) -> LabelCandidates {
         let mut cursor = node;
         while let Some(current) = cursor {
             if let Some(label) = current.isolate.get(name) {
-                return vec![*label];
+                return LabelCandidates::single(*label);
             }
             cursor = current.parent.as_ref();
         }
-        let mut candidates = Vec::new();
-        if let Some(realm) = Self::realm_label(node) {
-            candidates.push(realm);
-        }
-        candidates.push(DEFAULT_LABEL);
-        candidates
+        LabelCandidates::fallback(Self::realm_label(node))
     }
 
     /// The label a provide from this scope lands in (D15): explicit per-name
     /// isolation wins, else the realm, else the global default.
     #[must_use]
     pub fn primary_label(node: Option<&Arc<Self>>, name: &str) -> u64 {
-        Self::label_candidates(node, name)[0]
+        Self::label_candidates(node, name).primary()
     }
 
     /// Resolves the isolation label for `name`, walking outward to the root.

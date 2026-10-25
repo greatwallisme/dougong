@@ -359,9 +359,8 @@ impl DependencyIndex {
 /// the provider is inactive (strict), or the availability predicate fails.
 pub fn resolve_impl_for(ctx: &Context, dependent: &Fiber, name: &str) -> Option<ProviderSnapshot> {
     let root = &ctx.root;
-    let candidates = ScopeNode::label_candidates(Some(dependent.scope_node()), name);
-    for label in candidates {
-        let provided = root.reflect.get_impl(root, name, label, true);
+    for label in ScopeNode::label_candidates(Some(dependent.scope_node()), name).as_slice() {
+        let provided = root.reflect.get_impl(root, name, *label, true);
         if let Some(provided) = provided {
             if provided.compute.is_some() {
                 // Accessor entries commit only liveness metadata; values are
