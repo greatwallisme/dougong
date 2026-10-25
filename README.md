@@ -1,104 +1,106 @@
-# dougong（斗拱）
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-cordis 的 Rust 实现：时间可组合 × 空间可组合的通用插件基座内核。
+# dougong
 
-- **时间可组合**：每一次对环境的变更都是可逆 effect（LIFO 收集，卸载即按注册逆序回滚，teardown 由 setup 推导）
-- **空间可组合**：依赖显式声明、按可用性响应式解析——提供者晚到/先走/被替换时，消费者自动重接线
-- **插件形态**：`dylib/so` 动态库（C-ABI，可信代码）与 `wasm` 组件（沙箱，能力最小化）
-- **研究文档**：[doc/research/](doc/research/)（[cordis.md](doc/research/cordis.md) 论文全文分析、TS 版对照、生态调研、[设计决策与裁决记录](doc/research/dougong-design.md)）。
+A Rust implementation of cordis: a general-purpose plugin foundation kernel with temporal × spatial composability.
+
+- **Temporal composability**: every environmental mutation is a revertible effect (collected LIFO; unloading rolls back in reverse registration order; teardown is derived from setup)
+- **Spatial composability**: dependencies are declared explicitly and resolved reactively by availability — when a provider arrives late, leaves, or gets replaced, consumers rewire automatically
+- **Plugin forms**: `dylib/so` dynamic libraries (C-ABI, trusted code) and `wasm` components (sandboxed, capability-minimized)
+- **Research docs**: [doc/research/](doc/research/) ([cordis.md](doc/research/cordis.md) full-paper analysis, TS-version comparison, ecosystem survey, [design decisions & rulings](doc/research/dougong-design.md))
 
 ## Crates
 
-| crate | 内容 |
-|-------|------|
-| `dougong` | 组合内核：context / fiber / 依赖注入 / 可逆 effect / 响应式通知 / 事件五模式 / 反向依赖索引 |
-| `dougong-abi` | dylib 插件 C-ABI 契约（零依赖） |
-| `dougong-dylib` | dylib/so 宿主：libloading + ABI 门 + 动态通道适配 |
-| `dougong-wasm` | wasm 组件宿主：wasmtime + fuel/epoch/内存限额 + 最小 WASI |
-| `dougong-loader` | 声明式 JSON 期望态 + diff reconcile（insert/update/retire/isolate） |
-| `greeter-plugin` | dylib 插件示例（纯 C-ABI cdylib） |
-| `greeter-wasm` | wasm 插件示例（wit-bindgen，`wasm32-wasip2`） |
+| crate | contents |
+|-------|----------|
+| `dougong` | The composition kernel: context / fiber / dependency injection / revertible effects / reactive notification / the five event modes / reverse dependency index |
+| `dougong-abi` | The C-ABI contract for dylib plugins (zero dependencies) |
+| `dougong-dylib` | The dylib/so host: libloading + the ABI gate + the dynamic channel adapter |
+| `dougong-wasm` | The wasm component host: wasmtime + fuel/epoch/memory limits + a minimal WASI |
+| `dougong-loader` | Declarative JSON expected state + diff reconcile (insert/update/retire/isolate) |
+| `greeter-plugin` | Example dylib plugin (pure C-ABI cdylib) |
+| `greeter-wasm` | Example wasm plugin (wit-bindgen, `wasm32-wasip2`) |
 
-## 快速开始
+## Quick start
 
-宿主项目直接从 crates.io 引入：
+Host projects depend on the crates directly from crates.io:
 
 ```toml
 [dependencies]
-dougong = "0.3"          # 内核（进程内插件形态）
-# 按形态按需追加边界 crate：
-# dougong-dylib = "0.3"  # dylib 插件宿主
-# dougong-wasm = "0.3"   # wasm 插件宿主
-# dougong-loader = "0.3" # 声明式配置 + reconcile
+dougong = "0.3"          # kernel (in-process plugin form)
+# Add the boundary crate for each plugin form you use:
+# dougong-dylib = "0.3"  # dylib plugin host
+# dougong-wasm = "0.3"   # wasm plugin host
+# dougong-loader = "0.3" # declarative config + reconcile
 ```
 
-要求：Rust（edition 2024）；开发与验证以 `rust-toolchain.toml` 钉定的工具链为准，不另行宣称兼容下限；wasm 示例另需 `rustup target add wasm32-wasip2`。
+Requirements: Rust (edition 2024); development and verification use the toolchain pinned by `rust-toolchain.toml` — no lower compatibility bound is claimed; the wasm examples additionally need `rustup target add wasm32-wasip2`.
 
 ```sh
-# 宿主侧全量构建 + 测试
+# Full host-side build + tests
 cargo build --workspace
 cargo test --workspace
 
-# 构建 wasm guest 示例组件（greeter-wasm）
+# Build the wasm guest example component (greeter-wasm)
 cargo build -p greeter-wasm --target wasm32-wasip2
 
-# 三个机制示例（每种边界各一个）
-cargo run -p dougong-dylib  --example dylib_demo    # dylib 边界：响应式接线 + 调用 + drain
-cargo run -p dougong-wasm   --example wasm_demo     # wasm 边界：调用 + 事件 + waterfall + drain
-cargo run -p dougong-loader --example loader_demo   # 声明式配置：insert/update/retire
+# Three mechanism demos (one per boundary kind)
+cargo run -p dougong-dylib  --example dylib_demo    # dylib boundary: reactive wiring + calls + drain
+cargo run -p dougong-wasm   --example wasm_demo     # wasm boundary: calls + events + waterfall + drain
+cargo run -p dougong-loader --example loader_demo   # declarative config: insert/update/retire
 
-# 多插件组合示例（对齐 deepseek-harness 的"一切皆插件"形态）
-cargo run -p dougong-loader --example harness_demo  # 9 槽混合来源（builtin+dylib+wasm）单一文档、
-                                                    # 跨插件依赖注入、能力 seam 配置换供应商、
-                                                    # 策略 guard 经 waterfall 否决、 Failure 隔离
+# Multi-plugin composition demo (mirrors deepseek-harness's "everything is a plugin" shape)
+cargo run -p dougong-loader --example harness_demo  # 9 slots of mixed origin (builtin+dylib+wasm) in one document,
+                                                    # cross-plugin dependency injection, capability-seam config swapping,
+                                                    # policy guards vetoing via waterfall, failure isolation
 ```
 
-## 在宿主项目中用 AI 开发 dougong 插件
+## Developing dougong plugins with AI in host projects
 
-dougong 以 crate 形态被宿主项目引入（`dougong` / `dougong-dylib` / `dougong-wasm` / `dougong-loader`）。本仓库为**下游项目**的 AI 编码准备了现成技能：[`skills/dougong-plugin-dev/`](skills/dougong-plugin-dev/)。把该目录复制到宿主项目的 `.claude/skills/` 下（Claude Code 等工具会自动发现项目级技能），AI 即可按 dougong 的真实契约开发插件——形态选型、dylib 导出表与描述符、v2 CPS 事件协议、wasm 沙箱约束、验证命令与常见陷阱——而不是凭通用知识猜 API。
+dougong is consumed by host projects as crates (`dougong` / `dougong-dylib` / `dougong-wasm` / `dougong-loader`). This repository ships a ready-made skill for AI coding in **downstream projects**: [`skills/dougong-plugin-dev/`](skills/dougong-plugin-dev/). Copy that directory into the host project's `.claude/skills/` (tools like Claude Code discover project-level skills automatically) and the AI develops plugins against dougong's actual contracts — form selection, the dylib export table and descriptor, the v2 CPS event protocol, wasm sandbox constraints, verification commands, and common pitfalls — instead of guessing APIs from generic knowledge.
 
-## 插件开发工作流
+## The plugin development workflow
 
-四个动作贯穿插件的一生（可运行对照：[`crates/dougong-loader/examples/harness_demo.rs`](crates/dougong-loader/examples/harness_demo.rs) + 同目录的 [`harness.json`](crates/dougong-loader/examples/harness.json)）：
+Four actions span a plugin's life (runnable counterpart: [`crates/dougong-loader/examples/harness_demo.rs`](crates/dougong-loader/examples/harness_demo.rs) plus [`harness.json`](crates/dougong-loader/examples/harness.json) in the same directory):
 
-**1. 开发** —— 选一种形态，只写"声明 + 注册"，不写卸载逻辑：
+**1. Develop** — pick a form and write only "declarations + registrations"; no unload logic:
 
-- 进程内（最简）：`dougong::plugin("名字", 依赖列表, |ctx, 配置| ...)`，激活体里用 `ctx.provide("服务名", 值)` 注册能力；
-- dylib：cdylib crate，只依赖 `dougong-abi`，写导出表（照 `greeter-plugin`）；
-- wasm：wit-bindgen 实现 Guest trait（照 `greeter-wasm`），跑在沙箱里。
+- In-process (simplest): `dougong::plugin("name", dependency list, |ctx, config| ...)`, registering capabilities with `ctx.provide("service name", value)` inside the activation body;
+- dylib: a cdylib crate depending only on `dougong-abi`, writing the export table (see `greeter-plugin`);
+- wasm: implement the Guest trait with wit-bindgen (see `greeter-wasm`); it runs inside a sandbox.
 
-**2. 加载** —— 写一份 JSON 期望态文档（每个插件一行：名字 / 来源 `builtin`·`dylib`·`wasm` / 配置 / 隔离域，见 [`harness.json`](crates/dougong-loader/examples/harness.json)），宿主加载并收敛：
+**2. Load** — write a JSON expected-state document (one line per plugin: name / source `builtin`·`dylib`·`wasm` / config / isolate realm — see [`harness.json`](crates/dougong-loader/examples/harness.json)); the host loads and converges:
 
 ```rust
-let mut reconciler = Reconciler::new(内置插件表, wasm宿主);
+let mut reconciler = Reconciler::new(builtin plugin table, wasm host);
 reconciler.replace(Config::load_file("harness.json")?);
-reconciler.apply(&ctx).await;      // 文档里的所有插件自动启动
+reconciler.apply(&ctx).await;      // every plugin in the document starts automatically
 ```
 
-**3. 声明依赖** —— 插件用 `inject` 列出需要的服务名，其余交给内核：提供者没上线就停在 `Pending`，上线即自动激活（文档行序无关）；不声明就用会被直接拒绝（能力检查）；提供者被替换，消费者自动重接线。
+**3. Declare dependencies** — the plugin lists the service names it needs in `inject`; the kernel handles the rest: with no provider online the fiber parks in `Pending`, and activates automatically once one comes up (document row order is irrelevant); using an undeclared service is rejected outright (capability check); when a provider is replaced, consumers rewire automatically.
 
-**4. 卸载** —— 从文档里**删掉那一行**，重新 `replace` + `apply`：该插件被精确卸载，它的消费者先被 drain，注册的资源按 LIFO 自动回滚——不需要手写任何卸载代码。代码路径等价物：`handle.dispose()` / `ctx.uninstall(&插件)` / `ctx.stop()`。
+**4. Unload** — **delete that row** from the document, then `replace` + `apply` again: the plugin is unloaded precisely, its consumers drain first, and registered resources roll back automatically in LIFO order — no hand-written unload code anywhere. The code-path equivalents: `handle.dispose()` / `ctx.uninstall(&plugin)` / `ctx.stop()`.
 
-例外说明：dylib 的代码镜像进程内不卸载（换 .so 版本 = 重启进程）；其配置可随时 `handle.update(新配置)` 热更，不受影响。
+One caveat: a dylib's code image never unloads in-process (switching .so versions = restarting the process); its config can still be hot-updated at any time via `handle.update(new config)`, unaffected.
 
-## 内核一句话
+## The kernel in one sentence
 
-插件声明依赖（`inject`）并在激活体（`apply`）里只经 `ctx.effect`/`ctx.provide` 修改环境；
-依赖未就绪时 fiber 停在 `Pending`，提供者集一变即按 epoch 收敛（迁移/重激活）；
-提供者被卸载时先 drain 消费者再回滚自身 effect——顺序由 LIFO 保证。
+Plugins declare dependencies (`inject`) and mutate the environment only through `ctx.effect`/`ctx.provide` inside their activation body (`apply`);
+while dependencies are unready the fiber parks in `Pending`, and any change in the provider set converges by epoch (migration/re-activation);
+when a provider unloads, its consumers drain before its own effects roll back — LIFO guarantees the order.
 
-## 信任边界与沙箱
+## Trust boundaries and sandboxing
 
-| 形态 | 信任模型 | 边界 |
-|------|----------|------|
-| 进程内 Rust | 完全可信 | 无 |
-| `dylib/so` | 可信代码（[设计决策 D5](doc/research/dougong-design.md)：只 teardown、不卸载镜像） | C-ABI 契约 + ABI 版本门 |
-| `wasm` 组件 | 不可信 | Component Model world 即全部权威面；零能力 WASI；fuel 硬预算 + epoch 协作式让步 + `StoreLimits` 内存/实例帽 |
+| Form | Trust model | Boundary |
+|------|-------------|----------|
+| In-process Rust | Fully trusted | None |
+| `dylib/so` | Trusted code ([design decision D5](doc/research/dougong-design.md): teardown only, the image never unloads) | C-ABI contract + the ABI version gate |
+| `wasm` component | Untrusted | The Component Model world is the entire authority surface; zero-capability WASI; a hard fuel budget + cooperative epoch yielding + `StoreLimits` memory/instance caps |
 
-跨边界服务统一走动态通道（[设计决策 D6](doc/research/dougong-design.md)）：`service-key{name, abi-hash} + method(u32) + bytes`，
-消费方按声明解析、未声明即拒绝（两级解析错误，对齐 TS Algorithm 6）。
+Cross-boundary services all travel the dynamic channel ([design decision D6](doc/research/dougong-design.md)): `service-key{name, abi-hash} + method(u32) + bytes`;
+consumers resolve by declaration and undeclared use is rejected (the two-level resolution error, mirroring TS Algorithm 6).
 
-## 质量门
+## Quality gates
 
 ```sh
 cargo fmt --all --check
@@ -107,27 +109,27 @@ cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-## 版本锚
+## Version anchors
 
-- 内核/宿主：`wasmtime` 48.x（48.0.7 实证）、`wit-bindgen` 0.61.x（0.61.1 实证）、tokio、edition 2024
-- WIT 契约：`wit/dougong-plugin.wit`（package `dougong:kernel@0.1.0`）——wasm 边界的单一真源
+- Kernel/host: `wasmtime` 48.x (verified on 48.0.7), `wit-bindgen` 0.61.x (verified on 0.61.1), tokio, edition 2024
+- WIT contract: `wit/dougong-plugin.wit` (package `dougong:kernel@0.1.0`) — the single source of truth for the wasm boundary
 
-## 参考与致谢
+## References and acknowledgments
 
-dougong 站在这些开源项目的肩膀上（完整证据链见 [doc/research/study-1..4](doc/research/)）：
+dougong stands on the shoulders of these open-source projects (the full evidence chain lives in [doc/research/study-1..4](doc/research/)):
 
-| 项目 | 参考了什么 |
-|------|-----------|
-| [cordiverse/cordis](https://github.com/cordiverse/cordis)（TS 原版）与 [cordiverse/paper](https://github.com/cordiverse/paper)（arXiv:2608.25512，PKU / DeepSeek-AI） | 语义源：可逆 effect、响应式 coeffect、epoch 收敛、五事件模式；dougong 是其语义的 Rust 复现（见下节对齐程度） |
-| [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)（dsh） | "一切皆插件"的应用架构参照：capability seam、isolate realm 给会话不同能力集、事件即扩展点——见 [`harness_demo`](crates/dougong-loader/examples/harness_demo.rs) |
-| [redoop/cordis-rust](https://github.com/redoop/cordis-rust) | inverted-API 模式先例（插件侧只计算、宿主持有全部框架语义） |
-| [jincdream/cordis-rs](https://github.com/jincdream/cordis-rs) | 语义对齐清单（study-2），`kernel_semantics.rs` 的对照基准 |
-| [cordis_wasm](https://github.com/cordiverse/cordis)、[nucleus](https://github.com/meritozh/nucleus) | Component Model 路线（[设计决策 D13](doc/research/dougong-design.md) 实证）与 WASI 0.3 对照 |
-| dshbox/bayunai/helloworldtang/collab-ai-dev 等 cordis-rs 变体、tiny-cordis、spatiotemporal、cordis-verus、metis | 生态调研与设计取舍证据（study-3/4） |
+| Project | What was drawn from it |
+|---------|------------------------|
+| [cordiverse/cordis](https://github.com/cordiverse/cordis) (the TS original) and [cordiverse/paper](https://github.com/cordiverse/paper) (arXiv:2608.25512, PKU / DeepSeek-AI) | The semantic source: revertible effects, reactive coeffects, epoch convergence, the five event modes; dougong is a Rust reproduction of its semantics (see the alignment section below) |
+| [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) | The application-architecture reference for "everything is a plugin": capability seams, isolate realms giving sessions different capability sets, events as extension points — see [`harness_demo`](crates/dougong-loader/examples/harness_demo.rs) |
+| [redoop/cordis-rust](https://github.com/redoop/cordis-rust) | The inverted-API precedent (plugins only compute; the host owns all framework semantics) |
+| [jincdream/cordis-rs](https://github.com/jincdream/cordis-rs) | The semantic alignment checklist (study-2), the baseline for `kernel_semantics.rs` |
+| [cordis_wasm](https://github.com/cordiverse/cordis), [nucleus](https://github.com/meritozh/nucleus) | The Component Model route ([design decision D13](doc/research/dougong-design.md) evidence) and the WASI 0.3 comparison |
+| dshbox/bayunai/helloworldtang/collab-ai-dev and other cordis-rs variants, tiny-cordis, spatiotemporal, cordis-verus, metis | Ecosystem survey and design-tradeoff evidence (study-3/4) |
 
-## 与原版 cordis 的对齐程度
+## Alignment with the original cordis
 
-- **语义对齐（复现并有测试钉住）**：可逆 effect 与 LIFO 回滚、epoch 驱动的收敛/重激活、两级依赖解析检查（TS Algorithm 6，`inactive_dependency` vs `undeclared_dependency`）、事件五模式（`isBailed` 非空即断、waterfall 跳过 `next` 即否决、`internal/*` 递归保护）、isolate 域与 scope 遮蔽、isolate realm 的每会话能力集（D15：同一名服务的域内实例 + 全局回退）、provider 卸载先 drain 消费者、声明式期望态 reconcile（insert/update/retire/失败隔离）、插件 body panic 隔离为加载失败。验收映射：`tests/acceptance.rs`（论文 §15 场景）、`tests/kernel_semantics.rs`（上游兼容面）。
-- **dougong 特有的技术折中（原版无需面对）**：原版是 TS 架构，插件由语言运行时装载进同一进程，边界天然稳定，不需要任何 ABI。dougong 的三个形态里有两个跨越独立编译产物，而 Rust 恰恰没有跨产物的稳定 ABI——"三种形态共享一个语义契约"因此只能靠**显式定义边界契约**达成，这是折中而非加成：dylib 侧付出 C-ABI v3 契约（双向：宿主驱动 + 插件出站 require/emit）与缓冲协议/显式序列化（事件续链还得用[设计决策 D14](doc/research/dougong-design.md) 的 CPS 方案绕开"同步 C 回调无法 await"）；wasm 侧付出沙箱工程（capability-empty WASI + fuel/epoch/内存帽）；两个边界都引入每实例串行化约束。进程内形态则与原版一样，不付这些代价。
-- **有意不对齐**：Node 专属机制（prototype context、pnpm/bundle/HMR 生态）不做平移；capability 策略库属应用层（dsh 语境），不进内核；`cordis.patch.yml` 的有序分层由"整文档替换 + 响应式收敛"替代——结果只取决于最终文档，歧义靠硬拒而非层序仲裁（dougong 不需要层序；完整论证见 [doc/research/dougong-design.md](doc/research/dougong-design.md) 的设计决策 **D9**「声明式配置与 loader 的真实切分」）。
-- **文档资产来源**：[cordis.md](doc/research/cordis.md) 是第三方撰写的论文全文分析（论文本体 arXiv:2608.25512，PKU/DeepSeek-AI），获取自 [acryldev/cordis-meta-framework-spatiotemporal-composability](https://github.com/acryldev/cordis-meta-framework-spatiotemporal-composability)，存档作研究参考，非本项目作品——详见该文件内的来源标注。
+- **Semantic alignment (reproduced and pinned by tests)**: revertible effects with LIFO rollback; epoch-driven convergence/re-activation; two-level dependency resolution checks (TS Algorithm 6, `inactive_dependency` vs `undeclared_dependency`); the five event modes (`isBailed` non-null bails, skipping `next` in waterfall vetoes, `internal/*` recursion protection); isolate scopes and scope shadowing; per-session capability sets via isolate realms (D15: a realm-local instance of the same service + global fallback); provider unload draining consumers first; declarative expected-state reconcile (insert/update/retire/failure isolation); plugin body panics contained as load failures. Acceptance mapping: `tests/acceptance.rs` (paper §15 scenarios), `tests/kernel_semantics.rs` (the upstream compatibility surface).
+- **dougong-specific technical trade-offs (the original never faces these)**: the original is a TS architecture where the language runtime loads plugins into the same process — boundaries are naturally stable and no ABI is needed. Two of dougong's three forms cross independently compiled artifacts, and Rust has no stable ABI across artifacts, so "three forms sharing one semantic contract" can only be achieved by **explicitly defining the boundary contracts** — a trade-off, not a bonus: on the dylib side it costs the C-ABI v3 contract (bidirectional: host-driven + plugin outbound require/emit) plus buffer protocols and explicit serialization (event chaining also needs [design decision D14](doc/research/dougong-design.md)'s CPS scheme to route around "synchronous C callbacks cannot await"); on the wasm side it costs the sandbox engineering (capability-empty WASI + fuel/epoch/memory caps); both boundaries introduce per-instance serialization constraints. The in-process form, like the original, pays none of this.
+- **Deliberately not aligned**: Node-specific mechanisms (prototype context, the pnpm/bundle/HMR ecosystem) are not ported; the capability policy library belongs to the application layer (in the dsh context) and stays out of the kernel; the ordered layering of `cordis.patch.yml` is replaced by "whole-document replace + reactive convergence" — the outcome depends only on the final document, and ambiguity is hard-rejected rather than arbitrated by layer order (dougong needs no layer order; the full argument is [design decision D9](doc/research/dougong-design.md), "the real split between declarative config and the loader").
+- **Provenance of the document assets**: [cordis.md](doc/research/cordis.md) is a third-party-written full-paper analysis (the paper itself is arXiv:2608.25512, PKU/DeepSeek-AI), obtained from [acryldev/cordis-meta-framework-spatiotemporal-composability](https://github.com/acryldev/cordis-meta-framework-spatiotemporal-composability), archived here as a research reference and not a work of this project — see the provenance note inside that file.
