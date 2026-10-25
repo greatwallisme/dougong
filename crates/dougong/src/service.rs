@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::context::{Context, RootState};
 use crate::error::{Error, Result};
 use crate::fiber::{Fiber, FiberState, ProviderSnapshot};
+use crate::logger::{LogLevel, LogRecord};
 use crate::scope::ScopeNode;
 use crate::shard::ShardMap;
 
@@ -565,15 +566,17 @@ async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
         {
             continue;
         }
-        ctx.root.policies.log(
+        ctx.root.policies.emit(
             &*ctx.logger(),
             crate::ErrorClass::Timeout,
-            &format!(
-                "drain_timeout: consumer \"{}\" (uid {:?}) missed the {:?} drain budget",
-                fiber.name(),
-                fiber.uid_value(),
-                drain.budget,
-            ),
+            LogRecord::new(
+                LogLevel::Error,
+                "service",
+                "drain_timeout",
+                format!("consumer missed the {:?} drain budget", drain.budget),
+            )
+            .with_fiber(fiber.name(), fiber.uid_value())
+            .with_duration(drain.budget),
         );
         if drain.policy == crate::timeout::DrainPolicy::CancelConsumer {
             fiber.current_scope().cancel();

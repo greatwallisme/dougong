@@ -26,6 +26,7 @@ use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::events;
 use crate::invariant;
+use crate::logger::{LogLevel, LogRecord};
 use crate::plugin::{BoxFuture, Injection, Plugin};
 use crate::scope::ScopeNode;
 use crate::service::resolve_impl_for;
@@ -422,7 +423,12 @@ impl Fiber {
     /// Current lifecycle state: a lock-free read of the atomic mirror.
     #[must_use]
     pub fn state(&self) -> FiberState {
-        match self.state_cache.load(Ordering::Acquire) {
+        Self::mirror_state(self.state_cache.load(Ordering::Acquire))
+    }
+
+    /// Decodes one raw mirror byte into its lifecycle state.
+    const fn mirror_state(raw: u8) -> FiberState {
+        match raw {
             0 => FiberState::Pending,
             1 => FiberState::Loading,
             2 => FiberState::Active,
@@ -460,10 +466,11 @@ impl Fiber {
     }
 
     /// Republishes the derived state into the atomic mirror; also maintains
-    /// the root active set consulted by strict service resolution.
-    fn cache_state(&self) {
+    /// the root active set consulted by strict service resolution. Returns
+    /// the previous mirror value so the caller can log the transition (O1).
+    fn cache_state(&self) -> FiberState {
         let state = self.compute_state();
-        self.state_cache.store(state as u8, Ordering::Release);
+        let previous = self.state_cache.swap(state as u8, Ordering::AcqRel);
         let root = &self.ctx().root;
         if let Some(uid) = self.uid_value() {
             if state == FiberState::Active {
@@ -472,6 +479,47 @@ impl Fiber {
                 root.mark_inactive(uid);
             }
         }
+        Self::mirror_state(previous)
+    }
+
+    /// Logs one state transition at Info level (O1 structured logging).
+    ///
+    /// Lifecycle lines are not error-class records, so they bypass the S5
+    /// policy table and log ungraded; `publish_transition` skips them when
+    /// the derived state did not actually move (`cache_state` also runs on
+    /// refresh churn that leaves the state unchanged).
+    fn log_transition(&self, from: FiberState, to: FiberState) {
+        let ctx = self.ctx();
+        ctx.logger().log_record(
+            &LogRecord::new(
+                LogLevel::Info,
+                "fiber",
+                "state_transition",
+                "fiber state changed".to_string(),
+            )
+            .with_fiber(self.name(), self.uid_value())
+            .with_realm(ctx.realm_label())
+            .with_states(from, to),
+        );
+    }
+
+    /// Base record carrying this fiber's identity fields (O1 field table):
+    /// name, uid, realm. Sites add what else they know; the level is a
+    /// placeholder — `ErrorPolicies::emit` stamps the graded value over it.
+    fn base_record(&self, target: &'static str, event: &'static str, message: String) -> LogRecord {
+        LogRecord::new(LogLevel::Error, target, event, message)
+            .with_fiber(self.name(), self.uid_value())
+            .with_realm(self.ctx().realm_label())
+    }
+
+    /// Emits `internal/status` with the current snapshot, preceded by the
+    /// structured transition log when `from` differs from the new state.
+    fn publish_transition(self: &Arc<Self>, from: FiberState) {
+        let to = self.state();
+        if from != to {
+            self.log_transition(from, to);
+        }
+        self.publish_state();
     }
 
     /// Emits `internal/status` with the current snapshot.
@@ -613,29 +661,37 @@ impl Fiber {
             disposer().await;
             return;
         };
-        let fiber = self.name();
-        let uid = self.uid_value();
         let ctx = self.ctx();
         let logger = ctx.logger();
         let task = tokio::spawn(disposer());
         match tokio::time::timeout(budget, task).await {
             Ok(Ok(())) => {}
             Ok(Err(join_error)) => {
-                ctx.root.policies.log(
+                ctx.root.policies.emit(
                     &*logger,
                     crate::ErrorClass::Logic,
-                    &format!(
-                        "cleanup error: disposer \"{label}\" of fiber \"{fiber}\" (uid {uid:?}) failed: {join_error}"
-                    ),
+                    self.base_record(
+                        "fiber",
+                        "cleanup_error",
+                        format!("disposer \"{label}\" failed"),
+                    )
+                    .with_service(label.as_str())
+                    .with_cause(join_error.to_string()),
                 );
             }
             Err(_elapsed) => {
-                ctx.root.policies.log(
+                ctx.root.policies.emit(
                     &*logger,
                     crate::ErrorClass::Timeout,
-                    &format!(
-                        "cleanup_timeout: disposer \"{label}\" of fiber \"{fiber}\" (uid {uid:?}) exceeded {budget:?}; orphaned (still running in the background)"
-                    ),
+                    self.base_record(
+                        "fiber",
+                        "cleanup_timeout",
+                        format!(
+                            "disposer \"{label}\" exceeded {budget:?}; orphaned (still running in the background)"
+                        ),
+                    )
+                    .with_service(label.as_str())
+                    .with_duration(budget),
                 );
             }
         }
@@ -694,13 +750,17 @@ impl Fiber {
         }
         if !self.emit_breach_logged.swap(true, Ordering::Relaxed) {
             let ctx = self.ctx();
-            ctx.root.policies.log(
+            ctx.root.policies.emit(
                 &*ctx.logger(),
                 crate::ErrorClass::Logic,
-                &format!(
-                    "event budget of {cap} exceeded on fiber \"{}\": dropping emissions of \"{name}\" for this activation window",
-                    self.name()
-                ),
+                self.base_record(
+                    "fiber",
+                    "budget_breach",
+                    format!(
+                        "event budget of {cap} exceeded: dropping emissions for this activation window"
+                    ),
+                )
+                .with_event_name(name),
             );
         }
         false
@@ -786,9 +846,9 @@ impl Fiber {
             driver.task = Some(tokio::spawn(Self::drive_loop(Arc::clone(self))));
         }
         drop(driver);
-        self.cache_state();
+        let from = self.cache_state();
         self.bump_settle();
-        self.publish_state();
+        self.publish_transition(from);
     }
 
     /// Convergence loop: serialized transitions per fiber (decision D4).
@@ -811,9 +871,9 @@ impl Fiber {
                 // `loaded` is written only by this task and `desired` was
                 // captured under the driver lock: one atomic landing snapshot.
                 invariant::settled(&self, &loaded, &desired);
-                self.cache_state();
+                let from = self.cache_state();
                 self.bump_settle();
-                self.publish_state();
+                self.publish_transition(from);
                 return;
             }
             if loaded != EPOCH_INACTIVE {
@@ -896,9 +956,9 @@ impl Fiber {
         self.unload_effects().await;
         self.store.lock().clear();
         *self.loaded.lock() = EPOCH_INACTIVE.to_string();
-        self.cache_state();
+        let from = self.cache_state();
         self.bump_settle();
-        self.publish_state();
+        self.publish_transition(from);
         invariant::post_unload(self);
     }
 
@@ -921,15 +981,15 @@ impl Fiber {
                 () = &mut reap => break,
                 () = tokio::time::sleep(budget) => {
                     let ctx = self.ctx();
-                    ctx.root.policies.log(
+                    ctx.root.policies.emit(
                         &*ctx.logger(),
                         crate::ErrorClass::Timeout,
-                        &format!(
-                            "reap_blocked: fiber \"{}\" (uid {:?}) still waits on {} tracked task(s) after {budget:?}",
-                            self.name(),
-                            self.uid_value(),
-                            scope.task_count(),
-                        ),
+                        self.base_record(
+                            "fiber",
+                            "reap_blocked",
+                            format!("still waits on {} tracked task(s)", scope.task_count()),
+                        )
+                        .with_duration(budget),
                     );
                 }
             }
@@ -1038,12 +1098,12 @@ impl Fiber {
                 self.driver.lock().retries_used = 0;
                 // Republish state BEFORE notifying dependents: their
                 // `check_impl` consults provider liveness.
-                self.cache_state();
+                let from = self.cache_state();
                 let root = self.ctx().root;
                 let provided = root.reflect.provided_names(self.uid_value().unwrap_or(0));
                 crate::service::notify(&self.ctx(), &provided);
                 self.bump_settle();
-                self.publish_state();
+                self.publish_transition(from);
                 invariant::post_load(self, target, &committed);
                 LoadOutcome::Landed
             }
@@ -1119,14 +1179,16 @@ impl Fiber {
                     && join_error.is_panic()
                 {
                     let ctx = self.ctx();
-                    ctx.root.policies.log(
+                    ctx.root.policies.emit(
                         &*ctx.logger(),
                         crate::ErrorClass::Timeout,
-                        &format!(
-                            "apply_timeout: fiber \"{}\" (uid {:?}) body panicked while settling after its budget fired: {join_error}",
-                            self.name(),
-                            self.uid_value(),
-                        ),
+                        self.base_record(
+                            "fiber",
+                            "apply_timeout",
+                            "body panicked while settling after its budget fired".to_string(),
+                        )
+                        .with_cause(join_error.to_string())
+                        .with_duration(apply.budget),
                     );
                 }
                 BodyOutcome::TimedOut
@@ -1152,7 +1214,11 @@ impl Fiber {
 
     fn fail_load(self: &Arc<Self>, err: Error) {
         let ctx = self.ctx();
-        ctx.root.policies.log_error(&*ctx.logger(), &err);
+        ctx.root.policies.emit(
+            &*ctx.logger(),
+            err.class,
+            self.base_record("fiber", "fail_load", err.to_string()),
+        );
         self.error.lock().replace(err);
         *self.loaded.lock() = EPOCH_INACTIVE.to_string();
         // Park: the next provide/withdraw notification re-arms convergence.
@@ -1358,7 +1424,7 @@ impl Fiber {
             let _ = self.join().await;
             return;
         };
-        self.cache_state();
+        let from = self.cache_state();
         if old_uid != 0 {
             crate::registry::remove_from_runtime(self);
             let inject_names = self.inject_names();
@@ -1378,7 +1444,7 @@ impl Fiber {
         self.current_scope().cancel();
         self.request_epoch(EPOCH_INACTIVE.to_string());
         let _ = self.join().await;
-        self.publish_state();
+        self.publish_transition(from);
         invariant::post_dispose(self, old_uid);
     }
 }

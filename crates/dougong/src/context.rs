@@ -325,6 +325,21 @@ impl Context {
         ScopeNode::effective_label(Some(&self.scope), name)
     }
 
+    /// The innermost realm label on this context's scope chain (D15), or
+    /// `None` for the default label. Log records and status payloads use it
+    /// as the scope field.
+    #[must_use]
+    pub(crate) fn realm_label(&self) -> Option<u64> {
+        let mut node = Some(&self.scope);
+        while let Some(scope) = node {
+            if let Some(realm) = scope.realm {
+                return Some(realm);
+            }
+            node = scope.parent.as_ref();
+        }
+        None
+    }
+
     // ------------------------------------------------------------------
     // Fiber access
     // ------------------------------------------------------------------
@@ -364,6 +379,7 @@ impl Context {
                     let value = crate::policy::maybe_quarantine(
                         &self.root,
                         snapshot.provider_uid,
+                        name,
                         snapshot.value,
                     );
                     return value.downcast::<T>().ok();
@@ -377,11 +393,16 @@ impl Context {
         let provided = self.root.reflect.get_impl(&self.root, name, label, true)?;
         if let Some(compute) = &provided.compute {
             let computed = compute(self)?;
-            return crate::policy::maybe_quarantine(&self.root, provided.provider_uid, computed)
-                .downcast::<T>()
-                .ok();
+            return crate::policy::maybe_quarantine(
+                &self.root,
+                provided.provider_uid,
+                name,
+                computed,
+            )
+            .downcast::<T>()
+            .ok();
         }
-        crate::policy::maybe_quarantine(&self.root, provided.provider_uid, provided.value)
+        crate::policy::maybe_quarantine(&self.root, provided.provider_uid, name, provided.value)
             .downcast::<T>()
             .ok()
     }

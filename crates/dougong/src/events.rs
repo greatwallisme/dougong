@@ -30,6 +30,7 @@ use crate::cancel::CancelScope;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::fiber::{EffectGuard, Fiber};
+use crate::logger::{LogLevel, LogRecord};
 use crate::plugin::BoxFuture;
 
 /// A listener callback: receives the dispatch context, payload, and a
@@ -376,7 +377,23 @@ pub async fn run_fire_and_forget(
     let fiber = entry.fiber.clone();
     let invoke = entry.invoke(ctx.clone(), payload, null_next(), DispatchMode::Emit);
     let note = |err: &Error, react: bool| {
-        ctx.root.policies.log_error(&*ctx.logger(), err);
+        let owner = fiber.as_ref().and_then(std::sync::Weak::upgrade);
+        ctx.root.policies.emit(
+            &*ctx.logger(),
+            err.class,
+            LogRecord::new(
+                LogLevel::Error,
+                "events",
+                "listener_failure",
+                err.to_string(),
+            )
+            .with_fiber_opt(
+                owner.as_ref().map(|f| f.name()),
+                owner.as_ref().and_then(|f| f.uid_value()),
+            )
+            .with_event_name(&name)
+            .with_mode(DispatchMode::Emit),
+        );
         if react {
             crate::policy::react_to_listener_failure(&ctx, fiber.as_ref(), err);
         }

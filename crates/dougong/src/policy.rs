@@ -32,7 +32,7 @@ use crate::context::{Context, RootState};
 use crate::error::{Error, ErrorClass, Result};
 use crate::fiber::Fiber;
 use crate::invoke::{Invoke, Invoker};
-use crate::logger::{LogLevel, Logger};
+use crate::logger::{LogLevel, LogRecord, Logger};
 use crate::plugin::BoxFuture;
 
 /// What the runtime does with the fiber whose listener invocation failed.
@@ -114,14 +114,27 @@ impl ErrorPolicies {
         }
     }
 
-    /// Logs `message` at the level the policy assigns to `class`.
-    pub(crate) fn log(&self, logger: &dyn Logger, class: ErrorClass, message: &str) {
-        logger.log(self.for_class(class).log_level, "dougong", message);
+    /// Stamps the class-graded level and the class onto `record`, then
+    /// writes it through the structured face (O1). Every kernel error log
+    /// line funnels here so grading stays single-sourced.
+    pub(crate) fn emit(&self, logger: &dyn Logger, class: ErrorClass, mut record: LogRecord) {
+        record.level = self.for_class(class).log_level;
+        record.class = Some(class);
+        logger.log_record(&record);
     }
 
     /// Logs `err` at the level the policy assigns to its class.
     pub(crate) fn log_error(&self, logger: &dyn Logger, err: &Error) {
-        self.log(logger, err.class, &err.to_string());
+        self.emit(
+            logger,
+            err.class,
+            LogRecord::new(
+                self.for_class(err.class).log_level,
+                "dougong",
+                "error",
+                err.to_string(),
+            ),
+        );
     }
 }
 
@@ -167,6 +180,7 @@ pub fn react_to_listener_failure(ctx: &Context, fiber: Option<&Weak<Fiber>>, err
 struct QuarantineInvoke {
     inner: Arc<dyn Invoke>,
     provider_uid: u64,
+    service: Arc<str>,
     root: Weak<RootState>,
 }
 
@@ -175,6 +189,7 @@ impl Invoke for QuarantineInvoke {
         let inner = Arc::clone(&self.inner);
         let root = Weak::clone(&self.root);
         let provider_uid = self.provider_uid;
+        let service = Arc::clone(&self.service);
         Box::pin(async move {
             let result = inner.call(method, payload).await;
             let Err(err) = &result else { return result };
@@ -186,18 +201,23 @@ impl Invoke for QuarantineInvoke {
             };
             let fiber = root.fiber_by_uid(provider_uid);
             let Some(fiber) = fiber else { return result };
-            // Log through the root fiber's context: the wrapper holds only a
-            // weak root so the store never keeps its own root alive.
-            if let Some(root_fiber) = root.root_fiber.get() {
-                root.policies.log(
-                    &*root_fiber.ctx().logger(),
-                    ErrorClass::Transport,
-                    &format!(
-                        "provider_quarantine: disposing provider fiber \"{}\" (uid {provider_uid}) after transport-class call failure: {err}",
-                        fiber.name(),
-                    ),
-                );
-            }
+            // Log through the provider fiber's own context so the record
+            // lands in the provider realm's logger (isolation-consistent
+            // with every other kernel log line); `fiber` is a local Arc, so
+            // the weak-root wrapper never keeps the provider alive itself.
+            root.policies.emit(
+                &*fiber.ctx().logger(),
+                ErrorClass::Transport,
+                LogRecord::new(
+                    LogLevel::Error,
+                    "policy",
+                    "provider_quarantine",
+                    "disposing provider fiber after transport-class call failure".to_string(),
+                )
+                .with_fiber(fiber.name(), Some(provider_uid))
+                .with_service(&*service)
+                .with_cause(err.to_string()),
+            );
             // Detached (C7-analog): the caller's own fiber may be drained by
             // this disposal, so the disposal must not be awaited here.
             drop(tokio::spawn(async move { fiber.dispose().await }));
@@ -207,10 +227,12 @@ impl Invoke for QuarantineInvoke {
 }
 
 /// Wraps `value` in the quarantine decorator when it is an [`Invoker`] and
-/// the isolate knob is on; returns the input untouched otherwise.
+/// the isolate knob is on; returns the input untouched otherwise. `service`
+/// is the name the value is stored under, carried into quarantine records.
 pub fn maybe_quarantine(
     root: &Arc<RootState>,
     provider_uid: u64,
+    service: &str,
     value: Arc<dyn std::any::Any + Send + Sync>,
 ) -> Arc<dyn std::any::Any + Send + Sync> {
     if root.policies.provider_quarantine == ProviderQuarantine::Disabled {
@@ -222,6 +244,7 @@ pub fn maybe_quarantine(
     Arc::new(Invoker::new(Arc::new(QuarantineInvoke {
         inner: Arc::clone(&invoker.inner),
         provider_uid,
+        service: Arc::from(service),
         root: Arc::downgrade(root),
     })))
 }

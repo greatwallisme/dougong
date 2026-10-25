@@ -223,6 +223,32 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
   emit_with_policy 报 Dropped / 内核豁免端到端）+ 既有全套回归 + bench_notify
   锚点逐字节不变（b3=762）。
 
+### D24 结构化日志 = 记录面升级，logger 仍是可替换服务（O1）
+
+improve 三.1 要"结构化日志，不要只用 println"。两条路线：引入 `tracing` 依赖，或升级
+内核自有日志面。**裁决：升级自有日志面，不引依赖**（2026-10-25）。
+
+- logger 在 cordis 语义里是一个可替换/可隔离的服务（TS `LoggerService`）；内核引
+  tracing 会把 sink 决定权从宿主收走，与组合语义冲突。宿主要 tracing，覆写
+  `Logger::log_record` 一个方法桥接即可（Phase 0 裁决 OBS = 库级 API + 宿主接线的实例）。
+- `LogRecord` 十字段全表：必有 face（level/target/event 种类/message/timestamp）+
+  可选上下文（class/fiber/uid/realm/service/event_name/mode/from_state/to_state/
+  cause/duration）。`Logger::log_record` 默认实现平面降级为 `"{event}: {message}
+  (k=v …)"`——既有 log-only sink（全部存量测试、StderrLogger）零改动，needle 面保留。
+- 全部 10 个内核日志点升级为结构化记录；错误记录统一经 `ErrorPolicies::emit`
+  （分级 level + 盖 class 后走 log_record），S5 单源分级不被绕过。
+- 状态转移：`cache_state` 返回旧镜像值（swap），6 个 cache+publish 对经
+  `publish_transition(from)` 落 from→to 的 Info 日志（生命周期线非错误类，不进 S5
+  分级表），再发既有 `internal/status`。转移日志放在 publish_transition 而非
+  cache_state：cache_state 无锁，不在其中新增 store 条带锁获取（锁序纪律）。
+- 隔离记录（provider_quarantine）从"root fiber 的 logger"改为"provider fiber 自身
+  realm 的 logger"——与其余日志点的隔离语义一致；fiber 是局部 Arc，无存活期问题。
+  存量行为在无隔离场景逐字节相同（两路都解析到同一种子 stderr logger）。
+- 日志率控（限噪）不在 O1 范围，归 O6。
+- 验证：tests/logging.rs（10 用例：字段表/平面降级/转移序列/quarantine service/
+  budget_breach event_name/listener_failure mode）；bench_notify 锚点逐字节不变
+  （b3 status_events=762、service_events 245/183/244——转移只落日志不发事件）。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

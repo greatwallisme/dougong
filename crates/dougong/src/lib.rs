@@ -78,7 +78,7 @@ pub use fiber::{
     Runtime,
 };
 pub use invoke::{Invoke, Invoker};
-pub use logger::{LogLevel, Logger, LoggerHandle, StderrLogger};
+pub use logger::{LogLevel, LogRecord, Logger, LoggerHandle, StderrLogger};
 pub use plugin::{BoxFuture, Injection, Plugin, plugin};
 pub use policy::{ClassPolicy, ErrorPolicies, ListenerFailurePolicy, ProviderQuarantine};
 pub use scope::{DEFAULT_LABEL, ScopeNode};
