@@ -565,11 +565,21 @@ impl Fiber {
     }
 
     /// Emits `internal/status` with the current snapshot, preceded by the
-    /// structured transition log when `from` differs from the new state.
+    /// structured transition log and the O4 named state event when `from`
+    /// differs from the new state.
     fn publish_transition(self: &Arc<Self>, from: FiberState) {
         let to = self.state();
         if from != to {
             self.log_transition(from, to);
+            // O4 state family: "entered the state", fired only on real
+            // transitions — distinct from `internal/status`, whose snapshot
+            // semantics also fire on churn republishes.
+            let event = format!("internal/fiber.{}", to.as_str());
+            let payload = crate::events::system_event(
+                Some(self.as_ref()),
+                &[("state", Value::from(to.as_str()))],
+            );
+            events::emit_internal(&self.ctx(), &event, &payload, None);
         }
         self.publish_state();
     }
@@ -702,6 +712,24 @@ impl Fiber {
 
     /// Runs one disposer under the cleanup budget (S3).
     ///
+    /// Emits the O4 `effect.cleaned` event for a disposer that actually
+    /// finished; a timed-out orphaned disposer never fires it (the effect is
+    /// not cleaned — `cleanup_timeout` covers that arm).
+    fn emit_cleaned(&self, label: &str, ok: bool, duration: Duration) {
+        let payload = crate::events::system_event(
+            Some(self),
+            &[
+                ("label", Value::from(label)),
+                ("ok", Value::from(ok)),
+                (
+                    "duration",
+                    Value::from(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+                ),
+            ],
+        );
+        crate::events::emit_internal(&self.ctx(), "internal/effect.cleaned", &payload, None);
+    }
+
     /// Critical disposers always run inline to completion. An orphanable
     /// disposer under a configured budget runs on a detached task: on timeout
     /// the task is *not* aborted (aborting a wasm teardown would drop an
@@ -710,6 +738,7 @@ impl Fiber {
     /// finishes in the background.
     async fn run_one_disposer(&self, label: String, teardown: Teardown, disposer: Disposer) {
         let ctx = self.ctx();
+        let wall = Instant::now();
         let started = ctx.root.metrics.instant_if();
         let budget = ctx.root.timeouts.cleanup;
         let Some(budget) = budget.filter(|_| teardown == Teardown::Orphanable) else {
@@ -717,6 +746,7 @@ impl Fiber {
             if let Some(started) = started {
                 ctx.root.metrics.record(|m| &m.cleanup, started);
             }
+            self.emit_cleaned(&label, true, wall.elapsed());
             return;
         };
         let logger = ctx.logger();
@@ -726,8 +756,9 @@ impl Fiber {
             ctx.root.metrics.record(|m| &m.cleanup, started);
         }
         match outcome {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => self.emit_cleaned(&label, true, wall.elapsed()),
             Ok(Err(join_error)) => {
+                self.emit_cleaned(&label, false, wall.elapsed());
                 ctx.root.policies.emit(
                     &*logger,
                     &ctx.root.metrics,

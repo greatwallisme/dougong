@@ -302,6 +302,39 @@ fiber 构造期的 uid（独立不可变字段，永不清除），不另立计�
   失败激活全记录同 trace）；dylib/wasm 各一条 tag 映射单测。bench_notify 锚点
   逐字节不变（载荷加字段不改计数）。
 
+### D27 状态事件家族 = internal/ 命名空间 + 单一包络构造器，不建重复通道（O4）
+
+improve 三.4 要统一定义状态事件模型（fiber.created/…/disposed、
+provider.changed、service.notified、event.dispatched、effect.cleaned、
+drain.started/finished）且每个事件带一致载荷。**裁决：全部以 `internal/` 前缀
+落地；`service.notified` = 既有 `internal/service`、`event.dispatched` = 既有
+`internal/dispatch`（载荷加性对齐，不建重复通道）；`internal/status` 保留**
+（2026-10-25）。
+
+- internal/* 已是框架扩展点的纪律载体（作用域过滤、桥接禁订）；在旁边另起
+  `fiber.*` 裸名通道会把同一信息复制到两个命名空间，且热路径（notify/dispatch）
+  事件量翻倍。映射关系在模块文档与测试中钉死。
+- 新发射点 6 处：fiber.created（registry spawn，spawn invariant 通过后）；
+  fiber.<state> 六态（publish_transition，**仅真实换态**——与 status 的
+  「当前态快照」语义区分：churn 重发布不发命名态事件）；provider.changed
+  （notify 每名循环头——notify 恰是全部 provide 侧变更的唯一漏斗，S6 串行段
+  内事件生成序 == 提交序，先 changed 后 service 通知）；effect.cleaned
+  （run_one_disposer 实际完成臂；超时孤儿不发——effect 未清，cleanup_timeout
+  日志已盖）；drain.started/finished（drain_consumers_measured，仅 touched
+  非空——零 consumer 的撤下不是 drain）。
+- 一致载荷 = events::system_event 单一构造器：fiber/uid/trace/realm 四字段
+  身份包络（无 fiber 语境 = null；有则必带，trace 即 D26 字段）+ 事件 specifics
+  合入。internal/dispatch 载荷升级为同一包络 + {mode,event}（发射方 ctx 可用，
+  C7 发射侧无追踪语义不变）。
+- 成本与契约：全部走 emit_internal（无监听者按名 miss，近零成本）；status 与
+  internal/service 发射点零改动 ⇒ bench_notify 锚点（b3=762、service_events
+  245/183/244）逐字节保持。观测序仍受 C5（不承诺跨事件名观察顺序；D27 保证的
+  是生成序）。
+- 验证：tests/state_events.rs 7 用例（created+态家族+包络一致、disposed、
+  provided 双态 + 撤下 drain 对、cleaned ok=true、panic disposer ok=false——
+  预算臂走 spawn 任务 JoinError 收容、dispatch 包络带发射方 trace、日志面与
+  事件面不串）。四关 + 锚点逐字节 + 五 demo 全绿。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

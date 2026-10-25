@@ -78,6 +78,11 @@ pub fn plugin(
     // Before the cascade effect exists, so no dispose can race the checks.
     invariant::post_spawn(&child);
 
+    // O4: announce the fiber's existence once the spawn invariant accepted
+    // it; the state family covers transitions, this covers birth.
+    let payload = crate::events::system_event(Some(child.as_ref()), &[]);
+    crate::events::emit_internal(&child_ctx, "internal/fiber.created", &payload, None);
+
     // Cascade: the child's whole lifecycle is one effect of the parent
     // (paper Eq. 31). Registered synchronously; a parent that cannot host the
     // child fails the spawn, and the just-created fiber is disposed in the

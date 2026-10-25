@@ -258,10 +258,45 @@ impl EventStore {
     }
 }
 
+/// Common identity envelope for the O4 system event family (improve 三.4):
+/// the same four fields on every event, `null` when no fiber is in context.
+/// The emitting site merges its own specifics on top; `trace` is the O3
+/// fiber trace id.
+pub fn system_event(fiber: Option<&Fiber>, specifics: &[(&str, Value)]) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "fiber".to_string(),
+        fiber.map_or(Value::Null, |f| Value::String(f.name())),
+    );
+    object.insert(
+        "uid".to_string(),
+        fiber
+            .and_then(Fiber::uid_value)
+            .map_or(Value::Null, Value::from),
+    );
+    object.insert(
+        "trace".to_string(),
+        fiber.map_or(Value::Null, |f| Value::from(f.trace_id())),
+    );
+    object.insert(
+        "realm".to_string(),
+        fiber
+            .and_then(|f| f.ctx().realm_label())
+            .map_or(Value::Null, Value::from),
+    );
+    for (key, value) in specifics {
+        object.insert((*key).to_string(), value.clone());
+    }
+    Value::Object(object)
+}
+
 /// Fires `internal/dispatch` for observability, then resolves listeners.
 fn begin_dispatch(ctx: &Context, mode: &str, name: &str) -> Dispatch {
     if !name.starts_with("internal/") {
-        let payload = serde_json::json!({ "mode": mode, "event": name });
+        let payload = system_event(
+            ctx.fiber().as_deref(),
+            &[("mode", Value::from(mode)), ("event", Value::from(name))],
+        );
         crate::events::emit_internal(ctx, "internal/dispatch", &payload, None);
     }
     ctx.root.events.lock().matching(name, None)

@@ -595,6 +595,17 @@ async fn drain_consumers(ctx: &Context, touched: Vec<Arc<Fiber>>) {
 /// full drain call including every early return.
 async fn drain_consumers_measured(ctx: &Context, touched: Vec<Arc<Fiber>>) {
     let drain = ctx.root.timeouts.drain;
+    let consumers = touched.len();
+    if consumers > 0 {
+        // O4: bracket an actual drain — a withdrawal with no consumers is a
+        // no-op, not a drain.
+        let payload = crate::events::system_event(
+            ctx.fiber().as_deref(),
+            &[("consumers", Value::from(consumers))],
+        );
+        crate::events::emit_internal(ctx, "internal/drain.started", &payload, None);
+    }
+    let wall = std::time::Instant::now();
     for fiber in touched {
         let Some(drain) = drain else {
             let _ = fiber.join().await;
@@ -624,6 +635,19 @@ async fn drain_consumers_measured(ctx: &Context, touched: Vec<Arc<Fiber>>) {
         if drain.policy == crate::timeout::DrainPolicy::CancelConsumer {
             fiber.current_scope().cancel();
         }
+    }
+    if consumers > 0 {
+        let payload = crate::events::system_event(
+            ctx.fiber().as_deref(),
+            &[
+                ("consumers", Value::from(consumers)),
+                (
+                    "duration",
+                    Value::from(u64::try_from(wall.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                ),
+            ],
+        );
+        crate::events::emit_internal(ctx, "internal/drain.finished", &payload, None);
     }
 }
 
@@ -672,11 +696,23 @@ pub fn notify(ctx: &Context, names: &[String]) -> Vec<Arc<Fiber>> {
             .reflect
             .get_impl(&ctx.root, name, ctx.effective_label(name), false)
             .map(|p| p.value);
-        let payload = serde_json::json!({ "service": name, "provided": value.is_some() });
+        let provided = value.is_some();
+        // O4 provider.changed precedes the per-name notification; both share
+        // the label filter and the caller's S6 section ordering, so consumers
+        // observe change-then-notification in commit order.
+        let changed = crate::events::system_event(
+            ctx.fiber().as_deref(),
+            &[
+                ("service", Value::from(name.as_str())),
+                ("provided", Value::from(provided)),
+            ],
+        );
+        let payload = serde_json::json!({ "service": name, "provided": provided });
         // Service events are scope-filtered: listeners registered under a
         // different isolation label for this service do not receive it.
         let emitter_label = ctx.effective_label(name);
         let filter = |hook_ctx: &Context| hook_ctx.effective_label(name) == emitter_label;
+        crate::events::emit_internal(ctx, "internal/provider.changed", &changed, Some(&filter));
         crate::events::emit_internal(ctx, "internal/service", &payload, Some(&filter));
     }
     touched
