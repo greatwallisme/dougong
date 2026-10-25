@@ -393,6 +393,34 @@ O5 环与交付计数不受影响**（2026-10-25）。
   max_logged=2 时 5 错只落 2 线且类计数照记、alert_at=3 每窗口恰好一条
   alert 且原线不受限）。四关 + 锚点逐字节 + 六 demo 全绿。
 
+### D30 边界调用追踪 = invoke 缝装饰器，双方向各记一线（O7）
+
+improve 三.7 要跨边界调用可追踪：service/method/payload size/boundary type/
+duration/成败/plugin/realm/provider uid/host-guest context。**裁决：入口 =
+既有 invoke 缝装饰器扩展（S5 QuarantineInvoke → BoundaryInvoke，双开关
+复用），`ContextOptions::boundary_trace` 默认关；出口 = dylib require 桥
+单漏斗记 outbound_call 线；两方向各自携带本侧 fiber 身份（trace/realm/
+boundary tag），不跨边界透传调用方身份**（2026-10-25）。
+
+- 入站（消费方→提供方）：`maybe_quarantine` 是全部动态通道读取的唯一缠点
+  （resolve_typed 三处）；quarantine 开或 trace 开即缠——boundary_call 记录
+  = Info(ok)/S5 分级(err) + service 字段 + message 内 method/bytes/成败 +
+  duration + 提供 fiber 的 name/uid/trace/boundary tag；计数器
+  boundary_calls/boundary_call_failures 入 O2 快照。默认关 = 不缠不记，
+  严格解析路径零成本。
+- 出站（guest require）：require_impl 单漏斗（drive 前后计时）记
+  outbound_call 线，含 service#method/bytes_in/bytes_out/成败/duration/
+  cause + 本侧 trace + boundary="dylib"；走 activation ctx 的 realm logger
+  （隔离一致）。emit 出站已有 O4/D22 准入面与 S5 detail JSON（错误）。
+- 「host/guest context」释义 = boundary tag 标明穿越的边界类型 + 双方向
+  各自的本侧身份记录；调用方身份跨边界载荷透传（需 task-local 或 Invoker
+  传参，公共面语义变更）仍不做——需求字段表不含调用方，痛点（"不知道
+  具体调用链"）由双方向记录 + O3 trace join 覆盖。
+- 失败分级走 S5 emit（category=Boundary/err 类），限噪/告警规则天然适用。
+- 验证：tests/boundary_trace.rs 3 用例（默认关零记录、开则每调用一线含
+  身份/时长/计数器、失败分级 + quarantine 反应组合不回归）。四关 + 锚点
+  逐字节 + 六 demo 全绿。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。

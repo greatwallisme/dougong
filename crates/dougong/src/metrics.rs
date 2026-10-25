@@ -134,6 +134,11 @@ pub struct Metrics {
     pub logic_errors: AtomicU64,
     pub timeout_errors: AtomicU64,
     pub transport_errors: AtomicU64,
+    /// Dynamic-channel calls observed by the O7 boundary decorator (only
+    /// incremented when boundary tracing is on).
+    pub boundary_calls: AtomicU64,
+    /// Boundary calls that returned an error.
+    pub boundary_call_failures: AtomicU64,
     pub resolution: LatencyStat,
     pub update: LatencyStat,
     pub cleanup: LatencyStat,
@@ -178,6 +183,8 @@ impl Metrics {
             logic_errors: AtomicU64::new(0),
             timeout_errors: AtomicU64::new(0),
             transport_errors: AtomicU64::new(0),
+            boundary_calls: AtomicU64::new(0),
+            boundary_call_failures: AtomicU64::new(0),
             resolution: LatencyStat::default_stat(),
             update: LatencyStat::default_stat(),
             cleanup: LatencyStat::default_stat(),
@@ -325,6 +332,10 @@ pub struct MetricsSnapshot {
     pub timeout_error_count: u64,
     /// Transport-class error records since start (S5 emit site).
     pub transport_error_count: u64,
+    /// Dynamic-channel calls observed by the O7 boundary decorator.
+    pub boundary_calls: u64,
+    /// Boundary calls that returned an error.
+    pub boundary_call_failures: u64,
     /// Latency summaries; `count == 0` when instrumentation is off.
     pub resolution: LatencySummary,
     /// `Fiber::update` wall time (config round trip + convergence).

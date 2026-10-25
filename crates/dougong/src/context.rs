@@ -63,6 +63,8 @@ pub struct RootState {
     pub(crate) dispatcher: crate::event_queue::EventDispatcher,
     /// Runtime metrics (O2); counters always on, latency opt-in.
     pub(crate) metrics: crate::metrics::Metrics,
+    /// Boundary-call tracing (O7); fixed at construction.
+    pub(crate) boundary_trace: bool,
 }
 
 impl std::fmt::Debug for RootState {
@@ -175,6 +177,13 @@ pub struct ContextOptions {
     pub events: crate::event_queue::EventQueueConfig,
     /// Runtime metrics switches (O2); latency instrumentation is opt-in.
     pub metrics: crate::metrics::MetricsConfig,
+    /// Boundary-call tracing (O7): when on, every dynamic-channel
+    /// [`Invoker`](crate::Invoker) read is wrapped so each cross-boundary
+    /// call emits a `boundary_call` record (service, method, payload size,
+    /// boundary type, duration, outcome, provider identity). Default off —
+    /// the wrapper is a per-call hop, so the strict-resolution path stays
+    /// untouched.
+    pub boundary_trace: bool,
 }
 
 impl Context {
@@ -201,6 +210,7 @@ impl Context {
             policies: crate::policy::ErrorPolicies::default(),
             events: crate::event_queue::EventQueueConfig::default(),
             metrics: crate::metrics::MetricsConfig::default(),
+            boundary_trace: false,
         })
     }
 
@@ -223,6 +233,7 @@ impl Context {
             policies: options.policies,
             ordering: crate::ordering::UpdateSerializers::default(),
             metrics: crate::metrics::Metrics::new(options.metrics.latencies),
+            boundary_trace: options.boundary_trace,
             dispatcher: crate::event_queue::EventDispatcher::new(
                 options.events,
                 options.metrics.latencies,
@@ -403,6 +414,8 @@ impl Context {
         snapshot.logic_error_count = metrics.logic_errors.load(Ordering::Relaxed);
         snapshot.timeout_error_count = metrics.timeout_errors.load(Ordering::Relaxed);
         snapshot.transport_error_count = metrics.transport_errors.load(Ordering::Relaxed);
+        snapshot.boundary_calls = metrics.boundary_calls.load(Ordering::Relaxed);
+        snapshot.boundary_call_failures = metrics.boundary_call_failures.load(Ordering::Relaxed);
         snapshot.resolution = metrics.resolution.summarize();
         snapshot.update = metrics.update.summarize();
         snapshot.cleanup = metrics.cleanup.summarize();

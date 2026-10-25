@@ -348,10 +348,43 @@ fn require_impl(
     };
     // SAFETY: vtable input contract.
     let payload = unsafe { input_slice(in_data, in_len) }.to_vec();
+    let bytes_in = payload.len();
     // Steps 3-5: the reentrancy check fires at the target's entry
     // (`DylibInvoke::call`) and surfaces as the `reentrancy_cycle` code;
     // the invocation is driven on this thread.
-    match drive(&activation.rt, invoker.call(method, payload)) {
+    // O7: the outbound leg of a cross-boundary call carries the guest
+    // fiber's own identity (realm logger, trace id) and the call outcome.
+    let started = std::time::Instant::now();
+    let outcome = drive(&activation.rt, invoker.call(method, payload));
+    let duration = started.elapsed();
+    let record = match &outcome {
+        Ok(bytes) => dougong::LogRecord::new(
+            dougong::LogLevel::Info,
+            "dylib",
+            "outbound_call",
+            format!(
+                "require {service}#{method} bytes_in={bytes_in} bytes_out={} ok",
+                bytes.len()
+            ),
+        )
+        .with_service(service)
+        .with_trace(Some(activation.ctx.trace_id()))
+        .with_boundary(Some("dylib"))
+        .with_duration(duration),
+        Err(err) => dougong::LogRecord::new(
+            dougong::LogLevel::Error,
+            "dylib",
+            "outbound_call",
+            format!("require {service}#{method} bytes_in={bytes_in} failed"),
+        )
+        .with_service(service)
+        .with_trace(Some(activation.ctx.trace_id()))
+        .with_boundary(Some("dylib"))
+        .with_duration(duration)
+        .with_cause(err.to_string()),
+    };
+    activation.ctx.logger().log_record(&record);
+    match outcome {
         Ok(bytes) => {
             // SAFETY: caller-owned buffer protocol.
             if unsafe { write_out(&bytes, out_buf, cap, out_len) } {

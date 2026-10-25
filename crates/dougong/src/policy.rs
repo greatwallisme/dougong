@@ -274,81 +274,152 @@ pub fn react_to_listener_failure(ctx: &Context, fiber: Option<&Weak<Fiber>>, err
     });
 }
 
-/// `Invoke` decorator that quarantines the provider on a transport-class
-/// failure (S5 isolate knob). Wraps exactly once per resolution, only when
-/// [`ProviderQuarantine::DisposeOnTransportError`] is configured.
-struct QuarantineInvoke {
+/// `Invoke` decorator at the dynamic-channel seam (S5 + O7): quarantines
+/// the provider on a transport-class failure when configured, and emits a
+/// `boundary_call` record per call when boundary tracing (O7) is on —
+/// service, method, payload size, boundary type, duration, outcome, and the
+/// provider identity. Wraps exactly once per resolution.
+struct BoundaryInvoke {
     inner: Arc<dyn Invoke>,
     provider_uid: u64,
     service: Arc<str>,
+    quarantine: bool,
     root: Weak<RootState>,
 }
 
-impl Invoke for QuarantineInvoke {
+impl Invoke for BoundaryInvoke {
     fn call(&self, method: u32, payload: Vec<u8>) -> BoxFuture<Result<Vec<u8>>> {
         let inner = Arc::clone(&self.inner);
         let root = Weak::clone(&self.root);
         let provider_uid = self.provider_uid;
         let service = Arc::clone(&self.service);
+        let quarantine = self.quarantine;
+        let bytes = payload.len();
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let result = inner.call(method, payload).await;
-            let Err(err) = &result else { return result };
-            if err.class != ErrorClass::Transport {
-                return result;
-            }
             let Some(root) = root.upgrade() else {
                 return result;
             };
+            root.metrics
+                .boundary_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let fiber = root.fiber_by_uid(provider_uid);
-            let Some(fiber) = fiber else { return result };
             // Log through the provider fiber's own context so the record
             // lands in the provider realm's logger (isolation-consistent
             // with every other kernel log line); `fiber` is a local Arc, so
             // the weak-root wrapper never keeps the provider alive itself.
-            root.policies.emit(
-                &*fiber.ctx().logger(),
-                &root.metrics,
-                ErrorClass::Transport,
-                ErrorCategory::of(err.class, err.code),
-                LogRecord::new(
-                    LogLevel::Error,
-                    "policy",
-                    "provider_quarantine",
-                    "disposing provider fiber after transport-class call failure".to_string(),
-                )
-                .with_fiber(fiber.name(), Some(provider_uid))
-                .with_trace(Some(fiber.trace_id()))
-                .with_boundary(fiber.boundary_tag())
-                .with_service(&*service)
-                .with_cause(err.to_string()),
+            let (logger, name, trace, boundary) = fiber.as_ref().map_or_else(
+                || {
+                    (
+                        Arc::new(crate::logger::StderrLogger) as Arc<dyn Logger>,
+                        None,
+                        None,
+                        None,
+                    )
+                },
+                |fiber| {
+                    (
+                        fiber.ctx().logger(),
+                        Some(fiber.name()),
+                        Some(fiber.trace_id()),
+                        fiber.boundary_tag(),
+                    )
+                },
             );
-            // Detached (C7-analog): the caller's own fiber may be drained by
-            // this disposal, so the disposal must not be awaited here.
-            drop(tokio::spawn(async move { fiber.dispose().await }));
+            let duration = started.elapsed();
+            match &result {
+                Ok(_) => logger.log_record(
+                    &LogRecord::new(
+                        LogLevel::Info,
+                        "boundary",
+                        "boundary_call",
+                        format!("call {service}#{method} bytes={bytes} ok"),
+                    )
+                    .with_fiber_opt(name, Some(provider_uid))
+                    .with_trace(trace)
+                    .with_boundary(boundary)
+                    .with_service(&*service)
+                    .with_duration(duration),
+                ),
+                Err(err) => {
+                    root.metrics
+                        .boundary_call_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    root.policies.emit(
+                        &*logger,
+                        &root.metrics,
+                        err.class,
+                        ErrorCategory::of(err.class, err.code),
+                        LogRecord::new(
+                            LogLevel::Error,
+                            "boundary",
+                            "boundary_call",
+                            format!("call {service}#{method} bytes={bytes} failed"),
+                        )
+                        .with_fiber_opt(name, Some(provider_uid))
+                        .with_trace(trace)
+                        .with_boundary(boundary)
+                        .with_service(&*service)
+                        .with_duration(duration)
+                        .with_cause(err.to_string()),
+                    );
+                }
+            }
+            if quarantine {
+                let Err(err) = &result else { return result };
+                if err.class != ErrorClass::Transport {
+                    return result;
+                }
+                let Some(fiber) = fiber else { return result };
+                root.policies.emit(
+                    &*fiber.ctx().logger(),
+                    &root.metrics,
+                    ErrorClass::Transport,
+                    ErrorCategory::of(err.class, err.code),
+                    LogRecord::new(
+                        LogLevel::Error,
+                        "policy",
+                        "provider_quarantine",
+                        "disposing provider fiber after transport-class call failure".to_string(),
+                    )
+                    .with_fiber(fiber.name(), Some(provider_uid))
+                    .with_trace(Some(fiber.trace_id()))
+                    .with_boundary(fiber.boundary_tag())
+                    .with_service(&*service)
+                    .with_cause(err.to_string()),
+                );
+                // Detached (C7-analog): the caller's own fiber may be drained
+                // by this disposal, so the disposal must not be awaited here.
+                drop(tokio::spawn(async move { fiber.dispose().await }));
+            }
             result
         })
     }
 }
 
-/// Wraps `value` in the quarantine decorator when it is an [`Invoker`] and
-/// the isolate knob is on; returns the input untouched otherwise. `service`
-/// is the name the value is stored under, carried into quarantine records.
+/// Wraps `value` in the boundary decorator when it is an [`Invoker`] and
+/// either the S5 isolate knob or O7 boundary tracing is on; returns the
+/// input untouched otherwise. `service` is the name the value is stored
+/// under, carried into the boundary and quarantine records.
 pub fn maybe_quarantine(
     root: &Arc<RootState>,
     provider_uid: u64,
     service: &str,
     value: Arc<dyn std::any::Any + Send + Sync>,
 ) -> Arc<dyn std::any::Any + Send + Sync> {
-    if root.policies.provider_quarantine == ProviderQuarantine::Disabled {
+    let quarantine = root.policies.provider_quarantine != ProviderQuarantine::Disabled;
+    if !quarantine && !root.boundary_trace {
         return value;
     }
     let Ok(invoker) = Arc::clone(&value).downcast::<Invoker>() else {
         return value;
     };
-    Arc::new(Invoker::new(Arc::new(QuarantineInvoke {
+    Arc::new(Invoker::new(Arc::new(BoundaryInvoke {
         inner: Arc::clone(&invoker.inner),
         provider_uid,
         service: Arc::from(service),
+        quarantine,
         root: Arc::downgrade(root),
     })))
 }
