@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 dougong (斗拱) is a Rust implementation of the cordis composition kernel: time composability (every environmental mutation is a revertible effect, undone LIFO) meets spatial composability (declared dependencies resolve reactively as providers come and go). Plugins come in three forms sharing one semantic: in-process Rust (`dougong::Plugin`), dylib/so via C-ABI (trusted code), and wasm components (sandboxed).
 
-`doc/research/` is the semantic source of truth: `cordis.md` (the paper), `study-1..4` (evidence), `dougong-design.md` (decisions D4–D15 plus user rulings R1–R4). When changing behavior that a D-decision governs, update its landing record there.
+`doc/research/` is the semantic source of truth: `cordis.md` (the paper), `study-1..4` (evidence), `dougong-design.md` (decisions D4–D30 plus user rulings R1–R4 and the ABI v3 rulings D-V3-1/3/4/5). When changing behavior that a D-decision governs, update its landing record there.
 
 ## Commands
 
@@ -29,6 +29,7 @@ cargo run -p dougong-dylib  --example outbound_demo # ABI v3 outbound arms; same
 cargo run -p dougong-wasm   --example wasm_demo     # needs the wasm32-wasip2 guest artifact
 cargo run -p dougong-loader --example loader_demo   # needs the dylib artifact
 cargo run -p dougong-loader --example harness_demo  # multi-plugin composition: needs the dylib artifact + wasip2 guest
+cargo run -p dougong        --example health_demo    # health snapshot body composition (host wiring demo)
 ```
 
 The toolchain is pinned patch-level in `rust-toolchain.toml` (1.99.1) because clippy/rustdoc lints drift between releases. No MSRV is declared or claimed anywhere in the manifests - the pinned toolchain is the only verified one (ruling R4). rustup auto-installs the pinned toolchain and targets on first entry.

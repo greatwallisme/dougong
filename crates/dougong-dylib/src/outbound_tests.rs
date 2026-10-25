@@ -10,8 +10,8 @@
 //! Every test builds its own `Context` root, so parallel test threads share
 //! nothing but the stateless static tables.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use dougong::{Context, Error, FiberHandle, Injection, Invoker, Plugin, Result};
@@ -113,13 +113,20 @@ const CONSUMER_REQUIRE_THREAD_NAMED: u32 = 2;
 const CONSUMER_REQUIRE_THREAD_SLOW: u32 = 3;
 const CONSUMER_REQUIRE_CYCLE: u32 = 4;
 const CONSUMER_SETUP_RESULT: u32 = 5;
-const CONSUMER_STATE_ADDR: u32 = 6;
+const CONSUMER_ACTIVATION: u32 = 6;
 const CONSUMER_SPAWN_HAMMER: u32 = 8;
+
+static CONSUMER_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 
 struct ConsumerState {
     host: HostExports,
     /// Result of the require issued *during* `setup` (E1.10 probe).
     setup_probe: (i32, Vec<u8>),
+    /// Identity of this activation: a monotonic setup token. An address
+    /// would not do — the allocator may legally reuse the freed state's
+    /// address for the next activation, which made a pointer comparison
+    /// flaky.
+    activation: u64,
 }
 
 unsafe extern "C" fn consumer_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
@@ -156,7 +163,15 @@ unsafe extern "C" fn consumer_setup(host: *const HostExports) -> *mut std::ffi::
     let host = unsafe { *host };
     // E1.10 probe: require a committed provider during setup (G5/B5).
     let setup_probe = plugin_require(&host, b"svc-b", 0, b"setup-probe");
-    Box::into_raw(Box::new(ConsumerState { host, setup_probe })).cast::<std::ffi::c_void>()
+    // Monotonic per-activation token: unique per setup run (Relaxed is
+    // sufficient — uniqueness only, no ordering consumers).
+    let activation = CONSUMER_ACTIVATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    Box::into_raw(Box::new(ConsumerState {
+        host,
+        setup_probe,
+        activation,
+    }))
+    .cast::<std::ffi::c_void>()
 }
 
 unsafe extern "C" fn consumer_call(
@@ -207,10 +222,13 @@ unsafe extern "C" fn consumer_call(
             let (status, reply) = &state.setup_probe;
             pack(*status, reply, out, cap, out_len)
         }
-        CONSUMER_STATE_ADDR => {
-            let addr = format!("{state:p}");
-            pack(0, addr.as_bytes(), out, cap, out_len)
-        }
+        CONSUMER_ACTIVATION => pack(
+            0,
+            state.activation.to_le_bytes().as_slice(),
+            out,
+            cap,
+            out_len,
+        ),
         CONSUMER_SPAWN_HAMMER => {
             // Four plugin-owned threads concurrently requiring the slow
             // target method: the target's per-instance lock must serialize
@@ -1078,7 +1096,7 @@ async fn reactivation_rebuilds_vtable_and_setup_require_worked() {
     let probe_text = String::from_utf8(probe_payload).expect("utf8 probe");
     assert!(probe_text.ends_with(":setup-probe"));
 
-    let (_, first_addr) = call_framed(&ctx, "svc-a", CONSUMER_STATE_ADDR, b"").await;
+    let (_, first_activation) = call_framed(&ctx, "svc-a", CONSUMER_ACTIVATION, b"").await;
 
     // Withdraw the provider: the consumer drains (teardown emits its event),
     // then parks.
@@ -1097,8 +1115,11 @@ async fn reactivation_rebuilds_vtable_and_setup_require_worked() {
         .expect("consumer settles")
         .expect("consumer re-activated");
 
-    let (_, second_addr) = call_framed(&ctx, "svc-a", CONSUMER_STATE_ADDR, b"").await;
-    assert_ne!(first_addr, second_addr, "new activation, new handle");
+    let (_, second_activation) = call_framed(&ctx, "svc-a", CONSUMER_ACTIVATION, b"").await;
+    assert_ne!(
+        first_activation, second_activation,
+        "new activation, new setup token"
+    );
     let (probe_status, probe_payload) =
         call_framed(&ctx, "svc-a", CONSUMER_SETUP_RESULT, b"").await;
     assert_eq!(probe_status, STATUS_OK, "new vtable usable from new setup");
@@ -1156,4 +1177,312 @@ async fn teardown_waits_for_in_flight_calls() {
 fn dynplugin_declares_the_dylib_boundary_tag() {
     let plugin = from_static(&TARGET_TABLE).expect("adapter from static table");
     assert_eq!(Plugin::boundary_tag(&plugin), Some("dylib"));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-instance require cycle (D-V3-3 amendment): two dylib instances whose
+// handlers require through an in-process relay. With both instance locks
+// held, the second arming closes a wait cycle that must die as
+// `reentrancy_cycle` instead of deadlocking either call.
+// ---------------------------------------------------------------------------
+
+/// Gated handler control: the handler announces entry, parks until the gate
+/// opens, then issues its `require` through the copied vtable.
+struct RingCtl {
+    proceed: (Mutex<bool>, Condvar),
+}
+
+impl RingCtl {
+    fn new() -> Self {
+        Self {
+            proceed: (Mutex::new(false), Condvar::new()),
+        }
+    }
+
+    fn wait(&self) {
+        let (lock, gate) = &self.proceed;
+        drop(
+            gate.wait_while(lock.lock().expect("gate lock"), |open| !*open)
+                .expect("gate wait"),
+        );
+    }
+
+    fn open(&self) {
+        *self.proceed.0.lock().expect("gate lock") = true;
+        self.proceed.1.notify_all();
+    }
+}
+
+static RING1_CTL: Mutex<Option<Arc<RingCtl>>> = Mutex::new(None);
+static RING2_CTL: Mutex<Option<Arc<RingCtl>>> = Mutex::new(None);
+static RING1_HOST: Mutex<Option<SendHost>> = Mutex::new(None);
+static RING2_HOST: Mutex<Option<SendHost>> = Mutex::new(None);
+static RING1_ENTERED: AtomicBool = AtomicBool::new(false);
+static RING2_ENTERED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn ring1_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe { write_out(b"ring1", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring1_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"ring1","provide":["svc-ring1"],"inject":["svc-bridge"]}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring2_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe { write_out(b"ring2", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring2_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"ring2","provide":["svc-ring2"],"inject":["svc-bridge"]}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn ring1_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+    // SAFETY: the vtable contract hands `host` to `setup` exactly once; the
+    // copy outlives the activation in the test's static slot.
+    *RING1_HOST.lock().expect("ring1 host slot") = Some(SendHost(unsafe { *host }));
+    Box::into_raw(Box::new(0_u8)).cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn ring2_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+    // SAFETY: as `ring1_setup`.
+    *RING2_HOST.lock().expect("ring2 host slot") = Some(SendHost(unsafe { *host }));
+    Box::into_raw(Box::new(0_u8)).cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn ring_teardown(handle: *mut std::ffi::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: the byte was allocated by the ring's `setup` for this
+    // activation; teardown runs exactly once per successful setup.
+    drop(unsafe { Box::from_raw(handle.cast::<u8>()) });
+}
+
+/// Gated ring handler: announce entry, wait for the gate, require through
+/// the relay (`svc-bridge`), and frame the require outcome back. Reruns
+/// (the unwinding cycle re-entering an unguarded instance) pass through the
+/// same way, since each gate opens exactly once.
+unsafe extern "C" fn ring1_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _data: *const u8,
+    _len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    let host = RING1_HOST
+        .lock()
+        .expect("ring1 host slot")
+        .as_ref()
+        .expect("ring1 vtable copied at setup")
+        .0;
+    // Clone the handle and drop the slot guard: the guard must not stay
+    // held across the gate wait or the require (the test's wait_until and
+    // gate-open sections take the same ctl mutex).
+    let ctl = Arc::clone(
+        RING1_CTL
+            .lock()
+            .expect("ring1 ctl slot")
+            .as_ref()
+            .expect("ring1 ctl armed by the test"),
+    );
+    RING1_ENTERED.store(true, Ordering::SeqCst);
+    ctl.wait();
+    let (status, reply) = plugin_require(&host, b"svc-bridge", 0, b"ring1");
+    pack(status, &reply, out, cap, out_len)
+}
+
+unsafe extern "C" fn ring2_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _data: *const u8,
+    _len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    let host = RING2_HOST
+        .lock()
+        .expect("ring2 host slot")
+        .as_ref()
+        .expect("ring2 vtable copied at setup")
+        .0;
+    // As ring1_call: no guard stays held across the wait or the require.
+    let ctl = Arc::clone(
+        RING2_CTL
+            .lock()
+            .expect("ring2 ctl slot")
+            .as_ref()
+            .expect("ring2 ctl armed by the test"),
+    );
+    RING2_ENTERED.store(true, Ordering::SeqCst);
+    ctl.wait();
+    let (status, reply) = plugin_require(&host, b"svc-bridge", 1, b"ring2");
+    pack(status, &reply, out, cap, out_len)
+}
+
+static RING1_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: ring1_name,
+    descriptor: ring1_descriptor,
+    setup: ring1_setup,
+    call: ring1_call,
+    on_event: consumer_on_event,
+    on_next: consumer_on_next,
+    teardown: ring_teardown,
+};
+
+static RING2_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: ring2_name,
+    descriptor: ring2_descriptor,
+    setup: ring2_setup,
+    call: ring2_call,
+    on_event: consumer_on_event,
+    on_next: consumer_on_next,
+    teardown: ring_teardown,
+};
+
+/// In-process relay: method 0 calls `svc-ring2`, method 1 calls `svc-ring1`.
+struct BridgeSvc {
+    ctx: Context,
+}
+
+impl dougong::Invoke for BridgeSvc {
+    fn call(&self, method: u32, payload: Vec<u8>) -> dougong::BoxFuture<Result<Vec<u8>>> {
+        let target = if method == 0 {
+            "svc-ring2"
+        } else {
+            "svc-ring1"
+        };
+        let Some(invoker) = self.ctx.get::<Invoker>(target) else {
+            return Box::pin(async move { Err(Error::msg(format!("{target} missing"))) });
+        };
+        invoker.call(0, payload)
+    }
+}
+
+// The amendment's acceptance arm: ring1 and ring2 park inside their gated
+// exports holding their instance locks; the requires through the relay then
+// form the wait cycle ring1 -> ring2 -> ring1. The thread completing the
+// cycle must receive a deterministic `reentrancy_cycle` (never a deadlock),
+// and the wait graph must be edge-free once the calls unwind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_instance_require_cycle_dies_as_reentrancy() {
+    let ctx = Context::new();
+    // The relay first: both rings inject svc-bridge.
+    let bridge = dougong::plugin("bridge", vec![], |ctx, _config| {
+        Box::pin(async move {
+            let svc = BridgeSvc { ctx: ctx.clone() };
+            ctx.provide("svc-bridge", Invoker::new(Arc::new(svc)))
+                .await?;
+            Ok(())
+        })
+    });
+    start(&ctx, bridge).await;
+    *RING1_CTL.lock().expect("ring1 ctl slot") = Some(Arc::new(RingCtl::new()));
+    let ring1: Arc<dyn Plugin> = Arc::new(from_static(&RING1_TABLE).expect("ring1 table"));
+    start(&ctx, ring1).await;
+    *RING2_CTL.lock().expect("ring2 ctl slot") = Some(Arc::new(RingCtl::new()));
+    let ring2: Arc<dyn Plugin> = Arc::new(from_static(&RING2_TABLE).expect("ring2 table"));
+    start(&ctx, ring2).await;
+
+    let task1 = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { call_framed(&ctx, "svc-ring1", 0, b"ping").await }
+    });
+    assert!(
+        wait_until(|| RING1_ENTERED.load(Ordering::SeqCst)).await,
+        "ring1 handler entered"
+    );
+    let task2 = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { call_framed(&ctx, "svc-ring2", 0, b"ping").await }
+    });
+    assert!(
+        wait_until(|| RING2_ENTERED.load(Ordering::SeqCst)).await,
+        "ring2 handler entered"
+    );
+
+    // Both handlers hold their instance lock inside the gated export. Gate 1
+    // sends ring1's require through the relay at ring2: it parks on ring2's
+    // lock (still held by the gated ring2 handler). Gate 2 then sends
+    // ring2's require at ring1 — arming that wait closes the cycle, which
+    // must surface deterministically on this thread instead of parking.
+    RING1_CTL
+        .lock()
+        .expect("ring1 ctl slot")
+        .as_ref()
+        .expect("ring1 ctl armed")
+        .open();
+    RING2_CTL
+        .lock()
+        .expect("ring2 ctl slot")
+        .as_ref()
+        .expect("ring2 ctl armed")
+        .open();
+
+    let (status1, payload1) = tokio::time::timeout(Duration::from_secs(5), task1)
+        .await
+        .expect("ring1 call settles (no deadlock)")
+        .expect("ring1 task join");
+    let (status2, payload2) = tokio::time::timeout(Duration::from_secs(5), task2)
+        .await
+        .expect("ring2 call settles (no deadlock)")
+        .expect("ring2 task join");
+    // Exactly one arming closes the cycle: that thread gets the direct
+    // reentrancy status. The loser's parked leg unwinds through the relay,
+    // which carries the inner framing as opaque bytes — its top-level
+    // status stays OK with the nested detail inside the payload.
+    let mut statuses = [status1, status2];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [STATUS_REENTRANCY, STATUS_OK]);
+    for (status, payload) in [(&status1, &payload1), (&status2, &payload2)] {
+        let detail: Value = if *status == STATUS_REENTRANCY {
+            serde_json::from_slice(payload).expect("framed detail")
+        } else {
+            serde_json::from_slice(&payload[4..]).expect("nested framed detail")
+        };
+        assert_eq!(detail["code"], "reentrancy_cycle");
+    }
+    // The unwound cycle leaves no wait edges behind.
+    assert!(
+        wait_until(super::wait_edges_empty).await,
+        "wait edges must drain after the cycle unwinds"
+    );
 }

@@ -705,10 +705,14 @@ pub fn notify(ctx: &Context, names: &[String]) -> Vec<Arc<Fiber>> {
         }
     }
     for name in names {
+        // The payload reports the emitter's own slot: `primary_label` is the
+        // resolution head for this scope (realm label, per-name isolation, or
+        // the global default) — the label `provide` committed into.
+        let slot_label = ScopeNode::primary_label(Some(&ctx.scope), name);
         let value = ctx
             .root
             .reflect
-            .get_impl(&ctx.root, name, ctx.effective_label(name), false)
+            .get_impl(&ctx.root, name, slot_label, false)
             .map(|p| p.value);
         let provided = value.is_some();
         // O4 provider.changed precedes the per-name notification; both share
@@ -722,10 +726,19 @@ pub fn notify(ctx: &Context, names: &[String]) -> Vec<Arc<Fiber>> {
             ],
         );
         let payload = serde_json::json!({ "service": name, "provided": provided });
-        // Service events are scope-filtered: listeners registered under a
-        // different isolation label for this service do not receive it.
-        let emitter_label = ctx.effective_label(name);
-        let filter = |hook_ctx: &Context| hook_ctx.effective_label(name) == emitter_label;
+        // Service events are scope-filtered: a hook receives the notification
+        // only when the emitter's slot sits in the hook's D15 candidate set
+        // (`label_candidates` mirrors `resolve_impl_for`), so a listener that
+        // could not resolve this implementation is not notified. Comparing
+        // candidate membership instead of the effective label keeps realm
+        // providers visible to members whose per-name isolation pins the
+        // realm label — a strict equality missed that case because the
+        // effective label of a realm scope falls back to the global default.
+        let filter = |hook_ctx: &Context| {
+            ScopeNode::label_candidates(Some(&hook_ctx.scope), name)
+                .as_slice()
+                .contains(&slot_label)
+        };
         crate::events::emit_internal(ctx, "internal/provider.changed", &changed, Some(&filter));
         crate::events::emit_internal(ctx, "internal/service", &payload, Some(&filter));
     }

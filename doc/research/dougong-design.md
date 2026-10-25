@@ -111,6 +111,7 @@ cordis_wasm@127e1dd 路线（wasmtime 48 实证）；WIT 级 `async func`（nucl
 
 - **D-V3-1 vtable 传递 = a) setup 携带**：`setup(host: *const HostExports) -> *mut c_void`，`HostExports { host_handle, require, emit }` 在 setup 期间按值复制。理由：vtable 先于 setup 首指令可用，setup 期 require（G5）天然满足；ABI 版本本已必 bump，无兼容包袱；失败模式最少。
 - **D-V3-3 重入策略 = b') 同线程环检测**：thread-local 激活栈覆盖全部外来入口（setup/call/on_event/on_next/teardown，guard 不跨 await——任务迁移会破坏线程配对）；环 = 确定性 `reentrancy_cycle` 错误（`STATUS_REENTRANCY`），永不死锁。合法 service→service 链（call 处理器内 require 其他服务）放行；插件自有线程空栈出发，永不入环。否决项：a) 全禁令会禁掉 fr 侧审批→session 落账的合法链（不可用）；c) 嵌套派发独立执行体帧跳跃 + 跨执行体锁等待，复杂度最高。
+  **2026-10-25 修正裁决（用户，等待图）**：同线程栈不覆盖跨线程多实例环（A→B→C→A 各持一锁，无成员同现于单线程栈）——宿主增配跨实例等待图：执行上下文的持锁链（thread-local；waterfall 续链跨 await 的持锁由 poll 级重注维持）在每次实例锁获取时对每个已持实例加等待边，图闭合即在闭合线程报同一确定性 `reentrancy_cycle`（同码同状态码，详情含环路径 `target -> ... -> held`）；获取或取消即摘边，图恒无残留。原否决项 c) 的复杂度异议就此推翻——边表为每上下文 O(持有数) 的小图，游走出度 ≤ 1；teardown 两臂只持一锁、不成环闭合者，只推链不加边。WIT 无 wasm `require` 导入，等待图为 dylib 独有。
 - **D-V3-4 require 执行器 = 实现期基准**：基线 = `rt.enter()` + 调用线程本地自写 parker `block_on`——不依赖调用线程恰在 tokio 内（B1 定性满足）、不消耗 runtime worker、current_thread 兼容、对 future 无 Send 要求、重入栈在该路径上精确。驱动器收敛为 dougong-dylib 内部单个函数，缝后可换（备选：spawn-to-runtime + 调用线程 park oneshot）。
 - **D-V3-5 错误模型 = 状态码 + 详情载荷**：新增 `STATUS_UNDECLARED(-3)`/`INACTIVE(-4)`/`REENTRANCY(-5)`/`HOST_ERROR(-6)`/`INVALID_PAYLOAD(-7)`/`INVALID_EVENT(-8)`；任何非 OK/CAPACITY 状态可在 out buffer 携带 `{"code","message"}` JSON 详情（D20 起增 `"class"` 字段，additive），`STATUS_FAILED` 的详情 = 目标业务错误透传。与内核两级能力检查（undeclared vs inactive，TS Alg. 6）同名对齐。
 - **§5.8 推翻（附带裁决）**：事件派发队列化（bounded 队列 + worker pool + per-event-type 并发上限 + 背压 + 按事件名 opt-in 可丢弃）全量入 v0.3.0 范围；默认语义不变（不丢弃、五次序承诺照旧）。
@@ -314,6 +315,10 @@ drain.started/finished）且每个事件带一致载荷。**裁决：全部以 `
 - internal/* 已是框架扩展点的纪律载体（作用域过滤、桥接禁订）；在旁边另起
   `fiber.*` 裸名通道会把同一信息复制到两个命名空间，且热路径（notify/dispatch）
   事件量翻倍。映射关系在模块文档与测试中钉死。
+- 2026-10-25 追记：不可信 wasm 面补齐同一纪律——guest 的 `register_listener`
+  与出站 `dispatch` 拒绝 `internal/*`（`KernelError::CapabilityDenied`），与
+  桥禁订、dylib 出站禁发（`STATUS_INVALID_EVENT`）同构；in-process 信任界内
+  的 internal/* 监听（`internal/update` 可否决、`internal/config` 链）不变。
 - 新发射点 6 处：fiber.created（registry spawn，spawn invariant 通过后）；
   fiber.<state> 六态（publish_transition，**仅真实换态**——与 status 的
   「当前态快照」语义区分：churn 重发布不发命名态事件）；provider.changed
@@ -458,7 +463,7 @@ dougong = 内核（约 3k 行级）+ ABI 契约与 dylib 宿主（数百行级�
 | require 载荷 | 类型化键（`Any` 下转）与动态通道字节并存 | 仅动态通道字节，对宿主不透明（编码归服务契约） | B6 |
 | emit 载荷 | `serde_json::Value` | 必须合法 JSON 字节，非法 = `STATUS_INVALID_PAYLOAD` | C2（显式非对称） |
 | `internal/*` 事件 | 桥禁订（`on_dispatch` 拒绝） | 出站禁发（`STATUS_INVALID_EVENT`） | C3 |
-| 重入行为 | 每 fiber 单驱动循环，同 fiber 无锁可环 | 同线程激活栈；环 = 确定性 `reentrancy_cycle` 错误 | B4 / D-V3-3 |
+| 重入行为 | 每 fiber 单驱动循环，同 fiber 无锁可环 | 同线程激活栈 + 跨实例等待图；同线程或跨实例环 = 确定性 `reentrancy_cycle` 错误 | B4 / D-V3-3（2026-10-25 修正） |
 | teardown 后在途派发 | 监听方集随其 fiber 回滚自然收缩 | 发射方 teardown 不撤销已入队派发（内核任务独立于发射方寿命完成） | C7 |
 | 监听方卸载时在途调用 | in-process 监听器在 yield 点中止（cancel scope） | 桥调用只跟踪不中止，卸载等其完成（wasm store 禁弃在途 `call_async`；dylib 续链持实例锁，teardown 取锁本就隐式等待） | D17 / S2；C7 发射方语义不变 |
 | require 执行器 | fiber 任务上 await | 调用线程本地 `block_on`（`rt.enter` 供 tokio 上下文） | D-V3-4 |

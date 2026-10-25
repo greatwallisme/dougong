@@ -746,20 +746,25 @@ impl Context {
     }
 
     /// Disposes every running plugin fiber, newest registration first.
+    ///
+    /// uids are monotonic, so descending uid order is the registration order
+    /// reversed — the per-runtime reversal alone would inherit the registry
+    /// map's arbitrary iteration order across runtimes.
     pub async fn stop(&self) {
-        let fibers: Vec<Arc<Fiber>> = {
+        let mut fibers: Vec<(u64, Arc<Fiber>)> = {
             let registry = self.root.registry.lock();
             let mut fibers = Vec::new();
             for runtime in registry.values() {
                 let guards = runtime.fibers.lock();
-                for fiber in guards.iter().rev().filter_map(Weak::upgrade) {
-                    fibers.push(fiber);
+                for fiber in guards.iter().filter_map(Weak::upgrade) {
+                    fibers.push((fiber.uid_value().unwrap_or(0), fiber));
                 }
             }
             drop(registry);
             fibers
         };
-        for fiber in fibers {
+        fibers.sort_unstable_by_key(|(uid, _)| std::cmp::Reverse(*uid));
+        for (_, fiber) in fibers {
             fiber.dispose().await;
         }
     }

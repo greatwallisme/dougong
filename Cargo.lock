@@ -429,6 +429,7 @@ dependencies = [
  "dougong-abi",
  "greeter-plugin",
  "libloading",
+ "parking_lot",
  "serde_json",
  "tokio",
 ]

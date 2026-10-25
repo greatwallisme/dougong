@@ -137,7 +137,10 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   (`reentrancy_cycle` in the JSON detail) instead of deadlocking - restructure
   the chain (a plugin-owned thread starts with an empty stack and never
   cycles; only foreign entries - setup/call/on_event/on_next/teardown - push
-  frames).
+  frames). Cross-instance cycles are equally deterministic (2026-10-25
+  amendment): a require chain whose wait cycle spans threads or instances
+  fails the same way on the thread completing the cycle - break the cycle or
+  route the leg through a plugin-owned thread / in-process relay.
 - Dylib `emit` payload must be **valid JSON bytes** and the event name must
   not use the `internal/*` prefix - violations fail with
   `STATUS_INVALID_PAYLOAD` / `STATUS_INVALID_EVENT`.

@@ -26,6 +26,14 @@
 //! instance already executing on the calling thread fails deterministically
 //! with `reentrancy_cycle` instead of deadlocking the per-instance lock.
 //!
+//! Since the 2026-10-25 amendment of D-V3-3 the same guarantee covers
+//! cross-instance require chains: a held instance lock is visible to the
+//! whole nested require chain, parking on a foreign instance lock arms a
+//! wait-for edge from every held instance, and a chain whose wait edges
+//! close a cycle fails with `reentrancy_cycle` on the thread that would
+//! complete it. The per-instance lock can therefore never deadlock, no
+//! matter which threads hold which instances.
+//!
 //! # Event surface (ABI v2, design decision D14)
 //!
 //! The descriptor declares `listen` as an object mapping event names to u32
@@ -50,8 +58,10 @@
 //! plugin's `teardown`. Never unmap a library whose handles or disposers may
 //! still run.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Poll, Wake, Waker};
 
@@ -63,8 +73,9 @@ use dougong_abi::{
     write_out,
 };
 use libloading::Library;
+use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 /// Serializes every foreign call into one plugin instance (see the crate
 /// documentation: cross-fiber callers are not ordered by the kernel).
@@ -112,6 +123,196 @@ impl Drop for EntryGuard {
             let popped = stack.borrow_mut().pop();
             debug_assert_eq!(popped, Some(self.0), "entry stack pairing broken");
         });
+    }
+}
+
+std::thread_local! {
+    /// Instances whose per-instance locks the current execution context holds
+    /// right now, outermost first. This is the held side of the cross-instance
+    /// reentrancy policy (D-V3-3, 2026-10-25 amendment): a foreign entry pushes
+    /// its instance after acquiring the lock, a nested `require` arms a wait
+    /// edge from every held instance, and a closed wait cycle fails
+    /// deterministically instead of deadlocking. Guards never span `.await`
+    /// points; the one lock hold that does — a deferred waterfall continuation —
+    /// re-establishes its chain through [`ChainPoll`] on every poll instead.
+    static LOCK_CHAIN: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Snapshot of the instance locks held by the current execution context.
+fn chain_held() -> Vec<u64> {
+    LOCK_CHAIN.with(|chain| chain.borrow().clone())
+}
+
+/// RAII guard: pushes `id` on creation, pops it on drop. Like
+/// [`EntryGuard`], it must never span an `.await` — task migration breaks
+/// the thread-local push/pop pairing; [`ChainPoll`] carries the chain across
+/// the one await-spanning lock hold instead.
+struct ChainGuard(u64);
+
+impl ChainGuard {
+    fn hold(id: u64) -> Self {
+        LOCK_CHAIN.with(|chain| chain.borrow_mut().push(id));
+        Self(id)
+    }
+}
+
+impl Drop for ChainGuard {
+    fn drop(&mut self) {
+        LOCK_CHAIN.with(|chain| {
+            let popped = chain.borrow_mut().pop();
+            debug_assert_eq!(popped, Some(self.0), "lock chain pairing broken");
+        });
+    }
+}
+
+/// Wait edges of the cross-instance wait-for graph: `held instance -> target
+/// instance` while the holder of `held` is parked acquiring `target`. Keys
+/// are process-unique instance ids ([`next_instance_id`] never repeats), so
+/// entries can never alias across activations.
+static WAIT_EDGES: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Test-only snapshot: true when the wait graph holds no edges.
+#[cfg(test)]
+fn wait_edges_empty() -> bool {
+    WAIT_EDGES.lock().is_empty()
+}
+
+/// The wait edges armed by one parking foreign entry: alive from the moment
+/// the edges are inserted until the lock is granted — or until the parking
+/// future is cancelled, whose drop path keeps the graph exact as well.
+#[derive(Debug)]
+struct WaitToken {
+    held: Vec<u64>,
+    target: u64,
+}
+
+impl Drop for WaitToken {
+    fn drop(&mut self) {
+        if self.held.is_empty() {
+            return; // fast path: nothing was armed
+        }
+        let mut edges = WAIT_EDGES.lock();
+        for held in &self.held {
+            if edges.get(held) == Some(&self.target) {
+                edges.remove(held);
+            }
+        }
+    }
+}
+
+/// Arms the wait edges for a foreign entry about to park on `target`'s
+/// instance lock, and fails deterministically when parking would close a
+/// wait cycle. Every instance waits for at most one target, so the graph's
+/// out-degree is at most one: walking forward from `target` either
+/// terminates or revisits a node, and a revisit means the parking would
+/// deadlock. The returned token must stay alive across the `lock().await`
+/// and drop as soon as the lock is granted.
+///
+/// # Errors
+///
+/// `reentrancy_cycle` naming the closed chain `target -> ... -> held`, when
+/// the graph already contains a wait path from `target` back into `held`.
+fn arm_wait_edges(held: Vec<u64>, target: u64) -> Result<WaitToken, Error> {
+    if held.is_empty() {
+        // No held lock can be part of a cycle: parking cannot deadlock.
+        return Ok(WaitToken { held, target });
+    }
+    let mut edges = WAIT_EDGES.lock();
+    for held_id in &held {
+        edges.insert(*held_id, target);
+    }
+    // The walk is deterministic and cheap at chain depth; under sound
+    // bookkeeping a revisit is always `target` itself, and a foreign cycle
+    // (never insertable) would be treated the same — parking into one would
+    // deadlock all the same.
+    let mut path = vec![target];
+    let mut cursor = target;
+    let mut closer: Option<u64> = None;
+    let deadlock = loop {
+        match edges.get(&cursor) {
+            None => break false,
+            Some(&next) => {
+                if next == target || path.contains(&next) {
+                    closer = Some(next);
+                    break true;
+                }
+                path.push(next);
+                cursor = next;
+            }
+        }
+    };
+    if !deadlock {
+        return Ok(WaitToken { held, target });
+    }
+    // The walk stops on the revisited node; repeat it to render the closed
+    // cycle ("target -> ... -> target").
+    if let Some(last) = closer {
+        path.push(last);
+    }
+    let chain = path
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    drop(edges); // the token's drop re-locks the graph
+    drop(WaitToken { held, target });
+    Err(Error::new(
+        "reentrancy_cycle",
+        format!("cross-instance require chain would deadlock: {chain}"),
+    ))
+}
+
+/// Lock guard paired with its lock-chain guard. The tuple drops fields in
+/// order, so the chain pops *before* the lock releases — the graph never
+/// names a released lock. Field order is load-bearing.
+type InstanceHold = (ChainGuard, OwnedMutexGuard<()>);
+
+/// Acquires one instance lock under the full cross-instance discipline: wait
+/// edges armed while parking, the instance pushed on the lock chain while
+/// held. A fresh execution context pays only the empty-chain fast path.
+///
+/// # Errors
+///
+/// `reentrancy_cycle` when the wait graph shows the parking would close a
+/// cycle (the caller's held locks loop back into `target`).
+async fn enter_exclusive(lock: &InstanceLock, instance_id: u64) -> Result<InstanceHold, Error> {
+    let token = arm_wait_edges(chain_held(), instance_id)?;
+    let guard = Arc::clone(lock).lock_owned().await;
+    drop(token);
+    Ok((ChainGuard::hold(instance_id), guard))
+}
+
+/// Re-establishes a lock chain on every poll of `fut`. A deferred waterfall
+/// continuation is awaited *while its bridge still holds the instance lock*;
+/// a guard cannot span that `.await` (task migration breaks thread-local
+/// pairing), so the held chain travels inside the wrapper and is pushed and
+/// popped around each poll — the chain stays visible to nested acquisitions
+/// no matter which thread resumes the continuation.
+struct ChainPoll<F> {
+    held: Vec<u64>,
+    fut: F,
+}
+
+impl<F: Future + Unpin> Future for ChainPoll<F> {
+    type Output = F::Output;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        struct Release<'a>(&'a [u64]);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                LOCK_CHAIN.with(|chain| {
+                    let mut chain = chain.borrow_mut();
+                    let keep = chain.len().saturating_sub(self.0.len());
+                    debug_assert_eq!(&chain[keep..], self.0, "chain extension pairing broken");
+                    chain.truncate(keep);
+                });
+            }
+        }
+        let Self { held, fut } = self.get_mut();
+        LOCK_CHAIN.with(|chain| chain.borrow_mut().extend_from_slice(held));
+        let _release = Release(held);
+        std::pin::Pin::new(fut).poll(cx)
     }
 }
 
@@ -797,9 +998,10 @@ impl dougong::Invoke for DylibInvoke {
                     "dylib service call would re-enter an instance already executing on this thread",
                 ));
             }
-            let _instance = lock.lock().await;
-            // The guard opens after the last `.await` and closes before the
-            // next one, keeping push/pop pairing on this thread.
+            // Cross-instance discipline: wait edges while parking, this
+            // instance on the lock chain while held — a `require` issued
+            // from inside the handler must see this lock as held.
+            let _hold = enter_exclusive(&lock, instance_id).await?;
             let _entry = EntryGuard::enter(instance_id);
             exports.call_full(&handle, method, &payload)
         })
@@ -825,7 +1027,10 @@ fn event_bridge(
         let handle = handle.clone();
         let lock = Arc::clone(&lock);
         Box::pin(async move {
-            let _instance = lock.lock().await;
+            // The bridge takes the instance lock under the full
+            // cross-instance discipline (same as `call`): wait edges while
+            // parking, the instance on the lock chain while held.
+            let hold = enter_exclusive(&lock, instance_id).await?;
             let bytes = serde_json::to_vec(&payload).map_err(|err| {
                 Error::transport("payload_codec", format!("encode payload: {err}"))
             })?;
@@ -860,7 +1065,19 @@ fn event_bridge(
                             Error::transport("payload_codec", format!("decode payload: {err}"))
                         })?
                     };
-                    let continued = next.call(value).await?;
+                    // The lock keeps spanning the whole invocation, so the
+                    // continuation polls must keep seeing this instance as a
+                    // held lock — a guard cannot span the `.await`, so
+                    // `ChainPoll` re-establishes the chain per poll.
+                    drop(hold.0);
+                    let mut chain = chain_held();
+                    chain.push(instance_id);
+                    let continued = ChainPoll {
+                        held: chain,
+                        fut: next.call(value),
+                    }
+                    .await?;
+                    let _chain = ChainGuard::hold(instance_id);
                     let chain_bytes = serde_json::to_vec(&continued).map_err(|err| {
                         Error::transport("payload_codec", format!("encode payload: {err}"))
                     })?;
@@ -953,7 +1170,7 @@ impl Plugin for DynPlugin {
             // vtable is built inside the block: raw pointers are not `Send`
             // and must not be held across the `await` in a local.
             let setup = {
-                let _instance = instance.lock().await;
+                let _hold = enter_exclusive(&instance, instance_id).await?;
                 let _entry = EntryGuard::enter(instance_id);
                 let host_exports = HostExports {
                     host_handle: activation.0,
@@ -977,6 +1194,11 @@ impl Plugin for DynPlugin {
             // places it first in the queue because it is registered here,
             // before the effects below. It also reclaims the activation:
             // vtable calls after teardown returns are outside the contract.
+            // SAFETY-shared token: exactly one of the disposer and the inline
+            // fallback below ever runs, so exactly one copy reclaims; keeping
+            // the copy in the wrapper (not the raw pointer) keeps the apply
+            // future `Send` across the effect registration await.
+            let fallback_activation = ActivationPtr(activation.0);
             let teardown_exports = exports.clone();
             let teardown_handle = Handle(handle.0);
             let teardown_lock = Arc::clone(&instance);
@@ -984,7 +1206,12 @@ impl Plugin for DynPlugin {
             let disposer: dougong::Disposer = Box::new(move || {
                 Box::pin(async move {
                     {
+                        // Teardown acquires exactly one lock and holds
+                        // nothing else while parking, so it can never close a
+                        // wait cycle — plain parking is safe; the chain push
+                        // still exposes this lock to nested `require` arms.
                         let _instance = teardown_lock.lock().await;
+                        let _chain = ChainGuard::hold(instance_id);
                         let _entry = EntryGuard::enter(instance_id);
                         teardown_exports.teardown(&teardown_handle);
                     }
@@ -993,8 +1220,29 @@ impl Plugin for DynPlugin {
                     unsafe { teardown_activation.reclaim() };
                 })
             });
-            ctx.effect("dylib.teardown", async move { Ok(Some(disposer)) })
-                .await?;
+            if let Err(err) = ctx
+                .effect("dylib.teardown", async move { Ok(Some(disposer)) })
+                .await
+            {
+                // The effect was never registered, so the disposer above (and
+                // with it the plugin's `teardown` and the activation reclaim)
+                // would silently never run. Tear down inline instead: the
+                // failure arms are a dispose racing this body or an effect
+                // budget breach, and in both the activation is dead weight.
+                {
+                    // Same one-lock shape as the disposer: no wait edges
+                    // needed (nothing else is held), but the chain push keeps
+                    // this lock visible to nested `require` arms.
+                    let _instance = instance.lock().await;
+                    let _chain = ChainGuard::hold(instance_id);
+                    let _entry = EntryGuard::enter(instance_id);
+                    exports.teardown(&Handle(handle.0));
+                }
+                // SAFETY: the disposer was never registered, so this is the
+                // unique reclaim of the activation reference.
+                unsafe { fallback_activation.reclaim() };
+                return Err(err);
+            }
 
             // Mode-aware bridges: one per declared listened event.
             for (event_name, event_id) in &listen {
@@ -1541,5 +1789,119 @@ mod tests {
         .join()
         .expect("driver thread did not panic");
         assert_eq!(outcome, 42);
+    }
+}
+
+#[cfg(test)]
+mod wait_graph_tests {
+    use super::*;
+
+    #[test]
+    fn arms_edges_for_a_parking_wait_and_releases_on_drop() {
+        let held = next_instance_id();
+        let target = next_instance_id();
+        let token = arm_wait_edges(vec![held], target).expect("fresh ids cannot close a cycle");
+        assert_eq!(WAIT_EDGES.lock().get(&held), Some(&target));
+        drop(token);
+        assert_eq!(
+            WAIT_EDGES.lock().get(&held),
+            None,
+            "edges must clear on release"
+        );
+    }
+
+    #[test]
+    fn fast_path_with_no_held_locks_never_touches_the_graph() {
+        let target = next_instance_id();
+        let token = arm_wait_edges(Vec::new(), target).expect("empty chain cannot cycle");
+        assert_eq!(WAIT_EDGES.lock().get(&target), None);
+        drop(token);
+        assert_eq!(WAIT_EDGES.lock().get(&target), None);
+    }
+
+    #[test]
+    fn a_two_instance_wait_cycle_fails_deterministically() {
+        let a = next_instance_id();
+        let b = next_instance_id();
+        let parked = arm_wait_edges(vec![a], b).expect("the first arming cannot cycle");
+        let err = arm_wait_edges(vec![b], a).expect_err("the cycle must close here");
+        assert_eq!(err.code, "reentrancy_cycle");
+        drop(parked);
+        assert_eq!(
+            WAIT_EDGES.lock().get(&a),
+            None,
+            "error path cleans its edges"
+        );
+        assert_eq!(WAIT_EDGES.lock().get(&b), None);
+    }
+
+    #[test]
+    fn a_three_instance_cycle_names_the_closed_chain() {
+        let a = next_instance_id();
+        let b = next_instance_id();
+        let c = next_instance_id();
+        let first = arm_wait_edges(vec![a], b).expect("a waits for b");
+        let second = arm_wait_edges(vec![b], c).expect("b waits for c");
+        let err = arm_wait_edges(vec![c], a).expect_err("c closing on a deadlocks");
+        assert_eq!(err.code, "reentrancy_cycle");
+        assert!(
+            err.message.contains(&format!("{a} -> {b} -> {c} -> {a}")),
+            "chain must name the cycle: {}",
+            err.message
+        );
+        drop(first);
+        drop(second);
+        for id in [a, b, c] {
+            assert_eq!(WAIT_EDGES.lock().get(&id), None);
+        }
+    }
+
+    #[test]
+    fn converging_waits_without_a_cycle_park_normally() {
+        let a = next_instance_id();
+        let b = next_instance_id();
+        let c = next_instance_id();
+        let d = next_instance_id();
+        let first = arm_wait_edges(vec![a], d).expect("a waits for d");
+        let second = arm_wait_edges(vec![b], d).expect("b waits for d too");
+        let third = arm_wait_edges(vec![c], a).expect("c waits for a: no cycle, d is free");
+        drop(first);
+        drop(second);
+        drop(third);
+        for id in [a, b, c, d] {
+            assert_eq!(WAIT_EDGES.lock().get(&id), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_parking_future_removes_its_edges() {
+        let held = next_instance_id();
+        let target = next_instance_id();
+        let lock: InstanceLock = Arc::new(AsyncMutex::new(()));
+        let gate = Arc::clone(&lock).lock_owned().await;
+        let task = tokio::spawn({
+            let lock = Arc::clone(&lock);
+            async move {
+                let _outer = ChainGuard::hold(held);
+                let _hold = enter_exclusive(&lock, target).await;
+            }
+        });
+        let mut armed = false;
+        for _ in 0..200 {
+            if !WAIT_EDGES.lock().is_empty() {
+                armed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(armed, "the parked entry must have armed its edges");
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            WAIT_EDGES.lock().get(&held),
+            None,
+            "cancellation must clean up the armed edges"
+        );
+        drop(gate);
     }
 }

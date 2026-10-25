@@ -82,14 +82,31 @@ impl Plugin for WasmPlugin {
             // unwind runs it last, after every provide/listener disposer
             // (mirrors the dylib adapter ordering).
             let teardown_channel = Arc::clone(&channel);
+            let teardown_logger = ctx.logger();
             let teardown: Disposer = Box::new(move || {
                 let channel = Arc::clone(&teardown_channel);
                 Box::pin(async move {
-                    let _ = channel.run_disposer(0).await;
+                    if let Err(err) = channel.run_disposer(0).await {
+                        // Teardown failures are observable, never actionable:
+                        // log and let the unwind continue (guest teardown must
+                        // not fail the process).
+                        teardown_logger.log_error(&err);
+                    }
                 })
             });
-            ctx.effect("wasm.teardown", async move { Ok(Some(teardown)) })
-                .await?;
+            if let Err(err) = ctx
+                .effect("wasm.teardown", async move { Ok(Some(teardown)) })
+                .await
+            {
+                // The effect was never registered, so the guest teardown would
+                // silently never run. Run it inline: registration fails only
+                // when a dispose raced this body or an effect budget fired,
+                // and in both the guest teardown obligation still stands.
+                if let Err(teardown_err) = channel.run_disposer(0).await {
+                    ctx.logger().log_error(&teardown_err);
+                }
+                return Err(err);
+            }
 
             let site = wit::CallContext {
                 fiber: ctx

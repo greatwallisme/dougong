@@ -174,6 +174,12 @@ impl wit_host::Host for PluginState {
         if !self.bound {
             return Err(Self::inactive());
         }
+        if ev.name.starts_with("internal/") {
+            return Err(wit::KernelError::CapabilityDenied(format!(
+                "listener {listener} may not subscribe to framework extension point \"{}\"",
+                ev.name
+            )));
+        }
         let channel = Arc::clone(&self.channel);
         let event_name = ev.name.clone();
         let bridge_name = ev.name.clone();
@@ -206,6 +212,12 @@ impl wit_host::Host for PluginState {
     ) -> std::result::Result<Vec<u8>, wit::KernelError> {
         if !self.bound {
             return Err(Self::inactive());
+        }
+        if ev.name.starts_with("internal/") {
+            return Err(wit::KernelError::CapabilityDenied(format!(
+                "dispatch may not publish to framework extension point \"{}\"",
+                ev.name
+            )));
         }
         let value = decode(&payload).map_err(|err| to_wit(&err, None))?;
         let ctx = self.ctx.clone();
@@ -260,12 +272,16 @@ impl wit_host::Host for PluginState {
         let handle = self.channel.alloc_handle();
         let channel = Arc::clone(&self.channel);
         let ctx = self.ctx.clone();
+        let logger = ctx.logger();
         let disposer: dougong::Disposer = Box::new(move || {
             let channel = Arc::clone(&channel);
+            let logger = Arc::clone(&logger);
             Box::pin(async move {
-                // Disposal failures surface in kernel logs through the
-                // effect unwind; nothing further to propagate here.
-                let _ = channel.run_disposer(handle).await;
+                // Disposal failures are observable, never actionable: they
+                // surface in the kernel log here, and nothing propagates.
+                if let Err(err) = channel.run_disposer(handle).await {
+                    logger.log_error(&err);
+                }
             })
         });
         match ctx.effect(label, async move { Ok(Some(disposer)) }).await {

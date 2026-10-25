@@ -188,7 +188,11 @@ pub struct HostExports {
   instead of deadlocking the per-instance lock. Legal service->service chains
   (requiring a *different* service from inside a handler) work; a plugin-owned
   thread starts with an empty stack and can never cycle. `emit` never takes
-  the emitter's instance lock, so it is always cycle-free.
+  the emitter's instance lock, so it is always cycle-free. Cross-instance
+  require cycles are equally deterministic (D-V3-3, 2026-10-25 amendment):
+  the host tracks the held-lock chain and arms wait edges on every foreign
+  acquisition, so a chain closing a wait cycle across threads or instances
+  fails with `STATUS_REENTRANCY` on the thread completing the cycle.
 - `setup`-time `require` against already-committed providers is legal and is
   the canonical way to probe the environment at activation.
 
@@ -240,9 +244,10 @@ cargo run -p dougong-dylib --example outbound_demo # ABI v3 outbound arms (same 
   contract violation the host rejects.
 - Vtable calls after `teardown` returns are documented UB, not detected:
   join every plugin-owned thread before `teardown` returns.
-- A `require` that loops back into the same instance on the same thread
-  fails with `STATUS_REENTRANCY` (never a deadlock); plugin-owned threads
-  start with an empty stack, so cycles need a foreign entry in the chain.
+- A `require` that loops back into the same instance on the same thread, or
+  closes a wait cycle across instances/threads, fails with `STATUS_REENTRANCY`
+  (never a deadlock); plugin-owned threads start with an empty stack, so
+  cycles need a foreign entry in the chain.
 - `emit` payloads must be valid JSON and event names must not use the
   `internal/*` prefix (`STATUS_INVALID_PAYLOAD` / `STATUS_INVALID_EVENT`).
 - Keep only `dougong-abi` as a dependency; pulling in the kernel or tokio
