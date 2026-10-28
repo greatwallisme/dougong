@@ -477,6 +477,55 @@ G1–G8）。
   转发。`outbound_demo` 增 greeter→第二 dylib-form 插件的 grant 回调臂；既有
   全部 demo、wasm/WIT、loader JSON 与内核 invoke 语义零回归。
 
+#### D31-amended 2026-10-28 全项目审查修订（维护者已裁决）
+
+审查（/code-review high，含中断恢复）发现实现与本裁决文本共同偏离
+grant_requirements.md 的六处语义，修复后落地如下：
+
+1. **授权绑定解析到的提供者（F1）**：原判定「有名条目 + 调用方激活 id 匹配
+   即放行」发生在解析之前，不比对解析结果——跨 realm 同名提供者（或残留
+   条目窗口内的新提供者）会接过授权，违背 B1 三元组与「授权流向授予方从未
+   见过的对象」之禁。修订：`lookup_grant` 返回以该调用方为目标的 granter id
+   集，`require_impl` 在 realm 解析**之后**比对 `invoker.activation_id() ∈
+   granters` 才放行；不匹配走既有 UNDECLARED 文案。钉测 E1.13（跨 realm 同名
+   提供者不被授权、方法未被调用）。
+2. **在途 require 与授予者 teardown 的活性门（F2）**：授予目标不是内核依赖
+   边，provider withdrawal 不 drain 它——B 解析 Invoker 后若被抢占，A 的
+   teardown 释放插件状态后 B 的调用即 UAF。原 §6 风险表「无新竞态面」的论证
+   不成立。修订：每个激活带 `Arc<AtomicBool>` 活性门，两个 teardown 臂在持有
+   实例锁后、调用 teardown export 前置 false；`DylibInvoke::call` 在
+   `enter_exclusive` 之后、进入外方调用前检查，死亡即返回 Transport 类
+   `provider_gone`（STATUS_FAILED）。锁的 release/acquire 与标志自身的
+   Release/Acquire 双保险建立 happens-before。钉测：dispose 后调用残留
+   invoker 必得 `provider_gone`。
+3. **挂死 teardown 的残留条目 = 惰性（F3，文档化接受）**：S3 cleanup 孤儿化
+   挂死 teardown 时 unload 完成、条目留存——因 F1 的 granter-id 绑定（实例 id
+   永不复用），残留条目永久不可授权任何调用，仅占表内存，与挂死 teardown 本
+   身的插件状态泄漏同量级。不为此引入内核 unload 钩子（D31「内核预计零改动」
+   不值得破）；teardown 若返回则 reclaim 照常清除。
+4. **无激活 id 的目标直接拒绝（F7）**：in-process/wasm Invoker（`activation_id
+   () == None`）作 target 时原实现返回 OK 但条目永不匹配任何 dylib 调用方——
+   对结构性不可能生效的能力报成功违背 B2 fail-closed 精神。修订：FAILED +
+   `grant_target_unsupported`（B4 词表增补）。条目随之不再需要保留目标 Arc
+   （幂等同性退化为纯 id 比对），目标换件的 DylibInvoke 不再被表钉活。
+5. **授权名索引按内核 root 作用域化（F8）**：原进程全局裸名索引使 root A 的
+   条目把 root B 的未声明 require 从 UNDECLARED 翻成 INACTIVE（G2 对未触及
+   世界的承诺被另一 root 簿记破坏）。修订：内核新增 `Context::root_id()`
+   （进程唯一、构造期固定，与 `Invoke::activation_id()` 同型的小助手，本裁决
+   开先例的第二个内核触点）；条目记录 granter 的 root id，lookup 只见同 root
+   条目。钉测 E1.15（双 root 同进程，root B 逐字节 UNDECLARED）。
+6. **空表原子门（F9）**：无任何 grant 的进程里静态未中 require 原实现也要取
+   全局互斥锁。修订：`GRANTS_LIVE: AtomicBool`——插入路径在表锁内置 true
+   后释放，清空后置 false；lookup 先 Acquire 读，false 即 Missing 不取锁。
+   Release/Acquire 配对保证「可见条目 ⇒ 可见 true」。
+
+E1 矩阵增补：E1.13（提供者绑定）、E1.14=活性门钉测、E1.15（跨 root）、
+E1.16（无 id 目标拒绝）；E2 的第二插件改为真实 cdylib 工件
+`crates/grant-partner`（`cargo build --workspace` 产出
+`libgrant_partner.so`，demo grant 臂经 `load()` 装载，替换原内嵌表）；
+测试二进制加 120s 看门狗（同步 FFI 死锁无法被 tokio timeout 抢占，只有墙上
+时钟能挂死转失败）。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。
@@ -511,7 +560,7 @@ dougong = 内核（约 3k 行级）+ ABI 契约与 dylib 宿主（数百行级�
 | 面 | in-process | dylib v4 | 锚 |
 |---|---|---|---|
 | require 能力检查基准 | fiber 兴趣集（声明注入解析承诺） | 实例 descriptor `inject` 集（常量，激活期捕获进 vtable 闭包）；拥有者可另授运行期窄能力 | B2；两级语义（undeclared/inactive）一致，检查对象不同 |
-| 动态授予 | 不需要：依赖面在装配期已知，需动态边时改用 dylib 或静态声明 | `grant`：拥有者授一个自有服务名给一个已提交目标激活；随授予者激活失效 | D31；名级索引保持 undeclared→inactive 优先序，无跨激活继承 |
+| 动态授予 | 不需要：依赖面在装配期已知，需动态边时改用 dylib 或静态声明 | `grant`：拥有者授一个自有服务名给一个已提交目标激活；随授予者激活失效 | D31 + 2026-10-28 修订：名级索引 root 作用域化、授权绑定解析到的提供者、无 id 目标拒绝；undeclared→inactive 优先序与无跨激活继承不变 |
 | require 载荷 | 类型化键（`Any` 下转）与动态通道字节并存 | 仅动态通道字节，对宿主不透明（编码归服务契约） | B6 |
 | emit 载荷 | `serde_json::Value` | 必须合法 JSON 字节，非法 = `STATUS_INVALID_PAYLOAD` | C2（显式非对称） |
 | `internal/*` 事件 | 桥禁订（`on_dispatch` 拒绝） | 出站禁发（`STATUS_INVALID_EVENT`） | C3 |

@@ -172,10 +172,12 @@ pub struct HostExports {
   doubled buffer); input payloads are uncapped. Statuses: `STATUS_OK`,
   `STATUS_CAPACITY`, `STATUS_UNDECLARED` (neither injected nor granted),
   `STATUS_INACTIVE` (no committed provider), `STATUS_REENTRANCY`
-  (same-thread cycle), `STATUS_FAILED` (target's own error), and
-  `STATUS_HOST_ERROR` (host-internal, including a caught host panic). Any
-  failure status may carry a UTF-8 JSON detail document
-  (`{"code": ..., "message": ...}`) in the out buffer.
+  (same-thread cycle), `STATUS_FAILED` (target's own error, or the
+  transport-class `provider_gone` detail when the resolved provider's
+  activation is tearing down - the liveness gate under the per-instance
+  lock, not a deadlock), and `STATUS_HOST_ERROR` (host-internal, including a
+  caught host panic). Any failure status may carry a UTF-8 JSON detail
+  document (`{"code": ..., "message": ...}`) in the out buffer.
 - **`emit`** is enqueue-and-return: the kernel dispatches asynchronously,
   listener failures are logged but never propagated, and no ordering is
   promised between two emits or between an emit and a require. The payload
@@ -187,11 +189,17 @@ pub struct HostExports {
   table; the target is resolved immediately in this activation's realm and
   bound by activation identity, not inherited by a replacement provider. The
   call returns `STATUS_OK` (including idempotent re-grant),
-  `STATUS_INACTIVE` (target not committed), or `STATUS_FAILED` (invalid UTF-8
-  or not-owned service), and writes no output buffer. It is a pure
-  registration primitive: no foreign call, no instance lock, and no
+  `STATUS_INACTIVE` (target not committed), or `STATUS_FAILED` (invalid
+  UTF-8, not-owned service, or the `grant_target_unsupported` detail when
+  the resolved target is an in-process or wasm invoker - no activation id,
+  so the capability could never fire), and writes no output buffer. It is a
+  pure registration primitive: no foreign call, no instance lock, and no
   reentrancy-stack/wait-graph participation. Grants expire with the granter
-  activation; a new activation starts empty.
+  activation; a new activation starts empty. Authorization binds the
+  provider the target actually resolves: the target's `require` of the
+  granted name passes only when its own realm resolves it to the granter's
+  activation - a same-name provider in another realm never receives the
+  callback (2026-10-28 review amendment).
 - **All three callable entries may be called from any plugin thread,
   concurrently** - the host implementations are panic-contained. The host's per-instance lock
   serializes *foreign entries* (setup/call/on_event/on_next/teardown) but
@@ -268,8 +276,21 @@ cargo run -p dougong-dylib --example outbound_demo # ABI v3/v4 outbound + grant 
   `internal/*` prefix (`STATUS_INVALID_PAYLOAD` / `STATUS_INVALID_EVENT`).
 - Grants die with the granter activation and never transfer to a replacement
   provider; re-grant from the new activation instead of relying on inheritance.
+  The authorization also binds the resolved provider (2026-10-28 amendment):
+  a granted `require` passes only when the target's realm resolves the
+  granted name to the granter's own activation - same-name providers in
+  other realms, or a stale entry during provider replacement, stay
+  `STATUS_UNDECLARED`.
 - `grant` is not communication: it neither probes the target nor participates
-  in reentrancy detection. The target must be committed before the call.
+  in reentrancy detection. The target must be committed before the call, and
+  must be a dylib activation - an in-process or wasm target fails with
+  `STATUS_FAILED` (`grant_target_unsupported`) instead of a silent no-op.
+- A `require` racing the provider's teardown fails closed with
+  `STATUS_FAILED` (`provider_gone`, transport class) - the liveness gate
+  under the per-instance lock. Granted callers are not kernel dependency
+  edges, so no drain joins them; treat `provider_gone` like
+  `inactive_dependency` (retry after the provider re-commits, or surface the
+  failure) and never retry into a stale resolved handle.
 - Keep only `dougong-abi` as a dependency; pulling in the kernel or tokio
   across artifacts duplicates runtime state and breaks the portability
   contract (`#[repr(C)]` only, no `TypeId`/statics crossing).

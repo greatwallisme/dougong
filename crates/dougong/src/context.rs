@@ -26,6 +26,12 @@ use crate::scope::{DEFAULT_LABEL, ScopeNode};
 use crate::service::{DependencyIndex, ReflectStore};
 use crate::shard::ShardMap;
 
+/// Process-wide root identity seed: every [`RootState`] draws a distinct id
+/// so boundary hosts can scope process-global bookkeeping (the D31 grant
+/// table) per kernel root — one root's entries must never change another
+/// root's observable require semantics (review F8).
+static ROOT_ID_SEED: AtomicU64 = AtomicU64::new(0);
+
 /// State shared by every context derived from one root.
 ///
 /// The hot structures (`reflect`, `index`, `fibers`) are striped internally
@@ -37,6 +43,9 @@ use crate::shard::ShardMap;
 /// cross-structure flows snapshot under one lock, release it, then act. An
 /// S6 group-section lock is always the outermost lock.
 pub struct RootState {
+    /// Process-unique identity of this root (review F8); stable for the
+    /// root's lifetime and shared by every derived context handle.
+    pub(crate) root_id: u64,
     pub(crate) registry: Mutex<registry::RegistryMap>,
     pub(crate) reflect: ReflectStore,
     pub(crate) events: Mutex<crate::events::EventStore>,
@@ -219,6 +228,8 @@ impl Context {
     #[must_use]
     pub fn new_with_options(options: ContextOptions) -> Self {
         let root = Arc::new(RootState {
+            // Relaxed suffices: uniqueness only, no ordering consumers.
+            root_id: ROOT_ID_SEED.fetch_add(1, Ordering::Relaxed) + 1,
             registry: Mutex::new(HashMap::new()),
             reflect: ReflectStore::default(),
             events: Mutex::new(crate::events::EventStore::default()),
@@ -367,6 +378,17 @@ impl Context {
     #[must_use]
     pub fn trace_id(&self) -> u64 {
         self.fiber.upgrade().map_or(0, |fiber| fiber.trace_id())
+    }
+
+    /// The process-unique identity of this context's kernel root: distinct
+    /// per `Context::new`-family construction, shared by every handle
+    /// derived from that root. Boundary hosts use it to scope process-global
+    /// capability bookkeeping (the dylib grant table, D31) so one root's
+    /// entries cannot change another root's observable require semantics
+    /// (review F8).
+    #[must_use]
+    pub fn root_id(&self) -> u64 {
+        self.root.root_id
     }
 
     /// Takes a point-in-time metrics snapshot (O2).

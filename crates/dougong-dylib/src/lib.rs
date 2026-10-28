@@ -65,7 +65,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Poll, Wake, Waker};
 
 use dougong::{BoxFuture, DispatchListener, DispatchMode, Error, Invoker, Plugin, Result};
@@ -341,12 +341,14 @@ struct Activation {
     provide: Vec<String>,
 }
 
-/// One activation-granular grant. The resolved target Arc is retained for
-/// identity stability and idempotency; it is never called through the table.
+/// One activation-granular grant: pure identity bookkeeping, never a call
+/// path (the table is never dereferenced into an invocation).
 struct GrantEntry {
     granter: u64,
-    target_activation: Option<u64>,
-    target: Arc<dyn dougong::Invoke>,
+    /// Kernel root the granter lived in: entries are invisible to every
+    /// other root, whose require classification must stay untouched (F8).
+    root: u64,
+    target_activation: u64,
 }
 
 /// Process-wide grants indexed by granted service name (D31). Absence of the
@@ -355,10 +357,45 @@ struct GrantEntry {
 static GRANTS: LazyLock<Mutex<HashMap<String, Vec<GrantEntry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Fast gate over a provably empty [`GRANTS`] table (review F9): set under
+/// the table lock before any insertion completes, cleared under the same
+/// lock when the table drains. A grant-free process keeps the legacy
+/// static-miss rejection lock-free — the Release store pairs with the
+/// Acquire load in [`lookup_grant`], so a `true` verdict implies the
+/// inserting critical section has already made the entry visible.
+static GRANTS_LIVE: AtomicBool = AtomicBool::new(false);
+
 #[cfg(test)]
 std::thread_local! {
     /// Per-thread probe for G7: static require hits never call the lookup.
     static GRANT_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts real [`GRANTS`] mutex acquisitions inside [`lookup_grant`] (F9's
+/// empty-table gate must keep a grant-free process at zero).
+#[cfg(test)]
+static GRANT_LOCKS: AtomicU64 = AtomicU64::new(0);
+
+/// Converts a wedged test into a hard failure: a synchronous foreign call
+/// that deadlocks parks its polling thread, so `tokio::time::timeout` can
+/// never fire — only a wall-clock watchdog can turn the hang into an abort
+/// (review F5). Armed once per process; a spawn failure just leaves the
+/// suite without the guard, never fails a healthy run.
+#[cfg(test)]
+pub(crate) fn arm_deadlock_watchdog() {
+    static ARMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ARMED.get_or_init(|| {
+        // 120s: generous for a loaded CI machine running the whole binary
+        // under default parallelism, while still bounding a wedged suite;
+        // every per-test guard is 5s.
+        let budget = std::time::Duration::from_secs(120);
+        let _ = std::thread::Builder::new()
+            .name("test-deadlock-watchdog".to_string())
+            .spawn(move || {
+                std::thread::sleep(budget);
+                std::process::abort();
+            });
+    });
 }
 
 #[cfg(test)]
@@ -368,26 +405,47 @@ fn grant_lookups_on_this_thread() -> u64 {
 
 enum GrantLookup {
     Missing,
-    Present { authorized: bool },
+    /// Granter activation ids whose entries target this caller. Authorization
+    /// is decided after resolution: the caller passes only when the provider
+    /// resolved for the service is one of its granters (B1).
+    Present {
+        granters: Vec<u64>,
+    },
 }
 
 /// Looks up one caller's capability without holding the lock across kernel
-/// resolution, a foreign call, an instance lock, or logging (C4).
-fn lookup_grant(activation: &Activation, service: &str) -> GrantLookup {
+/// resolution, a foreign call, an instance lock, or logging (C4). `root` and
+/// `caller` come from the requiring activation's context and instance id.
+fn lookup_grant(root: u64, caller: u64, service: &str) -> GrantLookup {
     #[cfg(test)]
     GRANT_LOOKUPS.with(|count| count.set(count.get() + 1));
+    if !GRANTS_LIVE.load(Ordering::Acquire) {
+        return GrantLookup::Missing;
+    }
+    #[cfg(test)]
+    GRANT_LOCKS.fetch_add(1, Ordering::Relaxed);
     GRANTS
         .lock()
         .get(service)
-        .map_or(GrantLookup::Missing, |entries| GrantLookup::Present {
-            authorized: entries
-                .iter()
-                .any(|entry| entry.target_activation == Some(activation.instance_id)),
+        .map_or(GrantLookup::Missing, |entries| {
+            // Cross-root entries are invisible (F8): another root's
+            // bookkeeping must not flip this root's UNDECLARED
+            // classification to INACTIVE.
+            if !entries.iter().any(|entry| entry.root == root) {
+                return GrantLookup::Missing;
+            }
+            GrantLookup::Present {
+                granters: entries
+                    .iter()
+                    .filter(|entry| entry.root == root && entry.target_activation == caller)
+                    .map(|entry| entry.granter)
+                    .collect(),
+            }
         })
 }
 
 #[cfg(test)]
-fn grant_entries(service: &str) -> Vec<(u64, Option<u64>)> {
+fn grant_entries(service: &str) -> Vec<(u64, u64)> {
     GRANTS.lock().get(service).map_or_else(Vec::new, |entries| {
         entries
             .iter()
@@ -396,25 +454,29 @@ fn grant_entries(service: &str) -> Vec<(u64, Option<u64>)> {
     })
 }
 
-/// Removes one granter activation's entries and drops their target Arcs only
-/// after releasing the table lock. A new activation never inherits them.
+/// Removes one granter activation's entries. A new activation never
+/// inherits them.
 fn clear_grants(activation: &Activation) {
-    let mut removed = Vec::new();
+    let mut removed = 0;
     {
         let mut grants = GRANTS.lock();
         for entries in grants.values_mut() {
             let mut index = 0;
             while index < entries.len() {
                 if entries[index].granter == activation.instance_id {
-                    removed.push(entries.swap_remove(index));
+                    entries.swap_remove(index);
+                    removed += 1;
                 } else {
                     index += 1;
                 }
             }
         }
         grants.retain(|_, entries| !entries.is_empty());
+        if grants.is_empty() {
+            GRANTS_LIVE.store(false, Ordering::Release);
+        }
     }
-    if removed.is_empty() {
+    if removed == 0 {
         return;
     }
     activation.ctx.logger().log_record(
@@ -422,7 +484,7 @@ fn clear_grants(activation: &Activation) {
             dougong::LogLevel::Info,
             "dylib",
             "outbound_grant",
-            format!("cleared {} grant(s)", removed.len()),
+            format!("cleared {removed} grant(s)"),
         )
         .with_trace(Some(activation.ctx.trace_id()))
         .with_boundary(Some("dylib")),
@@ -636,14 +698,14 @@ fn require_impl(
     // Step 1: descriptor injection bypasses the grant table entirely (G7).
     // A static miss consults the name index; an absent name is the legacy
     // undeclared path with byte-identical detail (C1/C3).
-    let authorized = if activation.inject.iter().any(|declared| declared == service) {
-        true
+    let granters = if activation.inject.iter().any(|declared| declared == service) {
+        None
     } else {
-        match lookup_grant(activation, service) {
+        match lookup_grant(activation.ctx.root_id(), activation.instance_id, service) {
             GrantLookup::Missing => {
                 return undeclared_require(service, out_buf, cap, out_len);
             }
-            GrantLookup::Present { authorized } => authorized,
+            GrantLookup::Present { granters } => Some(granters),
         }
     };
     // Step 2: resolution in the activation's realm. Resolution precedes the
@@ -660,6 +722,17 @@ fn require_impl(
             STATUS_INACTIVE,
         );
     };
+    // B1: the grant binds the granter activation, so the caller passes only
+    // when the provider just resolved in its realm is one of its granters. A
+    // realm that resolves a same-name provider the granter never saw — or a
+    // stale entry from a replaced provider — stays unauthorized: capability
+    // never transfers to an object the granter did not grant.
+    let authorized = granters.is_none_or(|granters| {
+        invoker
+            .inner
+            .activation_id()
+            .is_some_and(|provider| granters.contains(&provider))
+    });
     if !authorized {
         return undeclared_require(service, out_buf, cap, out_len);
     }
@@ -836,22 +909,33 @@ fn grant_impl(
         });
     };
     let target_activation = target.inner.activation_id();
+    let Some(target_activation) = target_activation else {
+        // Fail-closed at the boundary (B2's spirit): an in-process or wasm
+        // target carries no activation id, so no dylib caller could ever
+        // match the entry — reporting success for a structurally inert
+        // capability would lie to the plugin (review F7).
+        return Err(GrantFailure {
+            code: "grant_target_unsupported",
+            message: format!(
+                "cannot grant to target service \"{target_service}\" without an activation id"
+            ),
+            status: STATUS_FAILED,
+        });
+    };
     let mut grants = GRANTS.lock();
     let entries = grants.entry(granted_service.to_string()).or_default();
     let duplicate = entries.iter().any(|entry| {
-        entry.granter == activation.instance_id
-            && match (entry.target_activation, target_activation) {
-                (Some(left), Some(right)) => left == right,
-                (None, None) => Arc::ptr_eq(&entry.target, &target.inner),
-                _ => false,
-            }
+        entry.granter == activation.instance_id && entry.target_activation == target_activation
     });
     if !duplicate {
         entries.push(GrantEntry {
             granter: activation.instance_id,
+            root: activation.ctx.root_id(),
             target_activation,
-            target: Arc::clone(&target.inner),
         });
+        // Under the table lock, before the release: a visible entry always
+        // implies a visible `true` gate (F9).
+        GRANTS_LIVE.store(true, Ordering::Release);
     }
     drop(grants);
     // Every successful grant, including an idempotent re-grant, is audited
@@ -1216,6 +1300,9 @@ struct DylibInvoke {
     handle: Handle,
     lock: InstanceLock,
     instance_id: u64,
+    /// Liveness gate cleared by this activation's teardown arms; see
+    /// [`Activation::alive`].
+    alive: Arc<AtomicBool>,
 }
 
 // SAFETY: the raw handle targets plugin-private state; every access is
@@ -1235,6 +1322,7 @@ impl dougong::Invoke for DylibInvoke {
         let handle = self.handle.clone();
         let lock = Arc::clone(&self.lock);
         let instance_id = self.instance_id;
+        let alive = Arc::clone(&self.alive);
         Box::pin(async move {
             // Reentrancy check before touching the lock (D-V3-3 b'): firing
             // means this thread is already executing inside this instance, so
@@ -1251,6 +1339,18 @@ impl dougong::Invoke for DylibInvoke {
             // instance on the lock chain while held — a `require` issued
             // from inside the handler must see this lock as held.
             let _hold = enter_exclusive(&lock, instance_id).await?;
+            // Teardown ordering for callers the kernel does not drain
+            // (granted targets are not dependency edges): once this
+            // activation's teardown has taken the lock, the handle below
+            // targets freed plugin state, so fail instead of entering the
+            // foreign call. The flag was cleared under this very lock before
+            // the teardown export ran; whoever holds the lock second sees it.
+            if !alive.load(Ordering::Acquire) {
+                return Err(Error::transport(
+                    "provider_gone",
+                    "dylib provider activation is tearing down",
+                ));
+            }
             let _entry = EntryGuard::enter(instance_id);
             exports.call_full(&handle, method, &payload)
         })
@@ -1400,6 +1500,14 @@ impl Plugin for DynPlugin {
         Box::pin(async move {
             let instance: InstanceLock = Arc::new(AsyncMutex::new(()));
             let instance_id = next_instance_id();
+            // Liveness gate shared by every DylibInvoke and both teardown
+            // arms of this activation: cleared under the instance lock before
+            // the teardown export runs, so a require that resolved an
+            // invoker before withdrawal fails with `provider_gone` instead of
+            // touching freed plugin state. Granted callers are not kernel
+            // dependency edges, so no drain joins them — this gate is their
+            // only teardown ordering (review F2, D31 amendment).
+            let alive = Arc::new(AtomicBool::new(true));
             // The outbound vtable is per-activation (A3): it captures this
             // fiber's context (realm-scoped resolution), the runtime handle
             // (foreign-thread driving), and the descriptor inject set
@@ -1454,6 +1562,7 @@ impl Plugin for DynPlugin {
             let teardown_exports = exports.clone();
             let teardown_handle = Handle(handle.0);
             let teardown_lock = Arc::clone(&instance);
+            let teardown_alive = Arc::clone(&alive);
             let teardown_activation = activation;
             let disposer: dougong::Disposer = Box::new(move || {
                 Box::pin(async move {
@@ -1465,6 +1574,12 @@ impl Plugin for DynPlugin {
                         let _instance = teardown_lock.lock().await;
                         let _chain = ChainGuard::hold(instance_id);
                         let _entry = EntryGuard::enter(instance_id);
+                        // Clear the liveness gate while holding the lock and
+                        // before the teardown export frees plugin state: a
+                        // require that acquires the lock later must observe
+                        // the store (mutex release/acquire pairs with the
+                        // flag's own ordering as a belt-and-suspenders).
+                        teardown_alive.store(false, Ordering::Release);
                         teardown_exports.teardown(&teardown_handle);
                     }
                     // SAFETY: teardown has returned, so the vtable is dead;
@@ -1488,6 +1603,8 @@ impl Plugin for DynPlugin {
                     let _instance = instance.lock().await;
                     let _chain = ChainGuard::hold(instance_id);
                     let _entry = EntryGuard::enter(instance_id);
+                    // Same liveness gate as the disposer arm (review F2).
+                    alive.store(false, Ordering::Release);
                     exports.teardown(&Handle(handle.0));
                 }
                 // SAFETY: the disposer was never registered, so this is the
@@ -1516,6 +1633,7 @@ impl Plugin for DynPlugin {
                     handle: Handle(invoker_handle),
                     lock: Arc::clone(&instance),
                     instance_id,
+                    alive: Arc::clone(&alive),
                 }));
                 ctx.provide(service, invoker).await?;
             }

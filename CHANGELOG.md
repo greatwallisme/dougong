@@ -32,6 +32,24 @@ wasm/WIT、loader JSON 和既有内核调用行为均不变。
   `DylibInvoke` 实现、`BoundaryInvoke` 转发，避免 O7/S5 装饰器使 Arc 身份失真。
 - 加载门：`ABI_VERSION` 3 → 4，v3 工件硬拒载（错误消息含两侧版本）。
 
+审查修订（2026-10-28 全项目审查，维护者裁决，发布前并入本版；全文见
+D31-amended 与需求文档 §7）：
+
+- 授权绑定解析到的提供者：放行条件 = 目标 realm 解析到的提供者激活 id 属于
+  以该调用方为目标的 granter 集——跨 realm 同名提供者与换供窗口不继承授权
+  （E1.13）。
+- 在途 require 与授予者 teardown 的活性门：授予目标非内核依赖边、不被 drain，
+  `DylibInvoke` 获实例锁后先查激活存活门，已 teardown 返回
+  `STATUS_FAILED`（Transport 类 `provider_gone`），杜绝悬垂 Handle 的 UAF。
+- 无激活 id 的 grant 目标（in-process/wasm Invoker）直接
+  `STATUS_FAILED`（`grant_target_unsupported`）；授权表条目不再保留目标 Arc。
+- 授权名索引按内核 root 作用域化：内核新增 `Context::root_id()` 助手，跨 root
+  的未声明 require 保持逐字节 UNDECLARED（E1.15）；空表时静态未中路径不取
+  授权表锁（`GRANTS_LIVE` 原子门）。
+- E2 的第二插件为真实 cdylib 工件 `crates/grant-partner`（demo grant 臂经
+  `load()` 装载）；测试二进制加 120s 墙钟看门狗（同步 FFI 死锁无法被 tokio
+  timeout 抢占）。
+
 迁移（v3 → v4）：
 
 1. 插件对齐 `ABI_VERSION` 重编译；`HostExports` 按值复制时自然带上第 4 字段，
@@ -41,9 +59,10 @@ wasm/WIT、loader JSON 和既有内核调用行为均不变。
 3. 需要运行期回调的插件由服务拥有者在目标已提交后调用 `grant`；目标换激活或
    授予者再激活后重新授予，不依赖旧授权继承。
 
-验证锚：`cargo test -p dougong-dylib`（ABI v3 回归 + ABI v4 E1.1–12）；
-`examples/outbound_demo.rs`（既有出站/权限/重入臂 + grant 回调往返）；下游
-fly-rafter 的零改第三方策略插件接入验收（E4）。
+验证锚：`cargo test -p dougong-dylib`（ABI v3 回归 + ABI v4 E1.1–16 与审查
+钉测：提供者绑定、teardown 活性门、跨 root 隔离、无 id 目标拒绝、空表零锁）；
+`examples/outbound_demo.rs`（既有出站/权限/重入臂 + greeter→grant-partner 真
+实工件 grant 回调往返）；下游 fly-rafter 的零改第三方策略插件接入验收（E4）。
 
 ## [0.3.0] - 2026-10-25
 

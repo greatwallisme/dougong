@@ -758,6 +758,7 @@ struct World {
 }
 
 async fn start(ctx: &Context, plugin: Arc<dyn Plugin>) -> FiberHandle {
+    super::arm_deadlock_watchdog();
     let handle = ctx.plugin(plugin, None).expect("spawn");
     tokio::time::timeout(Duration::from_secs(5), handle.join())
         .await
@@ -889,6 +890,7 @@ fn bare_activation_with_provide(
     inject: &[&str],
     provide: &[&str],
 ) -> *mut std::ffi::c_void {
+    super::arm_deadlock_watchdog();
     Arc::into_raw(Arc::new(super::Activation {
         ctx: ctx.clone(),
         rt: tokio::runtime::Handle::current(),
@@ -1039,6 +1041,7 @@ async fn same_thread_self_reentry_is_a_deterministic_error() {
         handle: Handle(std::ptr::null_mut()),
         lock: InstanceLock::default(),
         instance_id: 42,
+        alive: Arc::new(AtomicBool::new(true)),
     }));
     ctx.provide("svc-a", invoker).await.expect("provide");
     let raw = bare_activation(&ctx, &["svc-a"]);
@@ -1149,6 +1152,35 @@ fn realm_probe(sink: Arc<Mutex<Vec<Vec<u8>>>>) -> Arc<dyn Plugin> {
                     .expect("probe call ok");
                 let (_status, payload) = unpack(&reply);
                 sink.lock().expect("sink").push(payload.to_vec());
+                Ok(())
+            })
+        },
+    )
+}
+
+/// The grant probe's sinked outcome: ABI status plus granter activation id.
+type GrantOutcome = (i32, Option<u64>);
+
+/// An in-realm probe that declares svc-a (so its committed view binds to the
+/// realm-local provider), drives the consumer's `CONSUMER_GRANT`, and sinks
+/// the ABI status plus the granter activation id it resolved.
+fn grant_probe(sink: Arc<Mutex<Option<GrantOutcome>>>) -> Arc<dyn Plugin> {
+    dougong::plugin(
+        "grant-probe",
+        vec![Injection::new("svc-a")],
+        move |ctx, _config| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                let invoker = ctx
+                    .get::<Invoker>("svc-a")
+                    .expect("svc-a committed in the probe realm");
+                let granter_id = invoker.inner.activation_id();
+                let reply = invoker
+                    .call(CONSUMER_GRANT, b"svc-b\0svc-a".to_vec())
+                    .await
+                    .expect("grant call ok");
+                let (status, _) = unpack(&reply);
+                sink.lock().expect("sink").replace((status, granter_id));
                 Ok(())
             })
         },
@@ -1906,6 +1938,205 @@ async fn grant_is_exactly_one_service_for_one_target_activation() {
     ctx.stop().await;
 }
 
+// E1.13 (B1/C2): the authorization binds the provider resolved at require
+// time. A realm-local granter's entry must not authorize the same-name
+// provider the caller's own realm resolves — capability never transfers to
+// an activation the granter did not grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_does_not_transfer_to_a_same_name_provider_in_another_realm() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let ctx = Context::new();
+    // The default realm holds the target (svc-b) and the decoy svc-a
+    // provider (the world consumer, which never granted anything).
+    let world = boot_world(&ctx).await;
+    let realm = ctx.isolate_realm(ctx.fresh_label());
+    let granter: Arc<dyn Plugin> = Arc::new(from_static(&CONSUMER_TABLE).expect("consumer"));
+    let realm_granter = start(&realm, granter).await;
+    // Realm services do not leak outward (D15), so an in-realm probe that
+    // declares svc-a resolves the realm-local granter and drives its grant.
+    let sink = Arc::new(Mutex::new(None));
+    start(&realm, grant_probe(Arc::clone(&sink))).await;
+    let (grant_status, realm_granter_id) = sink.lock().expect("grant sink").expect("probe ran");
+    assert_eq!(grant_status, STATUS_OK);
+    let realm_granter_id = realm_granter_id.expect("realm granter activation id");
+    assert!(
+        super::grant_entries("svc-a")
+            .into_iter()
+            .any(|(g, t)| g == realm_granter_id && t != 0),
+        "the realm grant is recorded before the probe"
+    );
+    // The target's require resolves svc-a in the default realm (the decoy),
+    // not the realm granter: the entry must not authorize it.
+    let (status, detail) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"x").await;
+    assert_eq!(status, STATUS_UNDECLARED);
+    let detail: Value = serde_json::from_slice(&detail).expect("detail is JSON");
+    assert_eq!(detail["code"], "undeclared_dependency");
+    assert_eq!(
+        detail["message"],
+        "cannot get property \"svc-a\" without inject"
+    );
+    realm_granter.dispose().await;
+    world.consumer.dispose().await;
+    world.target.dispose().await;
+    ctx.stop().await;
+    assert!(
+        super::grant_entries("svc-a").is_empty(),
+        "serial grant slot cleaned"
+    );
+}
+
+// Review F2 (B5/C2, D31 amendment): a require that resolved the invoker
+// before the provider's withdrawal must fail closed once teardown has run.
+// Granted callers are not kernel dependency edges, so no drain joins them —
+// the liveness gate under the instance lock is their only teardown ordering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_invoker_call_after_provider_teardown_fails_closed() {
+    let ctx = Context::new();
+    let target: Arc<dyn Plugin> = Arc::new(from_static(&TARGET_TABLE).expect("target table"));
+    let target = start(&ctx, target).await;
+    let invoker = ctx.get::<Invoker>("svc-b").expect("svc-b committed");
+    target.dispose().await;
+    let err = invoker
+        .call(0, b"stale".to_vec())
+        .await
+        .expect_err("the liveness gate must fire");
+    assert_eq!(err.code, "provider_gone");
+    assert_eq!(err.class.as_str(), "transport");
+    ctx.stop().await;
+}
+
+// E1.15 (C1/C3/G2, review F8): the grant name index is root-scoped. A grant
+// made in one kernel root must not change another root's undeclared require
+// classification — cross-root stays byte-identical UNDECLARED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_name_index_does_not_bleed_across_roots() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let ctx_a = Context::new();
+    let world = boot_world(&ctx_a).await;
+    let (status, _) = call_framed(&ctx_a, "svc-a", CONSUMER_GRANT, b"svc-b\0svc-a").await;
+    assert_eq!(status, STATUS_OK);
+    assert!(
+        !super::grant_entries("svc-a").is_empty(),
+        "root A recorded the grant"
+    );
+
+    // Root B: a fresh kernel root in the same process. Its activation has no
+    // inject and no grant; the legacy classification must hold even though
+    // the process-global table holds root A's entry for the name.
+    let ctx_b = Context::new();
+    let raw = bare_activation(&ctx_b, &[]);
+    // SAFETY: raw names a live activation in root B.
+    let (status, detail) = unsafe { raw_require(raw, b"svc-a", CONSUMER_ECHO, b"") };
+    assert_eq!(status, STATUS_UNDECLARED);
+    let detail: Value = serde_json::from_slice(&detail).expect("detail is JSON");
+    assert_eq!(detail["code"], "undeclared_dependency");
+    assert_eq!(
+        detail["message"],
+        "cannot get property \"svc-a\" without inject"
+    );
+    // SAFETY: unique reclaim after the require.
+    unsafe { reclaim_activation(raw) };
+    world.consumer.dispose().await;
+    world.target.dispose().await;
+    ctx_b.stop().await;
+    ctx_a.stop().await;
+    assert!(
+        super::grant_entries("svc-a").is_empty(),
+        "serial grant slot cleaned"
+    );
+}
+
+// E1.16 (B2/B4, review F7): a target without an activation id (an
+// in-process or wasm invoker) is rejected at grant time — a structurally
+// inert capability must not be reported as success.
+#[tokio::test]
+async fn grant_rejects_a_target_without_an_activation_id() {
+    let ctx = Context::new();
+    let host_svc = dougong::plugin("host-svc", vec![], |ctx, _config| {
+        Box::pin(async move {
+            ctx.provide("svc-host", Invoker::new(Arc::new(HostSvc)))
+                .await?;
+            Ok(())
+        })
+    });
+    start(&ctx, host_svc).await;
+    let raw = bare_activation_with_provide(&ctx, &[], &["svc-inert"]);
+    assert_eq!(
+        // SAFETY: raw names the live detached activation.
+        unsafe { raw_grant(raw, b"svc-host", b"svc-inert") },
+        STATUS_FAILED
+    );
+    // SAFETY: same live activation; direct inspection retains the detail code.
+    let activation = unsafe { &*raw.cast::<super::Activation>() };
+    let err = super::grant_impl(activation, b"svc-host", b"svc-inert")
+        .expect_err("in-process target grant must fail");
+    assert_eq!(err.code, "grant_target_unsupported");
+    assert_eq!(err.status, STATUS_FAILED);
+    assert!(
+        super::grant_entries("svc-inert").is_empty(),
+        "no inert entry was stored"
+    );
+    // SAFETY: unique reclaim after all vtable calls.
+    unsafe { reclaim_activation(raw) };
+    ctx.stop().await;
+}
+
+// Review F9 (G2/C4): a provably empty grant table answers Missing through
+// the atomic gate alone — a grant-free process keeps the legacy static-miss
+// rejection lock-free. Holds the serialized slot so the table state is
+// exclusive to this test.
+#[tokio::test]
+async fn empty_grant_table_takes_no_lock() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    assert!(
+        !super::GRANTS_LIVE.load(Ordering::Relaxed),
+        "the serialized slot starts with a drained table"
+    );
+    let locks = super::GRANT_LOCKS.load(Ordering::Relaxed);
+    assert!(matches!(
+        super::lookup_grant(1, 9, "svc-gate"),
+        super::GrantLookup::Missing
+    ));
+    assert_eq!(
+        super::GRANT_LOCKS.load(Ordering::Relaxed),
+        locks,
+        "the gate answered without the mutex"
+    );
+    // One committed entry flips the gate; the lookup now takes the lock and
+    // reports the entry's granter for its target caller.
+    super::GRANTS.lock().insert(
+        "svc-gate".to_string(),
+        vec![super::GrantEntry {
+            granter: 7,
+            root: 1,
+            target_activation: 9,
+        }],
+    );
+    super::GRANTS_LIVE.store(true, Ordering::Release);
+    assert!(matches!(
+        super::lookup_grant(1, 9, "svc-gate"),
+        super::GrantLookup::Present { granters } if granters == [7]
+    ));
+    // Cross-root and wrong-caller probes still take the lock (the name is
+    // live) and answer through the filtered path (F8/C1).
+    assert!(matches!(
+        super::lookup_grant(2, 9, "svc-gate"),
+        super::GrantLookup::Missing
+    ));
+    assert!(matches!(
+        super::lookup_grant(1, 10, "svc-gate"),
+        super::GrantLookup::Present { granters } if granters.is_empty()
+    ));
+    assert_eq!(
+        super::GRANT_LOCKS.load(Ordering::Relaxed),
+        locks + 3,
+        "each post-gate lookup took the mutex exactly once"
+    );
+    // Drain restores the gate for the next serialized test.
+    super::GRANTS.lock().clear();
+    super::GRANTS_LIVE.store(false, Ordering::Release);
+}
+
 // E1.9 (A3/C4): concurrent registration and callbacks are deterministic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_grants_and_requires_do_not_deadlock() {
@@ -1980,6 +2211,8 @@ async fn grant_rejects_non_utf8_names() {
 // E1.11 (G7/C1/C3): static hits bypass the table; name presence keeps INACTIVE.
 #[tokio::test]
 async fn require_grant_lookup_preserves_hot_path_and_two_level_priority() {
+    // Writes the table (grant-missing), so it joins the serialized slot.
+    let _serial = GRANT_TEST_LOCK.lock().await;
     let ctx = Context::new();
     let host_svc = dougong::plugin("host-svc", vec![], |ctx, _config| {
         Box::pin(async move {
@@ -1989,6 +2222,10 @@ async fn require_grant_lookup_preserves_hot_path_and_two_level_priority() {
         })
     });
     start(&ctx, host_svc).await;
+    // The grant target must be a dylib activation (F7 rejects id-less
+    // in-process invokers), so the name-index arm below boots one.
+    let target: Arc<dyn Plugin> = Arc::new(from_static(&TARGET_TABLE).expect("target table"));
+    let target = start(&ctx, target).await;
     let declared = bare_activation(&ctx, &["svc-host"]);
     let before = super::grant_lookups_on_this_thread();
     // SAFETY: declared names a live activation with a static capability.
@@ -2000,9 +2237,9 @@ async fn require_grant_lookup_preserves_hot_path_and_two_level_priority() {
     unsafe { reclaim_activation(declared) };
 
     let granter = bare_activation_with_provide(&ctx, &[], &["grant-missing"]);
-    // SAFETY: granter is live; svc-host is a committed target.
+    // SAFETY: granter is live; svc-b is a committed dylib target.
     let activation = unsafe { &*granter.cast::<super::Activation>() };
-    super::grant_impl(activation, b"svc-host", b"grant-missing").expect("grant registers");
+    super::grant_impl(activation, b"svc-b", b"grant-missing").expect("grant registers");
     let caller = bare_activation(&ctx, &[]);
     // SAFETY: caller is live, has no static declaration, and owns no grant.
     let (status, detail) = unsafe { raw_require(caller, b"grant-missing", 0, b"") };
@@ -2014,6 +2251,7 @@ async fn require_grant_lookup_preserves_hot_path_and_two_level_priority() {
     unsafe { reclaim_activation(caller) };
     // SAFETY: the granter has its own unique reclaim after all grant checks.
     unsafe { reclaim_activation(granter) };
+    target.dispose().await;
     ctx.stop().await;
 }
 
@@ -2037,7 +2275,7 @@ async fn target_reactivation_rebinds_grant_through_granter_reactivation() {
         .get::<Invoker>("svc-a")
         .and_then(|invoker| invoker.inner.activation_id())
         .expect("first granter id");
-    assert!(super::grant_entries("svc-a").contains(&(first_granter, Some(first_target))));
+    assert!(super::grant_entries("svc-a").contains(&(first_granter, first_target)));
     let (status, payload) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"first").await;
     assert_eq!(
         (status, payload.as_slice()),
@@ -2067,9 +2305,9 @@ async fn target_reactivation_rebinds_grant_through_granter_reactivation() {
         .expect("second granter id");
     assert_ne!(first_target, second_target);
     assert_ne!(first_granter, second_granter);
-    assert!(super::grant_entries("svc-a").contains(&(second_granter, Some(second_target))));
+    assert!(super::grant_entries("svc-a").contains(&(second_granter, second_target)));
     assert!(
-        !super::grant_entries("svc-a").contains(&(second_granter, Some(first_target))),
+        !super::grant_entries("svc-a").contains(&(second_granter, first_target)),
         "the new grant is bound to the new target, not the old identity"
     );
     let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_SETUP_GRANT, b"").await;

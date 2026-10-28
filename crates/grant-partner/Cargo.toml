@@ -1,0 +1,19 @@
+[package]
+name = "grant-partner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Example grant-target dougong plugin built as a pure C-ABI cdylib"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+dougong-abi = { path = "../dougong-abi" }

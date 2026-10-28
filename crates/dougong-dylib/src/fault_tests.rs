@@ -164,6 +164,7 @@ static HANG_TABLE: PluginExports = PluginExports {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hung_teardown_is_orphaned_and_the_unload_completes() {
+    super::arm_deadlock_watchdog();
     let (release_tx, wait_rx) = std::sync::mpsc::channel();
     let _ = HANG_RELEASE.set(release_tx);
     let _ = HANG_WAIT.set(Mutex::new(wait_rx));
@@ -238,6 +239,7 @@ static ONCE_TABLE: PluginExports = PluginExports {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn teardown_runs_exactly_once_under_concurrent_dispose() {
+    super::arm_deadlock_watchdog();
     let ctx = Context::new();
     let plugin: Arc<dyn Plugin> = Arc::new(from_static(&ONCE_TABLE).expect("once table"));
     let handle = Arc::new(ctx.plugin(plugin, None).expect("spawn fixture"));

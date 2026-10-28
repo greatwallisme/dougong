@@ -675,6 +675,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "grant-partner"
+version = "0.4.0"
+dependencies = [
+ "dougong-abi",
+]
+
+[[package]]
 name = "greeter-plugin"
 version = "0.4.0"
 dependencies = [

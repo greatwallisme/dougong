@@ -27,8 +27,10 @@ in `rust-toolchain.toml`.
 | wasm component | untrusted, sandboxed | WIT world `dougong:kernel@0.1.0` | `wit-bindgen` only | third-party or fault-isolated code; fuel/epoch/memory capped |
 
 Reference implementations to copy structure from (not names):
-`crates/greeter-plugin` (dylib), `crates/greeter-wasm` (wasm),
-`crates/dougong/src/lib.rs` doctest (in-process).
+`crates/greeter-plugin` (dylib), `crates/grant-partner` (dylib grant
+target - empty inject list, callbacks ride a runtime grant),
+`crates/greeter-wasm` (wasm), `crates/dougong/src/lib.rs` doctest
+(in-process).
 
 ## 2. The contract every form implements
 
@@ -100,7 +102,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # End-to-end proof per form (each must exit 0):
 cargo run -p dougong-dylib  --example dylib_demo    # dylib artifact, needs cargo build --workspace first
-cargo run -p dougong-dylib  --example outbound_demo # ABI v3/v4 outbound + grant arms, same artifact
+cargo run -p dougong-dylib  --example outbound_demo # ABI v3/v4 outbound + grant arms (greeter + grant-partner artifacts)
 cargo run -p dougong-wasm   --example wasm_demo     # wasm artifact, needs the wasip2 build above
 cargo run -p dougong-loader --example loader_demo   # loader lifecycle over the dylib artifact
 ```
@@ -149,8 +151,18 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   `STATUS_INVALID_PAYLOAD` / `STATUS_INVALID_EVENT`.
 - Dylib `grant` is registration, not communication: it makes no call and does
   not participate in reentrancy detection. The target must already be
-  committed, and the granted name must be in the granter's `provide` table.
+  committed, must be a dylib activation (an in-process or wasm target fails
+  with `STATUS_FAILED` / `grant_target_unsupported`), and the granted name
+  must be in the granter's `provide` table.
 - Grants die with the granter activation: teardown or reactivation revokes
   them, and a new activation starts with an empty grant set. There is no
-  runtime revoke or cross-activation inheritance.
+  runtime revoke or cross-activation inheritance. The authorization also
+  binds the resolved provider (2026-10-28 amendment): the target's granted
+  `require` passes only when its realm resolves the granted name to the
+  granter's own activation - same-name providers in other realms stay
+  `STATUS_UNDECLARED`.
+- A dylib `require` racing the provider's teardown fails closed with
+  `STATUS_FAILED` (`provider_gone`, transport class): granted callers are
+  not kernel dependency edges, so the liveness gate under the per-instance
+  lock is the only teardown ordering - never retry into a stale handle.
 - Teardown code that must run last goes first in `apply` (LIFO reversal).
