@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-20
+// Rust guideline compliant 2026-10-28
 //! The dynamic service invocation channel (design decision D6).
 //!
 //! Services provided across a plugin boundary (dylib/so, wasm) are invoked
@@ -23,6 +23,17 @@ use crate::plugin::BoxFuture;
 /// hosts); in-process Rust plugins may also implement it to expose
 /// interface-style services to non-Rust consumers.
 pub trait Invoke: Send + Sync {
+    /// Returns the stable activation identity used by boundary capability grants.
+    ///
+    /// Boundary hosts return a process-unique, never-reused id when one
+    /// invocation adapter represents one plugin activation. Decorators must
+    /// forward the wrapped implementation's id. The default `None` preserves
+    /// ordinary in-process implementations, which do not participate in the
+    /// dylib runtime-grant mechanism.
+    fn activation_id(&self) -> Option<u64> {
+        None
+    }
+
     /// Invokes one method of the service.
     ///
     /// `payload` encoding is fixed by the service contract (the interface

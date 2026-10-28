@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-24
+// Rust guideline compliant 2026-10-28
 //! Per-class error policy surface (stability track S5, design D20).
 //!
 //! Every kernel [`Error`] carries an [`ErrorClass`]; this module holds the
@@ -288,6 +288,10 @@ struct BoundaryInvoke {
 }
 
 impl Invoke for BoundaryInvoke {
+    fn activation_id(&self) -> Option<u64> {
+        self.inner.activation_id()
+    }
+
     fn call(&self, method: u32, payload: Vec<u8>) -> BoxFuture<Result<Vec<u8>>> {
         let inner = Arc::clone(&self.inner);
         let root = Weak::clone(&self.root);

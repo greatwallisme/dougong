@@ -12,8 +12,8 @@ providers come and go). A plugin never hand-writes teardown - it declares and
 registers, and the kernel derives reversal from registration.
 
 All plugin forms implement **one semantic contract**. Version anchors for the
-current code: ABI_VERSION 3 (`dougong-abi`: v2 CPS event protocol per D14,
-plus the v3 outbound `HostExports` vtable per D16), WIT world
+current code: ABI_VERSION 4 (`dougong-abi`: v2 CPS event protocol per D14,
+v3 outbound `HostExports` per D16, plus the v4 `grant` entry per D31), WIT world
 `dougong:kernel@0.1.0` (`wit/dougong-plugin.wit`), contract hash
 `dougong-dynamic-channel-v1`, wasmtime 48 / wit-bindgen 0.61, toolchain pinned
 in `rust-toolchain.toml`.
@@ -42,7 +42,10 @@ Five obligations, same shape in all three forms:
    Keep this distinction when mapping errors across a boundary. For the dylib
    form the descriptor `inject` list doubles as the capability basis of the
    v3 outbound vtable: a `require` for an undeclared service fails with
-   `STATUS_UNDECLARED` before any resolution happens.
+   `STATUS_UNDECLARED` before any resolution happens. ABI v4 adds one narrow
+   exception: the service owner may `grant` one committed target activation
+   runtime access to one of its provided services, without changing the
+   target's descriptor.
 2. **Activate** - the body (`apply`) receives the activation site and config.
    ALL registration happens here: `provide`, listeners, custom effects. The
    committed view (already-provided services) is visible *before* the body
@@ -83,7 +86,7 @@ Config arrives as `serde_json::Value` (in-process) or JSON bytes
 | Reference | Read when |
 |-----------|-----------|
 | [kernel-model.md](references/kernel-model.md) | Writing in-process Rust plugins; need the Context API, event modes, effect collection, error model, or loader config format. Explains the shared semantics all forms inherit. |
-| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: v3 export table + `HostExports` outbound vtable, JSON descriptor (incl. `listen`), buffer protocol, CPS event protocol, reentrancy and thread discipline, state and teardown. |
+| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: v4 export table + `HostExports` outbound vtable (including grants), JSON descriptor (incl. `listen`), buffer protocol, CPS event protocol, reentrancy and thread discipline, state and teardown. |
 | [wasm-plugin.md](references/wasm-plugin.md) | Building a wasm component: crate layout, WIT bindings, Guest impl, JSON payload rules, sandbox expectations, host-side requirements. |
 
 ## 4. Verification
@@ -97,7 +100,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # End-to-end proof per form (each must exit 0):
 cargo run -p dougong-dylib  --example dylib_demo    # dylib artifact, needs cargo build --workspace first
-cargo run -p dougong-dylib  --example outbound_demo # ABI v3 outbound arms, same artifact
+cargo run -p dougong-dylib  --example outbound_demo # ABI v3/v4 outbound + grant arms, same artifact
 cargo run -p dougong-wasm   --example wasm_demo     # wasm artifact, needs the wasip2 build above
 cargo run -p dougong-loader --example loader_demo   # loader lifecycle over the dylib artifact
 ```
@@ -116,7 +119,7 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   export time - the guest must call `register_listener` during `apply`.
 - Dylib event listener never fires: the descriptor's `listen` map is missing
   the event, or the host rejected the table at load - `abi_version` must
-  equal the host's `ABI_VERSION` exactly (a v2 artifact is refused outright),
+  equal the host's `ABI_VERSION` exactly (a v3 artifact is refused outright),
   and events additionally need the `listen` declaration.
 - Dylib waterfall: return `STATUS_DEFERRED` only when `next_available == 1`;
   deferring outside waterfall, or from `on_next`, is rejected by the host.
@@ -144,4 +147,10 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
 - Dylib `emit` payload must be **valid JSON bytes** and the event name must
   not use the `internal/*` prefix - violations fail with
   `STATUS_INVALID_PAYLOAD` / `STATUS_INVALID_EVENT`.
+- Dylib `grant` is registration, not communication: it makes no call and does
+  not participate in reentrancy detection. The target must already be
+  committed, and the granted name must be in the granter's `provide` table.
+- Grants die with the granter activation: teardown or reactivation revokes
+  them, and a new activation starts with an empty grant set. There is no
+  runtime revoke or cross-activation inheritance.
 - Teardown code that must run last goes first in `apply` (LIFO reversal).

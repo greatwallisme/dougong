@@ -426,6 +426,57 @@ boundary tag），不跨边界透传调用方身份**（2026-10-25）。
   身份/时长/计数器、失败分级 + quarantine 反应组合不回归）。四关 + 锚点
   逐字节 + 六 demo 全绿。
 
+### D31 dylib 回调能力授予 = ABI v4 `HostExports.grant` + 激活粒度窄授权
+
+2026-10-28，下游 fly-rafter 的通用策略注册面要求「服务拥有者运行期授权特定
+对方回调自己」，且决策回调必须有同步返回值。静态枚举会使通用注册面退化为每
+新增插件即重编译宿主；事件 rendezvous 的回程 require 又必闭合 D-V3-3 等待环。
+**裁决：新增纯登记原语 `grant`，不动描述符、不造第二调用路径；能力从拥有者
+主动窄授予，而非放宽静态声明体系**（doc/maintenance/grant_requirements.md，
+G1–G8）。
+
+- **ABI 最小 diff**：`ABI_VERSION` 3→4；`HostExports` 在 `emit` 后追加第 4
+  字段 `grant(host, target_service, target_len, granted_service, granted_len)
+  -> i32`，其余字段与 `PluginExports` 逐字节不变，v3 工件由既有加载门硬拒。
+  `grant` 任意插件线程可调、宿主 panic-contained；不获取实例锁、不发起调用、
+  不参与重入栈或等待图、不写 out buffer。复制件生命周期与 require/emit 同窗，
+  teardown 后调用仍为文档化 UB。
+- **授权记录与目标身份**：记录 =（授予者激活 id，目标激活 id，授予服务名）。
+  目标在授予时按授予者 realm 解析到**已提交** Invoker，fail-closed；解析失败即
+  `STATUS_INACTIVE`，装配序错误不推迟到首次回调。目标身份必须是激活而非名字：
+  与 vtable/`Activation.inject` 粒度一致；目标换件后旧授权不得静默流向新对象；
+  注入该目标的授予者会随 D4/D6 再激活级联重新 setup 并绑新目标，无失养窗口。
+- **稳定 id 助手（内核唯一触点）**：`Invoke::activation_id()` 默认 `None`，
+  `DylibInvoke` 返回既有进程单调 `instance_id`，`BoundaryInvoke` 原样转发。
+  不能拿 `Context::get` 返回的 Arc 地址当激活身份：O7/S5 开启时每次解析可生成
+  新装饰器，地址既不稳定也不可跨 crate 解包。该助手只暴露身份，不改变任何
+  invoke 行为；授权表另持解析时 Arc 用于幂等同性判断，永不经它调用。
+- **校验与幂等**：先验证两名均为 UTF-8（FAILED/`invalid_grant_name`），再查
+  `granted_service ∈ 授予者 descriptor provide`（FAILED/`grant_not_owned`），
+  最后解析 target（INACTIVE/`inactive_dependency`）。同三元组重复授予 = OK 且
+  簿记单条；授权与后续注册调用解耦。ABI 签名无 out buffer，故边界只返回状态码；
+  内部 typed failure 保留 code/message 供诊断与钉测，不虚构第二详情通道。
+- **require 判定序与名级索引**：静态 inject 命中直接走原路径，**不触授权表**
+  （G7）；静态未中先查「该授予服务名是否有任何条目」，无名条目即逐字节复用
+  UNDECLARED。有名条目才比对调用方激活 id，但无论是否获授都先解析所请求服务：
+  未提交 = INACTIVE，已提交但未获授 = UNDECLARED，获授 = 与静态放行完全同路。
+  因此 undeclared→inactive 的两级优先序不被授权存在性改变（C1–C3）。
+- **锁与生命周期**：全局授权表以授予服务名为索引；锁是叶锁，锁内无解析、无
+  实例锁、无外方调用、无日志，移除的 Arc 在解锁后析构。授予者全部回滚路径汇聚
+  `ActivationPtr::reclaim`（正常 teardown、setup 失败、effect 注册失败），在此
+  清条目，故新激活从空集开始且不复活。每次成功授予（含幂等重授）记 Info
+  `outbound_grant`，批量清理记一次汇总 Info。
+- **能力模型收窄论证**：静态 inject 仍是装配期声明；grant 只能由服务拥有者给
+  一个当前已提交激活授出一个自有服务名，粒度不宽于 inject，且随授予者激活自动
+  失效。无通配/前缀/方法粒度/主动 revoke/转移/再委托/跨激活继承，无 in-process
+  或 wasm 动态授予，无 loader 声明注入，无 grant 探测调用；多方回调须各自直接
+  授权。UNDECLARED/INACTIVE 词表及未触及世界的可观测行为不变。
+- **验证锚**：`dougong-dylib::outbound_tests` ABI v4 E1.1–12（往返、未授权零
+  回归、非自有、未提交、消亡不复活、幂等与审计、精确授权面、并发、非法名、
+  热路径与两级优先序、再激活重绑）；E1.1 额外开启 boundary_trace 钉装饰器
+  转发。`outbound_demo` 增 greeter→第二 dylib-form 插件的 grant 回调臂；既有
+  全部 demo、wasm/WIT、loader JSON 与内核 invoke 语义零回归。
+
 ## 3. 剩余真实待决（产品判断，非工程回避）
 
 **R1 dylib 旧镜像常驻的可接受性**：D5 的推论——每次热替换泄漏一份旧代码镜像（有界：次数×体积）。请确认接受，或给出重载频率/体积上限要求（若不可接受，唯一替代是"dylib 不支持热替换，仅重启换新"——也请裁决）。
@@ -455,11 +506,12 @@ dougong = 内核（约 3k 行级）+ ABI 契约与 dylib 宿主（数百行级�
 - **R3** ABI 契约 crate 命名 = `dougong-abi`。
 - **R4 工具链纪律**（2026-10-21）：仓库工件一律且仅由 `rust-toolchain.toml` 钉定的工具链（1.99.1）编译；禁止以任何其他工具链构建或替换 `target/` 内的工件（含一次性实验）。MSRV 声明已整体移除（2026-10-21 追记）——未实测过的兼容下限一律不宣称；如需版本证明，走隔离环境（独立 worktree/CI）实测后再写进清单。
 
-## 附录 A：语义等价表（in-process vs dylib-v3，D16/F2）
+## 附录 A：语义等价表（in-process vs dylib-v4，D16/D31）
 
-| 面 | in-process | dylib v3 | 锚 |
+| 面 | in-process | dylib v4 | 锚 |
 |---|---|---|---|
-| require 能力检查基准 | fiber 兴趣集（声明注入解析承诺） | 实例 descriptor `inject` 集（常量，激活期捕获进 vtable 闭包） | B2；两级语义（undeclared/inactive）一致，检查对象不同 |
+| require 能力检查基准 | fiber 兴趣集（声明注入解析承诺） | 实例 descriptor `inject` 集（常量，激活期捕获进 vtable 闭包）；拥有者可另授运行期窄能力 | B2；两级语义（undeclared/inactive）一致，检查对象不同 |
+| 动态授予 | 不需要：依赖面在装配期已知，需动态边时改用 dylib 或静态声明 | `grant`：拥有者授一个自有服务名给一个已提交目标激活；随授予者激活失效 | D31；名级索引保持 undeclared→inactive 优先序，无跨激活继承 |
 | require 载荷 | 类型化键（`Any` 下转）与动态通道字节并存 | 仅动态通道字节，对宿主不透明（编码归服务契约） | B6 |
 | emit 载荷 | `serde_json::Value` | 必须合法 JSON 字节，非法 = `STATUS_INVALID_PAYLOAD` | C2（显式非对称） |
 | `internal/*` 事件 | 桥禁订（`on_dispatch` 拒绝） | 出站禁发（`STATUS_INVALID_EVENT`） | C3 |

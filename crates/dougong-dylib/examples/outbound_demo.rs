@@ -1,9 +1,11 @@
-// Rust guideline compliant 2026-10-24
-//! ABI v3 outbound acceptance demo: the greeter dylib's own worker thread
+// Rust guideline compliant 2026-10-28
+//! ABI v3/v4 outbound acceptance demo: the greeter dylib's own worker thread
 //! performs a synchronous cross-plugin `require` and publishes an event
-//! (the full chain), then two embedded arms prove the deterministic failure
-//! modes of the vtable contract:
+//! (the full chain), then embedded arms prove grants and deterministic
+//! failure modes of the vtable contract:
 //!
+//! - grant: greeter authorizes a second dylib-form plugin's activation,
+//!   which then requires greeter's service without a static injection;
 //! - permission: requiring a service absent from the descriptor `inject`
 //!   list fails with `STATUS_UNDECLARED` (capability error);
 //! - reentrancy: requiring a service that calls back into greeter on the
@@ -25,7 +27,7 @@ use dougong_abi::{
     write_out,
 };
 use dougong_dylib::{from_static, load};
-use greeter_plugin::{GREETER_HELLO, GREETER_REQUIRE, GREETER_WORKER_REPLY};
+use greeter_plugin::{GREETER_GRANT, GREETER_HELLO, GREETER_REQUIRE, GREETER_WORKER_REPLY};
 use serde_json::Value;
 
 fn plugin_path() -> PathBuf {
@@ -85,6 +87,91 @@ fn detail_code(payload: &[u8]) -> dougong::Result<String> {
         .map(str::to_string)
         .ok_or_else(|| Error::msg("detail document lacks a \"code\" field"))
 }
+
+// ---------------------------------------------------------------------------
+// Grant arm fixture: a second dylib-form plugin with no static injection.
+// ---------------------------------------------------------------------------
+
+struct CallbackState {
+    host: HostExports,
+}
+
+unsafe extern "C" fn callback_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: caller-owned buffer contract.
+    if unsafe { write_out(b"grant-callback", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn callback_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: caller-owned buffer contract. The empty inject list is the arm.
+    if unsafe {
+        write_out(
+            br#"{"name":"grant-callback","provide":["grant-callback"],"inject":[]}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn callback_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+    if host.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: valid for the duration of setup; copied by value.
+    let host = unsafe { *host };
+    Box::into_raw(Box::new(CallbackState { host })).cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn callback_call(
+    handle: *mut std::ffi::c_void,
+    _method: u32,
+    data: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if handle.is_null() {
+        return dougong_abi::STATUS_FAILED;
+    }
+    // SAFETY: live handle; the host serializes foreign entries per instance.
+    let state = unsafe { &mut *handle.cast::<CallbackState>() };
+    let payload = if data.is_null() {
+        &[]
+    } else {
+        // SAFETY: the vtable contract makes data readable for len bytes here.
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    let (status, reply) = plugin_require(&state.host, b"greeting", GREETER_HELLO, payload);
+    pack_framed(status, &reply, out, cap, out_len)
+}
+
+unsafe extern "C" fn callback_teardown(handle: *mut std::ffi::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: allocated by callback_setup and torn down exactly once.
+    drop(unsafe { Box::from_raw(handle.cast::<CallbackState>()) });
+}
+
+static CALLBACK_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: callback_name,
+    descriptor: callback_descriptor,
+    setup: callback_setup,
+    call: callback_call,
+    on_event: ring_on_event,
+    on_next: ring_on_next,
+    teardown: callback_teardown,
+};
 
 // ---------------------------------------------------------------------------
 // Cross-instance arm fixtures: two statically-resolved dylib-form instances
@@ -478,6 +565,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(status, STATUS_UNDECLARED);
         assert_eq!(detail_code(detail)?, "undeclared_dependency");
         log("-- permission arm: undeclared require rejected --".to_string());
+
+        // Grant arm: the callback plugin has an empty descriptor inject set.
+        // Greeter grants its activation `greeting`; the subsequent callback
+        // therefore takes the grant path rather than the static-inject path.
+        let callback: Arc<dyn dougong::Plugin> = Arc::new(from_static(&CALLBACK_TABLE)?);
+        let callback_fiber = ctx.plugin(callback, None)?;
+        callback_fiber.join().await?;
+        let granted = greeting
+            .call(GREETER_GRANT, b"grant-callback\0greeting".to_vec())
+            .await?;
+        let (status, _) = unpack_framed(&granted)?;
+        assert_eq!(status, STATUS_OK);
+        let callback_reply = ctx
+            .get::<Invoker>("grant-callback")
+            .ok_or_else(|| Error::msg("grant-callback is not committed"))?
+            .call(0, b"grant-round-trip".to_vec())
+            .await?;
+        let (status, payload) = unpack_framed(&callback_reply)?;
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(payload, b"hello from a dougong dylib");
+        callback_fiber.dispose().await;
+        log("-- grant arm: authorized callback round trip verified --".to_string());
 
         // Reentrancy arm: the `GREETER_REQUIRE` handler runs inside a greeter
         // export, so the oracle's `loop` callback into `greeting` would

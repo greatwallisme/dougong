@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-23
+// Rust guideline compliant 2026-10-28
 //! Stable C-ABI contract between a [`dougong`] host and dynamically loaded
 //! plugins.
 //!
@@ -10,7 +10,7 @@
 //! duplicated runtime state across compilation artifacts (redoop/cordis-rust
 //! validated the pattern; see `doc/research/study-3-rust-projects.md` §3.1).
 //!
-//! # Outbound calls (ABI v3)
+//! # Outbound calls and grants (ABI v4)
 //!
 //! Since v3 the boundary is two-way: `setup` receives a [`HostExports`]
 //! vtable through which the plugin may call other plugins' services
@@ -22,17 +22,24 @@
 //!   entries remain callable until *this activation's* `teardown` returns;
 //!   any later call is undefined behavior (not detected). A re-activation
 //!   receives a fresh vtable independent of the previous handle.
-//! - `require`/`emit` may be called from any plugin thread, concurrently.
-//!   The host implementations are panic-contained: a host-side panic becomes
-//!   [`STATUS_HOST_ERROR`], never an unwind across the boundary. The plugin
-//!   must uphold the same rule in the other direction.
+//! - `require`/`emit`/`grant` may be called from any plugin thread,
+//!   concurrently. The host implementations are panic-contained: a host-side
+//!   panic becomes [`STATUS_HOST_ERROR`], never an unwind across the boundary.
+//!   The plugin must uphold the same rule in the other direction.
 //! - `require` honors the capability model: calling a service absent from
-//!   the descriptor `inject` list deterministically fails with
-//!   [`STATUS_UNDECLARED`]; a declared-but-uncommitted service fails with
-//!   [`STATUS_INACTIVE`]; a call that would re-enter an instance already
-//!   executing on the calling thread fails with [`STATUS_REENTRANCY`]
-//!   instead of deadlocking. `in` payloads are uncapped; `out` payloads
-//!   follow the growable buffer protocol (retry on [`STATUS_CAPACITY`]).
+//!   the descriptor `inject` list and not covered by an activation grant
+//!   deterministically fails with [`STATUS_UNDECLARED`]; an uncommitted
+//!   service fails with [`STATUS_INACTIVE`]; a call that would re-enter an
+//!   instance already executing on the calling thread fails with
+//!   [`STATUS_REENTRANCY`] instead of deadlocking. `in` payloads are uncapped;
+//!   `out` payloads follow the growable buffer protocol (retry on
+//!   [`STATUS_CAPACITY`]).
+//! - `grant` lets a provider authorize one committed target activation to
+//!   `require` one of its descriptor-provided services without static
+//!   injection. It is an idempotent, status-only registration primitive: no
+//!   foreign call, no output buffer, no instance lock, and no reentrancy
+//!   participation. Grants expire with the granter activation and are never
+//!   inherited by a later activation.
 //! - On any `require` status other than [`STATUS_OK`]/[`STATUS_CAPACITY`]
 //!   the out buffer may carry a UTF-8 JSON detail document (`{"code": ...,
 //!   "class": ..., "message": ...}` — `class` is the kernel's error class,
@@ -226,7 +233,11 @@ pub const STATUS_INVALID_EVENT: i32 = -8;
 /// v3 (2026-10-23): outbound capability — `setup` now receives a
 /// [`HostExports`] vtable carrying `require` (synchronous cross-plugin
 /// service calls) and `emit` (kernel-bus event publication).
-pub const ABI_VERSION: u32 = 3;
+///
+/// v4 (2026-10-28): callback capability grants — [`HostExports`] gains
+/// `grant`, an activation-scoped registration primitive for narrow runtime
+/// delegation of `require` capability (design decision D31).
+pub const ABI_VERSION: u32 = 4;
 
 /// Event dispatch mode: run listeners without waiting for returned values.
 pub const MODE_EMIT: u32 = 0;
@@ -270,7 +281,7 @@ pub unsafe fn write_out(src: &[u8], out_buf: *mut u8, cap: usize, out_len: *mut 
     true
 }
 
-/// Host-provided outbound vtable handed to `setup` (ABI v3).
+/// Host-provided outbound vtable handed to `setup` (ABI v4).
 ///
 /// The pointer passed to `setup` is valid for the duration of that call
 /// only; the plugin copies this struct by value. `host_handle` is an opaque
@@ -293,9 +304,19 @@ pub unsafe fn write_out(src: &[u8], out_buf: *mut u8, cap: usize, out_len: *mut 
 /// - `emit` publishes one event to the kernel bus, enqueue-and-return. The
 ///   event name must be UTF-8 outside the `internal/*` prefix and the
 ///   payload must be valid JSON bytes.
+/// - `grant` allows the currently committed provider of `target_service` to
+///   `require` this plugin's `granted_service` without a static descriptor
+///   injection. The granted service must occur in this plugin's `provide`
+///   table. The grant binds the resolved target activation and expires with
+///   the granting activation. It returns [`STATUS_OK`], including for an
+///   idempotent repeated grant, [`STATUS_INACTIVE`] when the target has no
+///   committed provider, or [`STATUS_FAILED`] for an invalid name or a
+///   service the granter does not own. No output buffer is written.
 ///
-/// Both entries are implemented by the host with full panic containment and
-/// are safe to call concurrently from arbitrary plugin threads.
+/// All three callable entries are implemented by the host with full panic
+/// containment and are safe to call concurrently from arbitrary plugin
+/// threads. `grant` only registers capability: it neither invokes a plugin
+/// nor participates in reentrancy detection.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HostExports {
@@ -320,6 +341,17 @@ pub struct HostExports {
         event_len: usize,
         payload: *const u8,
         payload_len: usize,
+    ) -> i32,
+    /// Grants `target_service`'s committed activation access to `granted_service`.
+    ///
+    /// This is a pure registration primitive: it initiates no calls and writes
+    /// no output buffer. Both names are read-only byte strings for this call.
+    pub grant: unsafe extern "C" fn(
+        host: *mut std::os::raw::c_void,
+        target_service: *const u8,
+        target_service_len: usize,
+        granted_service: *const u8,
+        granted_service_len: usize,
     ) -> i32,
 }
 
@@ -472,7 +504,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(ABI_VERSION, 3);
+        assert_eq!(ABI_VERSION, 4);
         assert_eq!(STATUS_DEFERRED, 2);
     }
 

@@ -3,6 +3,48 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.4.0] - 2026-10-28
+
+### ABI v4：dylib 回调能力授予（破坏性变更）
+
+服务拥有者可在运行期把「可 require 我的一个服务」授给特定的已提交目标激活，
+无需目标在 descriptor `inject` 中静态声明。裁决全文见 D31；需求来源为
+fly-rafter 的通用决策型策略注册面（回调必须有同步返回值，事件 rendezvous
+无法替代）。
+
+v3 → v4 diff 清单仅一项：`HostExports` 在 `emit` 后追加 `grant` 字段及配套
+授权表语义。`PluginExports`、descriptor schema、require/emit、五种事件模式、
+wasm/WIT、loader JSON 和既有内核调用行为均不变。
+
+- `grant(target_service, granted_service)` 只登记、不调用、不写 out buffer；
+  任意插件线程并发可调，不获取实例锁，不参与重入栈/等待图。
+- 只能授予自己 descriptor `provide` 表内的服务名。目标在授予时按授予者 realm
+  解析且必须已提交；目标身份为激活 id，提供者换件不继承。
+- 校验：非 UTF-8 = `STATUS_FAILED`（`invalid_grant_name`）；非自有 =
+  `STATUS_FAILED`（`grant_not_owned`）；目标未提交 = `STATUS_INACTIVE`
+  （`inactive_dependency`）。同三元组重复授予 = `STATUS_OK` 且簿记单条。
+- 授权随授予者激活回滚清除，新激活从空集开始；成功授予与批量清理均记
+  `outbound_grant` 审计日志。无 revoke、通配、方法粒度、转移或再委托。
+- require 判定序：静态 inject 命中不触授权表；静态未中先查授权名索引，无名
+  条目保持逐字节 UNDECLARED。有名条目时仍先解析所请求服务，未提交 =
+  INACTIVE，已提交但未获授 = UNDECLARED；获授后的调用路径与静态放行完全相同。
+- 内核仅新增 `Invoke::activation_id()` 稳定身份助手（默认 `None`），由
+  `DylibInvoke` 实现、`BoundaryInvoke` 转发，避免 O7/S5 装饰器使 Arc 身份失真。
+- 加载门：`ABI_VERSION` 3 → 4，v3 工件硬拒载（错误消息含两侧版本）。
+
+迁移（v3 → v4）：
+
+1. 插件对齐 `ABI_VERSION` 重编译；`HostExports` 按值复制时自然带上第 4 字段，
+   手工构造 vtable 的宿主/测试表须补 `grant` 指针。
+2. 宿主侧 `dougong` / `dougong-abi` / `dougong-dylib` / `dougong-loader` 同步升
+   0.4.0；既有 descriptor 与装载文档无需修改。
+3. 需要运行期回调的插件由服务拥有者在目标已提交后调用 `grant`；目标换激活或
+   授予者再激活后重新授予，不依赖旧授权继承。
+
+验证锚：`cargo test -p dougong-dylib`（ABI v3 回归 + ABI v4 E1.1–12）；
+`examples/outbound_demo.rs`（既有出站/权限/重入臂 + grant 回调往返）；下游
+fly-rafter 的零改第三方策略插件接入验收（E4）。
+
 ## [0.3.0] - 2026-10-25
 
 ### ABI v3：dylib 插件出站能力（破坏性变更）

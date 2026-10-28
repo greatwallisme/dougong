@@ -1,5 +1,5 @@
-// Rust guideline compliant 2026-10-24
-//! E1 test matrix for the ABI v3 outbound surface (require/emit vtable).
+// Rust guideline compliant 2026-10-28
+//! E1 test matrix for the ABI v3 outbound surface and ABI v4 grant surface.
 //!
 //! The fixtures are hand-written "real" plugins over static export tables:
 //! they copy the `HostExports` vtable at `setup` and call back through it
@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use dougong::{Context, Error, FiberHandle, Injection, Invoker, Plugin, Result};
+use dougong::{
+    Context, ContextOptions, Error, FiberHandle, Injection, Invoker, LogLevel, LogRecord, Logger,
+    LoggerHandle, Plugin, Result,
+};
 use dougong_abi::{
     HostExports, PluginExports, STATUS_CAPACITY, STATUS_FAILED, STATUS_INACTIVE, STATUS_OK,
     STATUS_REENTRANCY, STATUS_UNDECLARED, write_out,
@@ -65,6 +68,25 @@ impl SendHost {
     fn require(&self, service: &[u8], method: u32, payload: &[u8]) -> (i32, Vec<u8>) {
         plugin_require(&self.0, service, method, payload)
     }
+
+    /// Calls `grant` through the copied vtable.
+    fn grant(&self, target: &[u8], granted: &[u8]) -> i32 {
+        plugin_grant(&self.0, target, granted)
+    }
+}
+
+/// Plugin-side grant: the v4 registration primitive has no out-buffer.
+fn plugin_grant(host: &HostExports, target: &[u8], granted: &[u8]) -> i32 {
+    // SAFETY: the vtable is live and both names are readable byte strings.
+    unsafe {
+        (host.grant)(
+            host.host_handle,
+            target.as_ptr(),
+            target.len(),
+            granted.as_ptr(),
+            granted.len(),
+        )
+    }
 }
 
 /// Plugin-side growable `require`: retries with a doubled buffer whenever
@@ -114,7 +136,11 @@ const CONSUMER_REQUIRE_THREAD_SLOW: u32 = 3;
 const CONSUMER_REQUIRE_CYCLE: u32 = 4;
 const CONSUMER_SETUP_RESULT: u32 = 5;
 const CONSUMER_ACTIVATION: u32 = 6;
+const CONSUMER_ECHO: u32 = 7;
 const CONSUMER_SPAWN_HAMMER: u32 = 8;
+const CONSUMER_GRANT: u32 = 9;
+const CONSUMER_SETUP_GRANT: u32 = 10;
+const CONSUMER_GRANT_HAMMER: u32 = 11;
 
 static CONSUMER_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -122,6 +148,8 @@ struct ConsumerState {
     host: HostExports,
     /// Result of the require issued *during* `setup` (E1.10 probe).
     setup_probe: (i32, Vec<u8>),
+    /// Result of the optional grant issued during setup (ABI v4 E1.12).
+    setup_grant: i32,
     /// Identity of this activation: a monotonic setup token. An address
     /// would not do — the allocator may legally reuse the freed state's
     /// address for the next activation, which made a pointer comparison
@@ -142,7 +170,23 @@ unsafe extern "C" fn consumer_descriptor(out: *mut u8, cap: usize, len: *mut usi
     // SAFETY: host buffer contract.
     if unsafe {
         write_out(
-            br#"{"name":"fake-consumer","provide":["svc-a"],"inject":["svc-b","svc-mid","svc-host"]}"#,
+            br#"{"name":"fake-consumer","provide":["svc-a","svc-a-alt"],"inject":["svc-b","svc-mid","svc-host"]}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn grant_consumer_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"fake-grant-consumer","provide":["svc-a"],"inject":["svc-b"]}"#,
             out,
             cap,
             len,
@@ -169,9 +213,43 @@ unsafe extern "C" fn consumer_setup(host: *const HostExports) -> *mut std::ffi::
     Box::into_raw(Box::new(ConsumerState {
         host,
         setup_probe,
+        setup_grant: STATUS_OK,
         activation,
     }))
     .cast::<std::ffi::c_void>()
+}
+
+/// Grant-on-setup variant used by the reactivation self-healing arm.
+unsafe extern "C" fn grant_consumer_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+    if host.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: valid for the duration of setup; copied by value.
+    let host = unsafe { *host };
+    let setup_probe = plugin_require(&host, b"svc-b", 0, b"setup-probe");
+    let setup_grant = plugin_grant(&host, b"svc-b", b"svc-a");
+    let activation = CONSUMER_ACTIVATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    Box::into_raw(Box::new(ConsumerState {
+        host,
+        setup_probe,
+        setup_grant,
+        activation,
+    }))
+    .cast::<std::ffi::c_void>()
+}
+
+fn consumer_grant_hammer(host: HostExports) -> (i32, &'static [u8]) {
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let host = SendHost(host);
+        workers.push(std::thread::spawn(move || {
+            (0..4).all(|_| host.grant(b"svc-b", b"svc-a") == STATUS_OK)
+        }));
+    }
+    let ok = workers
+        .into_iter()
+        .all(|worker| worker.join().expect("grant hammer thread"));
+    (if ok { STATUS_OK } else { STATUS_FAILED }, b"16")
 }
 
 unsafe extern "C" fn consumer_call(
@@ -229,6 +307,32 @@ unsafe extern "C" fn consumer_call(
             cap,
             out_len,
         ),
+        CONSUMER_ECHO => {
+            // SAFETY: host buffer contract.
+            if unsafe { write_out(input, out, cap, out_len) } {
+                STATUS_OK
+            } else {
+                STATUS_CAPACITY
+            }
+        }
+        CONSUMER_GRANT => {
+            let (target, granted) = input.iter().position(|byte| *byte == 0).map_or_else(
+                || (input, &[][..]),
+                |split| (&input[..split], &input[split + 1..]),
+            );
+            pack(
+                plugin_grant(&state.host, target, granted),
+                b"",
+                out,
+                cap,
+                out_len,
+            )
+        }
+        CONSUMER_SETUP_GRANT => pack(state.setup_grant, b"", out, cap, out_len),
+        CONSUMER_GRANT_HAMMER => {
+            let (status, payload) = consumer_grant_hammer(state.host);
+            pack(status, payload, out, cap, out_len)
+        }
         CONSUMER_SPAWN_HAMMER => {
             // Four plugin-owned threads concurrently requiring the slow
             // target method: the target's per-instance lock must serialize
@@ -313,9 +417,24 @@ static CONSUMER_TABLE: PluginExports = PluginExports {
     teardown: consumer_teardown,
 };
 
+static GRANT_CONSUMER_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: consumer_name,
+    descriptor: grant_consumer_descriptor,
+    setup: grant_consumer_setup,
+    call: consumer_call,
+    on_event: consumer_on_event,
+    on_next: consumer_on_next,
+    teardown: consumer_teardown,
+};
+
 // ---------------------------------------------------------------------------
 // Target fixture: provides svc-b (echo / slow / stats)
 // ---------------------------------------------------------------------------
+
+const TARGET_REQUIRE_GRANTED: u32 = 3;
+const TARGET_REQUIRE_GRANTED_HAMMER: u32 = 4;
+const TARGET_REQUIRE_NAMED: u32 = 5;
 
 struct TargetState {
     host: HostExports,
@@ -400,6 +519,36 @@ unsafe extern "C" fn target_call(
             b"slow-done".to_vec()
         }
         2 => format!("{},{}", state.calls, state.max_seen).into_bytes(),
+        TARGET_REQUIRE_GRANTED => {
+            let (status, reply) = plugin_require(&state.host, b"svc-a", CONSUMER_ECHO, input);
+            return pack(status, &reply, out, cap, out_len);
+        }
+        TARGET_REQUIRE_GRANTED_HAMMER => {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let host = SendHost(state.host);
+                workers.push(std::thread::spawn(move || {
+                    (0..4).all(|_| {
+                        let (status, reply) = host.require(b"svc-a", CONSUMER_ECHO, b"hammer");
+                        status == STATUS_OK && reply == b"hammer"
+                    })
+                }));
+            }
+            let ok = workers
+                .into_iter()
+                .all(|worker| worker.join().expect("require hammer thread"));
+            return pack(
+                if ok { STATUS_OK } else { STATUS_FAILED },
+                b"16",
+                out,
+                cap,
+                out_len,
+            );
+        }
+        TARGET_REQUIRE_NAMED => {
+            let (status, reply) = plugin_require(&state.host, input, CONSUMER_ECHO, b"probe");
+            return pack(status, &reply, out, cap, out_len);
+        }
         _ => return STATUS_FAILED,
     };
     // SAFETY: host buffer contract.
@@ -731,10 +880,21 @@ async fn own_thread_require_reaches_in_process_and_dylib_providers() {
 
 /// Builds a detached activation handle for direct vtable drives.
 fn bare_activation(ctx: &Context, inject: &[&str]) -> *mut std::ffi::c_void {
+    bare_activation_with_provide(ctx, inject, &[])
+}
+
+/// Builds a detached activation with an explicit grant-ownership set.
+fn bare_activation_with_provide(
+    ctx: &Context,
+    inject: &[&str],
+    provide: &[&str],
+) -> *mut std::ffi::c_void {
     Arc::into_raw(Arc::new(super::Activation {
         ctx: ctx.clone(),
         rt: tokio::runtime::Handle::current(),
+        instance_id: super::next_instance_id(),
         inject: inject.iter().map(|name| (*name).to_string()).collect(),
+        provide: provide.iter().map(|name| (*name).to_string()).collect(),
     }))
     .cast_mut()
     .cast::<std::ffi::c_void>()
@@ -768,6 +928,27 @@ unsafe fn raw_require(
     (status, buf)
 }
 
+/// Drives `host_grant` and returns its status-only ABI result.
+unsafe fn raw_grant(host: *mut std::ffi::c_void, target: &[u8], granted: &[u8]) -> i32 {
+    // SAFETY: `host` names a live activation and both byte strings are valid.
+    unsafe {
+        super::host_grant(
+            host,
+            target.as_ptr(),
+            target.len(),
+            granted.as_ptr(),
+            granted.len(),
+        )
+    }
+}
+
+/// Reclaims a detached activation and runs its grant cleanup.
+unsafe fn reclaim_activation(host: *mut std::ffi::c_void) {
+    // SAFETY: each detached raw activation has exactly one reclaim and no
+    // subsequent vtable use.
+    unsafe { super::ActivationPtr(host).reclaim() };
+}
+
 #[tokio::test]
 async fn require_enforces_capability_and_liveness() {
     let ctx = Context::new();
@@ -786,6 +967,10 @@ async fn require_enforces_capability_and_liveness() {
     // SAFETY: `raw` names the live activation above.
     let (status, detail) = unsafe { raw_require(raw, b"svc-other", 0, b"") };
     assert_eq!(status, STATUS_UNDECLARED);
+    assert_eq!(
+        detail,
+        br#"{"class":"logic","code":"undeclared_dependency","message":"cannot get property \"svc-other\" without inject"}"#
+    );
     let detail: Value = serde_json::from_slice(&detail).expect("detail is JSON");
     assert_eq!(detail["code"], "undeclared_dependency");
 
@@ -812,6 +997,7 @@ async fn require_enforces_capability_and_liveness() {
         host_handle: raw,
         require: host_require,
         emit: super::host_emit,
+        grant: super::host_grant,
     });
     let outcome = std::thread::spawn(move || shared.require(b"svc-host", 0, b"t"))
         .join()
@@ -1485,4 +1671,415 @@ async fn cross_instance_require_cycle_dies_as_reentrancy() {
         wait_until(super::wait_edges_empty).await,
         "wait edges must drain after the cycle unwinds"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ABI v4 E1 grant matrix (D31)
+// ---------------------------------------------------------------------------
+
+/// Serializes scenarios that intentionally share the global `svc-a` name.
+/// Concurrency under test stays inside each scenario's own plugin threads.
+static GRANT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Clone, Default)]
+struct GrantLog {
+    records: Arc<Mutex<Vec<LogRecord>>>,
+}
+
+impl GrantLog {
+    fn grants(&self) -> Vec<LogRecord> {
+        self.records
+            .lock()
+            .expect("grant log lock")
+            .iter()
+            .filter(|record| record.event == "outbound_grant")
+            .cloned()
+            .collect()
+    }
+}
+
+impl Logger for GrantLog {
+    fn log(&self, _level: LogLevel, _target: &str, _message: &str) {}
+
+    fn log_record(&self, record: &LogRecord) {
+        self.records
+            .lock()
+            .expect("grant log lock")
+            .push(record.clone());
+    }
+}
+
+/// Installs a structured logger without changing the default service labels.
+async fn logged_context() -> (Context, GrantLog) {
+    let root = Context::new();
+    let ctx = root.isolate("logger");
+    let sink = GrantLog::default();
+    let logger: Arc<dyn Logger> = Arc::new(sink.clone());
+    let plug = dougong::plugin("grant-test-logger", vec![], move |ctx, _config| {
+        let logger = Arc::clone(&logger);
+        Box::pin(async move {
+            ctx.provide("logger", LoggerHandle::new(logger)).await?;
+            Ok(())
+        })
+    });
+    start(&ctx, plug).await;
+    (ctx, sink)
+}
+
+// E1.1 (B1/C2): the callback round trip also crosses BoundaryInvoke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_allows_callback_round_trip_through_boundary_decorator() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let ctx = Context::new_with_options(ContextOptions {
+        boundary_trace: true,
+        ..ContextOptions::default()
+    });
+    let world = boot_world(&ctx).await;
+    let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_GRANT, b"svc-b\0svc-a").await;
+    assert_eq!(status, STATUS_OK);
+    let (status, payload) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"decision").await;
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(payload, b"decision");
+    world.consumer.dispose().await;
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+// E1.4 (B2/B4): only descriptor-provided services can be granted.
+#[tokio::test]
+async fn grant_rejects_a_service_the_granter_does_not_own() {
+    let ctx = Context::new();
+    let host_svc = dougong::plugin("host-svc", vec![], |ctx, _config| {
+        Box::pin(async move {
+            ctx.provide("svc-host", Invoker::new(Arc::new(HostSvc)))
+                .await?;
+            Ok(())
+        })
+    });
+    start(&ctx, host_svc).await;
+    let raw = bare_activation_with_provide(&ctx, &[], &["svc-a"]);
+    assert_eq!(
+        // SAFETY: raw names the live detached activation.
+        unsafe { raw_grant(raw, b"svc-host", b"svc-other") },
+        STATUS_FAILED
+    );
+    // SAFETY: same live activation; direct inspection retains the detail code.
+    let activation = unsafe { &*raw.cast::<super::Activation>() };
+    let err = super::grant_impl(activation, b"svc-host", b"svc-other")
+        .expect_err("not-owned grant must fail");
+    assert_eq!(err.code, "grant_not_owned");
+    assert_eq!(err.status, STATUS_FAILED);
+    // SAFETY: unique reclaim after all vtable calls.
+    unsafe { reclaim_activation(raw) };
+    ctx.stop().await;
+}
+
+// E1.5 (B2/C3): target resolution is fail-closed at grant time.
+#[tokio::test]
+async fn grant_rejects_an_uncommitted_target() {
+    let ctx = Context::new();
+    let raw = bare_activation_with_provide(&ctx, &[], &["svc-a"]);
+    assert_eq!(
+        // SAFETY: raw names the live detached activation.
+        unsafe { raw_grant(raw, b"missing", b"svc-a") },
+        STATUS_INACTIVE
+    );
+    // SAFETY: same live activation.
+    let activation = unsafe { &*raw.cast::<super::Activation>() };
+    let err = super::grant_impl(activation, b"missing", b"svc-a")
+        .expect_err("inactive-target grant must fail");
+    assert_eq!(err.code, "inactive_dependency");
+    assert_eq!(err.status, STATUS_INACTIVE);
+    // SAFETY: unique reclaim after all vtable calls.
+    unsafe { reclaim_activation(raw) };
+    ctx.stop().await;
+}
+
+// E1.6 (B5/G3): teardown revokes and a new activation starts empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_dies_with_granter_and_does_not_resurrect() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let ctx = Context::new();
+    let world = boot_world(&ctx).await;
+    let old_granter = ctx
+        .get::<Invoker>("svc-a")
+        .and_then(|invoker| invoker.inner.activation_id())
+        .expect("old granter activation id");
+    let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_GRANT, b"svc-b\0svc-a").await;
+    assert_eq!(status, STATUS_OK);
+    world.consumer.dispose().await;
+
+    let (status, _) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"after").await;
+    assert_eq!(status, STATUS_UNDECLARED);
+    assert!(
+        super::grant_entries("svc-a")
+            .into_iter()
+            .all(|(granter, _)| granter != old_granter),
+        "teardown removed every old-granter entry"
+    );
+
+    let consumer2: Arc<dyn Plugin> =
+        Arc::new(from_static(&CONSUMER_TABLE).expect("new consumer table"));
+    let consumer2 = start(&ctx, consumer2).await;
+    let (status, _) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"new").await;
+    assert_eq!(
+        status, STATUS_UNDECLARED,
+        "the new activation did not inherit the old grant"
+    );
+    let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_GRANT, b"svc-b\0svc-a").await;
+    assert_eq!(status, STATUS_OK);
+    let (status, payload) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"new").await;
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(payload, b"new");
+    consumer2.dispose().await;
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+// E1.7 (B3/B6): duplicate registration is singular and every success audits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_is_idempotent_and_audited() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let (ctx, sink) = logged_context().await;
+    let world = boot_world(&ctx).await;
+    for _ in 0..2 {
+        let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_GRANT, b"svc-b\0svc-a").await;
+        assert_eq!(status, STATUS_OK);
+    }
+    let granter = ctx
+        .get::<Invoker>("svc-a")
+        .and_then(|invoker| invoker.inner.activation_id())
+        .expect("granter activation id");
+    assert_eq!(
+        super::grant_entries("svc-a")
+            .into_iter()
+            .filter(|(candidate, _)| *candidate == granter)
+            .count(),
+        1,
+        "duplicate grant stored one entry"
+    );
+    let successes: Vec<_> = sink
+        .grants()
+        .into_iter()
+        .filter(|record| record.message.ends_with(" ok"))
+        .collect();
+    assert_eq!(successes.len(), 2, "each successful grant is audited");
+    for record in successes {
+        assert_eq!(record.level, LogLevel::Info);
+        assert_eq!(record.service.as_deref(), Some("svc-a"));
+        assert_eq!(record.boundary, Some("dylib"));
+        assert!(record.trace.is_some());
+        assert!(record.message.contains("target=svc-b"));
+    }
+    world.consumer.dispose().await;
+    assert!(
+        sink.grants()
+            .iter()
+            .any(|record| record.message == "cleared 1 grant(s)"),
+        "batch cleanup emitted its summary"
+    );
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+// E1.8 (B1/G4/C3): neither another name nor another activation is authorized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grant_is_exactly_one_service_for_one_target_activation() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let ctx = Context::new();
+    let world = boot_world(&ctx).await;
+    let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_GRANT, b"svc-b\0svc-a").await;
+    assert_eq!(status, STATUS_OK);
+    let (status, _) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_NAMED, b"svc-a-alt").await;
+    assert_eq!(status, STATUS_UNDECLARED);
+
+    let third_party = bare_activation(&ctx, &[]);
+    // SAFETY: third_party names a live activation with no matching grant.
+    let (status, detail) = unsafe { raw_require(third_party, b"svc-a", CONSUMER_ECHO, b"") };
+    assert_eq!(status, STATUS_UNDECLARED);
+    let detail: Value = serde_json::from_slice(&detail).expect("detail is JSON");
+    assert_eq!(detail["code"], "undeclared_dependency");
+    // SAFETY: unique reclaim after the require.
+    unsafe { reclaim_activation(third_party) };
+    world.consumer.dispose().await;
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+// E1.9 (A3/C4): concurrent registration and callbacks are deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_grants_and_requires_do_not_deadlock() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let ctx = Context::new();
+    let world = boot_world(&ctx).await;
+    let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_GRANT, b"svc-b\0svc-a").await;
+    assert_eq!(status, STATUS_OK);
+    let grant_task = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { call_framed(&ctx, "svc-a", CONSUMER_GRANT_HAMMER, b"").await }
+    });
+    let require_task = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED_HAMMER, b"").await }
+    });
+    let (grant_result, require_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        (grant_task.await, require_task.await)
+    })
+    .await
+    .expect("concurrent grant/require did not deadlock");
+    let (grant_status, grant_payload) = grant_result.expect("grant task joined");
+    let (require_status, require_payload) = require_result.expect("require task joined");
+    assert_eq!(
+        (grant_status, grant_payload.as_slice()),
+        (STATUS_OK, b"16".as_slice())
+    );
+    assert_eq!(
+        (require_status, require_payload.as_slice()),
+        (STATUS_OK, b"16".as_slice())
+    );
+    let granter = ctx
+        .get::<Invoker>("svc-a")
+        .and_then(|invoker| invoker.inner.activation_id())
+        .expect("granter activation id");
+    assert_eq!(
+        super::grant_entries("svc-a")
+            .into_iter()
+            .filter(|(candidate, _)| *candidate == granter)
+            .count(),
+        1,
+        "concurrent idempotent grants remained singular"
+    );
+    world.consumer.dispose().await;
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+// E1.10 (B2/B4): both names are validated before ownership or resolution.
+#[tokio::test]
+async fn grant_rejects_non_utf8_names() {
+    let ctx = Context::new();
+    let raw = bare_activation_with_provide(&ctx, &[], &["svc-a"]);
+    for (target, granted) in [
+        (&[0xFF][..], b"svc-a".as_slice()),
+        (b"svc-b".as_slice(), &[0xFE][..]),
+    ] {
+        // SAFETY: raw names a live activation and each slice is readable.
+        assert_eq!(unsafe { raw_grant(raw, target, granted) }, STATUS_FAILED);
+        // SAFETY: same live activation.
+        let activation = unsafe { &*raw.cast::<super::Activation>() };
+        let err = super::grant_impl(activation, target, granted)
+            .expect_err("invalid grant name must fail");
+        assert_eq!(err.code, "invalid_grant_name");
+        assert_eq!(err.status, STATUS_FAILED);
+    }
+    // SAFETY: unique reclaim after all calls.
+    unsafe { reclaim_activation(raw) };
+    ctx.stop().await;
+}
+
+// E1.11 (G7/C1/C3): static hits bypass the table; name presence keeps INACTIVE.
+#[tokio::test]
+async fn require_grant_lookup_preserves_hot_path_and_two_level_priority() {
+    let ctx = Context::new();
+    let host_svc = dougong::plugin("host-svc", vec![], |ctx, _config| {
+        Box::pin(async move {
+            ctx.provide("svc-host", Invoker::new(Arc::new(HostSvc)))
+                .await?;
+            Ok(())
+        })
+    });
+    start(&ctx, host_svc).await;
+    let declared = bare_activation(&ctx, &["svc-host"]);
+    let before = super::grant_lookups_on_this_thread();
+    // SAFETY: declared names a live activation with a static capability.
+    let (status, payload) = unsafe { raw_require(declared, b"svc-host", 0, b"hot") };
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(payload, b"host:hot");
+    assert_eq!(super::grant_lookups_on_this_thread(), before);
+    // SAFETY: unique reclaim; no grants were issued by this activation.
+    unsafe { reclaim_activation(declared) };
+
+    let granter = bare_activation_with_provide(&ctx, &[], &["grant-missing"]);
+    // SAFETY: granter is live; svc-host is a committed target.
+    let activation = unsafe { &*granter.cast::<super::Activation>() };
+    super::grant_impl(activation, b"svc-host", b"grant-missing").expect("grant registers");
+    let caller = bare_activation(&ctx, &[]);
+    // SAFETY: caller is live, has no static declaration, and owns no grant.
+    let (status, detail) = unsafe { raw_require(caller, b"grant-missing", 0, b"") };
+    assert_eq!(status, STATUS_INACTIVE);
+    let detail: Value = serde_json::from_slice(&detail).expect("detail is JSON");
+    assert_eq!(detail["code"], "inactive_dependency");
+    // SAFETY: unique reclaims; the caller is reclaimed before the granter so
+    // the grant-name entry remains present for the assertion above.
+    unsafe { reclaim_activation(caller) };
+    // SAFETY: the granter has its own unique reclaim after all grant checks.
+    unsafe { reclaim_activation(granter) };
+    ctx.stop().await;
+}
+
+// E1.12 (B1 reason 2): target replacement drives a fresh grant and binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn target_reactivation_rebinds_grant_through_granter_reactivation() {
+    let _serial = GRANT_TEST_LOCK.lock().await;
+    let ctx = Context::new();
+    let target1: Arc<dyn Plugin> = Arc::new(from_static(&TARGET_TABLE).expect("target one"));
+    let target1 = start(&ctx, target1).await;
+    let consumer: Arc<dyn Plugin> =
+        Arc::new(from_static(&GRANT_CONSUMER_TABLE).expect("grant consumer"));
+    let consumer = start(&ctx, consumer).await;
+    let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_SETUP_GRANT, b"").await;
+    assert_eq!(status, STATUS_OK);
+    let first_target = ctx
+        .get::<Invoker>("svc-b")
+        .and_then(|invoker| invoker.inner.activation_id())
+        .expect("first target id");
+    let first_granter = ctx
+        .get::<Invoker>("svc-a")
+        .and_then(|invoker| invoker.inner.activation_id())
+        .expect("first granter id");
+    assert!(super::grant_entries("svc-a").contains(&(first_granter, Some(first_target))));
+    let (status, payload) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"first").await;
+    assert_eq!(
+        (status, payload.as_slice()),
+        (STATUS_OK, b"first".as_slice())
+    );
+
+    target1.dispose().await;
+    assert!(
+        super::grant_entries("svc-a")
+            .into_iter()
+            .all(|(granter, _)| granter != first_granter),
+        "the drained granter activation revoked its old binding"
+    );
+    let target2: Arc<dyn Plugin> = Arc::new(from_static(&TARGET_TABLE).expect("target two"));
+    let target2 = start(&ctx, target2).await;
+    tokio::time::timeout(Duration::from_secs(5), consumer.join())
+        .await
+        .expect("consumer reactivation settles")
+        .expect("consumer reactivation succeeds");
+    let second_target = ctx
+        .get::<Invoker>("svc-b")
+        .and_then(|invoker| invoker.inner.activation_id())
+        .expect("second target id");
+    let second_granter = ctx
+        .get::<Invoker>("svc-a")
+        .and_then(|invoker| invoker.inner.activation_id())
+        .expect("second granter id");
+    assert_ne!(first_target, second_target);
+    assert_ne!(first_granter, second_granter);
+    assert!(super::grant_entries("svc-a").contains(&(second_granter, Some(second_target))));
+    assert!(
+        !super::grant_entries("svc-a").contains(&(second_granter, Some(first_target))),
+        "the new grant is bound to the new target, not the old identity"
+    );
+    let (status, _) = call_framed(&ctx, "svc-a", CONSUMER_SETUP_GRANT, b"").await;
+    assert_eq!(status, STATUS_OK);
+    let (status, payload) = call_framed(&ctx, "svc-b", TARGET_REQUIRE_GRANTED, b"second").await;
+    assert_eq!(
+        (status, payload.as_slice()),
+        (STATUS_OK, b"second".as_slice())
+    );
+    consumer.dispose().await;
+    target2.dispose().await;
+    ctx.stop().await;
 }

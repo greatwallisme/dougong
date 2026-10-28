@@ -44,9 +44,10 @@ pub static DOUGONG_PLUGIN_EXPORTS: PluginExports = PluginExports {
 };
 ```
 
-`ABI_VERSION` is 3 (v2 = CPS event protocol, D14; v3 = outbound
-`HostExports` vtable, D16). Any change to `PluginExports` or the constants
-breaks the ABI: bump it and update every duplicate table in the same commit.
+`ABI_VERSION` is 4 (v2 = CPS event protocol, D14; v3 = outbound
+`HostExports` vtable, D16; v4 = activation-scoped grants, D31). Any change to
+`PluginExports`, `HostExports`, or the constants breaks the ABI: bump it and
+update every duplicate table in the same commit.
 
 ## Descriptor
 
@@ -56,7 +57,7 @@ registrations, so it must match what `call`/`on_event` actually serve:
 
 ```rust
 unsafe extern "C" fn descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
-    let json = br#"{"name":"greeter","version":"0.3.0","provide":["greeting"],
+    let json = br#"{"name":"greeter","version":"0.4.0","provide":["greeting"],
 "inject":[],"listen":{"ping":1,"upper":2}}"#;
     if unsafe { write_out(json, out, cap, len) } { dougong_abi::STATUS_OK }
     else { dougong_abi::STATUS_CAPACITY }
@@ -67,7 +68,8 @@ unsafe extern "C" fn descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i3
 handles. Malformed entries (non-object, non-u32) fail the load. Provide only
 what `call` serves; the host rejects undeclared provides. Since ABI v3,
 `inject` also gates the outbound vtable: a `require` for a service absent
-from `inject` fails with `STATUS_UNDECLARED` before any resolution happens.
+from `inject` fails with `STATUS_UNDECLARED` unless the service owner has
+explicitly granted this activation access at runtime (ABI v4, see below).
 Declaring a service nobody provides parks the fiber in `Pending` forever -
 every world that loads the plugin must provide each declared name.
 
@@ -139,7 +141,7 @@ MODE_WATERFALL(4)` - chosen at dispatch by the host, never at registration.
   host guarantees no other foreign call interleaves between your deferred
   `on_event` and its `on_next`.
 
-## Outbound calls (ABI v3, D16)
+## Outbound calls and grants (ABI v3/v4, D16/D31)
 
 `setup` receives a `HostExports` vtable, valid only for that call - copy it
 by value. The copy stays callable until **this activation's** `teardown`
@@ -157,6 +159,9 @@ pub struct HostExports {
     pub emit: unsafe extern "C" fn(
         host, event, event_len, payload, payload_len,
     ) -> i32,                     // fire-and-forget kernel-bus event
+    pub grant: unsafe extern "C" fn(
+        host, target_service, target_service_len, granted_service, granted_service_len,
+    ) -> i32,                     // activation-scoped require authorization
 }
 ```
 
@@ -165,8 +170,8 @@ pub struct HostExports {
   future for you - the calling thread does not need a tokio runtime. The out
   buffer follows the same growable protocol (`STATUS_CAPACITY` = retry with a
   doubled buffer); input payloads are uncapped. Statuses: `STATUS_OK`,
-  `STATUS_CAPACITY`, `STATUS_UNDECLARED` (not in descriptor `inject`),
-  `STATUS_INACTIVE` (declared but no committed provider), `STATUS_REENTRANCY`
+  `STATUS_CAPACITY`, `STATUS_UNDECLARED` (neither injected nor granted),
+  `STATUS_INACTIVE` (no committed provider), `STATUS_REENTRANCY`
   (same-thread cycle), `STATUS_FAILED` (target's own error), and
   `STATUS_HOST_ERROR` (host-internal, including a caught host panic). Any
   failure status may carry a UTF-8 JSON detail document
@@ -176,8 +181,19 @@ pub struct HostExports {
   promised between two emits or between an emit and a require. The payload
   must be valid JSON bytes (`STATUS_INVALID_PAYLOAD` otherwise) and the event
   name must be UTF-8 outside the `internal/*` prefix (`STATUS_INVALID_EVENT`).
-- **Both entries may be called from any plugin thread, concurrently** - the
-  host implementations are panic-contained. The host's per-instance lock
+- **`grant`** authorizes the currently committed provider of
+  `target_service` to `require` this activation's `granted_service` without a
+  static injection. The granted name must be in this descriptor's `provide`
+  table; the target is resolved immediately in this activation's realm and
+  bound by activation identity, not inherited by a replacement provider. The
+  call returns `STATUS_OK` (including idempotent re-grant),
+  `STATUS_INACTIVE` (target not committed), or `STATUS_FAILED` (invalid UTF-8
+  or not-owned service), and writes no output buffer. It is a pure
+  registration primitive: no foreign call, no instance lock, and no
+  reentrancy-stack/wait-graph participation. Grants expire with the granter
+  activation; a new activation starts empty.
+- **All three callable entries may be called from any plugin thread,
+  concurrently** - the host implementations are panic-contained. The host's per-instance lock
   serializes *foreign entries* (setup/call/on_event/on_next/teardown) but
   does not cover plugin-owned threads: state shared with your own threads
   needs its own synchronization, and `teardown` must join every plugin-owned
@@ -228,7 +244,7 @@ cargo build -p my-plugin                          # produces the .so
 nm -D target/debug/libmy_plugin.so | rg DOUGONG_PLUGIN_EXPORTS
 cargo clippy -p my-plugin --all-targets -- -D warnings
 cargo run -p dougong-loader --example loader_demo # end-to-end (uses the greeter artifact)
-cargo run -p dougong-dylib --example outbound_demo # ABI v3 outbound arms (same artifact)
+cargo run -p dougong-dylib --example outbound_demo # ABI v3/v4 outbound + grant arms
 ```
 
 ## Pitfalls
@@ -250,6 +266,10 @@ cargo run -p dougong-dylib --example outbound_demo # ABI v3 outbound arms (same 
   cycles need a foreign entry in the chain.
 - `emit` payloads must be valid JSON and event names must not use the
   `internal/*` prefix (`STATUS_INVALID_PAYLOAD` / `STATUS_INVALID_EVENT`).
+- Grants die with the granter activation and never transfer to a replacement
+  provider; re-grant from the new activation instead of relying on inheritance.
+- `grant` is not communication: it neither probes the target nor participates
+  in reentrancy detection. The target must be committed before the call.
 - Keep only `dougong-abi` as a dependency; pulling in the kernel or tokio
   across artifacts duplicates runtime state and breaks the portability
   contract (`#[repr(C)]` only, no `TypeId`/statics crossing).

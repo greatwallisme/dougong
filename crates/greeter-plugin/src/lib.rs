@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-24
+// Rust guideline compliant 2026-10-28
 //! Example dougong plugin as a pure C-ABI cdylib.
 //!
 //! Depends only on `dougong-abi`: no kernel, no async runtime crosses the
@@ -11,7 +11,7 @@
 //!   continuation by returning `STATUS_DEFERRED` and upper-cases the chain
 //!   reply in `on_next` (ABI v2 CPS protocol, design decision D14).
 //!
-//! # Outbound surface (ABI v3)
+//! # Outbound surface (ABI v4)
 //!
 //! `setup` copies the `HostExports` vtable and spawns one worker thread,
 //! which synchronously requires the declared `greeter.oracle` service and
@@ -26,6 +26,8 @@
 //!   payload; no NUL means an empty payload), output frames the outbound
 //!   result as `i32 little-endian status || reply bytes`; failure statuses
 //!   carry the host's JSON detail document as the reply bytes.
+//! - [`GREETER_GRANT`]: an activation-scoped capability grant. Input is
+//!   `target\0granted`, with the same status framing and no reply payload.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -43,6 +45,11 @@ pub const GREETER_WORKER_REPLY: u32 = 1;
 /// call handler; see the crate documentation for the `name\0payload` input
 /// and `i32 LE status || reply` output framing.
 pub const GREETER_REQUIRE: u32 = 2;
+
+/// Method selector: grants a target activation access to one owned service.
+/// Input is `target\0granted`; output frames the grant status like
+/// [`GREETER_REQUIRE`].
+pub const GREETER_GRANT: u32 = 3;
 
 /// Event id: `ping` — echo a pong.
 pub const GREETER_EV_PING: u32 = 1;
@@ -65,10 +72,10 @@ const READY_EVENT: &[u8] = b"greeter/ready";
 const READY_PAYLOAD: &[u8] = br#"{"source":"greeter-worker"}"#;
 
 /// `Send` wrapper for the copied vtable: the ABI contract explicitly allows
-/// `require`/`emit` from any plugin thread, concurrently.
+/// all callable entries from any plugin thread, concurrently.
 struct SendHost(HostExports);
 
-// SAFETY: the vtable contract states both entries are callable from any
+// SAFETY: the vtable contract states the entries are callable from any
 // thread concurrently; the host implementations are panic-contained.
 unsafe impl Send for SendHost {}
 
@@ -171,7 +178,7 @@ unsafe extern "C" fn name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
 }
 
 unsafe extern "C" fn descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
-    let descriptor = br#"{"name":"greeter","version":"0.3.0","provide":["greeting"],"inject":["greeter.oracle"],"listen":{"ping":1,"upper":2}}"#;
+    let descriptor = br#"{"name":"greeter","version":"0.4.0","provide":["greeting"],"inject":["greeter.oracle"],"listen":{"ping":1,"upper":2}}"#;
     // SAFETY: same host buffer contract as `name`.
     if unsafe { write_out(descriptor, out, cap, len) } {
         dougong_abi::STATUS_OK
@@ -264,6 +271,24 @@ unsafe extern "C" fn call(
             );
             let (status, reply) = plugin_require(&state.host, service, 0, payload);
             pack_out(status, &reply, out, cap, out_len)
+        }
+        GREETER_GRANT => {
+            let (target, granted) = input.iter().position(|byte| *byte == 0).map_or_else(
+                || (input, &[][..]),
+                |split| (&input[..split], &input[split + 1..]),
+            );
+            // SAFETY: this activation is live and both input slices remain
+            // readable for the synchronous registration call.
+            let status = unsafe {
+                (state.host.grant)(
+                    state.host.host_handle,
+                    target.as_ptr(),
+                    target.len(),
+                    granted.as_ptr(),
+                    granted.len(),
+                )
+            };
+            pack_out(status, b"", out, cap, out_len)
         }
         _ => dougong_abi::STATUS_FAILED,
     }

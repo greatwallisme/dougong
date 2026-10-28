@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-23
+// Rust guideline compliant 2026-10-28
 //! dylib/so plugin host for the dougong kernel.
 //!
 //! Loads a [`dougong_abi::PluginExports`] table from a shared library and
@@ -13,13 +13,16 @@
 //! registers a [`dougong::Invoker`] service so any consumer can call the
 //! plugin through the dynamic channel (`method` selector + byte payload).
 //!
-//! # Outbound surface (ABI v3)
+//! # Outbound surface (ABI v4)
 //!
 //! Each activation receives a [`dougong_abi::HostExports`] vtable at `setup`:
 //! `require` performs a synchronous blocking call into another plugin's
 //! service (capability-checked against the descriptor `inject` set, resolved
 //! in the activation's realm), and `emit` publishes a JSON event to the
-//! kernel bus. Reentrancy is governed by a per-thread activation stack
+//! kernel bus. `grant` (D31) additionally lets a provider authorize one
+//! committed target activation to require one owned service without static
+//! injection; grants bind activation identities and are reclaimed with the
+//! granter. Reentrancy is governed by a per-thread activation stack
 //! (design decision D-V3-3 option b'): any foreign entry — `setup`, `call`,
 //! `on_event`/`on_next`, `teardown` — records its instance for the duration
 //! of the synchronous FFI segment, and a service call that would re-enter an
@@ -316,7 +319,7 @@ impl<F: Future + Unpin> Future for ChainPoll<F> {
     }
 }
 
-/// Host-side state of one plugin activation backing the v3 [`HostExports`]
+/// Host-side state of one plugin activation backing the v4 [`HostExports`]
 /// vtable: built per activation, dead once that activation's `teardown`
 /// returns (the vtable's documented lifetime bound).
 struct Activation {
@@ -326,11 +329,104 @@ struct Activation {
     /// Runtime captured during `apply`; `enter`ing it gives foreign threads
     /// (plugin-owned, never inside tokio) a valid runtime context.
     rt: tokio::runtime::Handle,
+    /// Process-unique identity of this plugin activation (D31).
+    instance_id: u64,
     /// Descriptor `inject` names: the constant capability-check basis for
     /// outbound `require` (the in-process form uses the fiber interest set;
     /// the boundary form uses the descriptor set — see the equivalence table
     /// in `doc/research/dougong-design.md`).
     inject: Vec<String>,
+    /// Descriptor `provide` names: the only services this activation may
+    /// grant to another activation (D31).
+    provide: Vec<String>,
+}
+
+/// One activation-granular grant. The resolved target Arc is retained for
+/// identity stability and idempotency; it is never called through the table.
+struct GrantEntry {
+    granter: u64,
+    target_activation: Option<u64>,
+    target: Arc<dyn dougong::Invoke>,
+}
+
+/// Process-wide grants indexed by granted service name (D31). Absence of the
+/// map key is the zero-resolution name-index miss required by C1. Instance
+/// ids are globally unique, so independent kernel roots cannot alias.
+static GRANTS: LazyLock<Mutex<HashMap<String, Vec<GrantEntry>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+std::thread_local! {
+    /// Per-thread probe for G7: static require hits never call the lookup.
+    static GRANT_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn grant_lookups_on_this_thread() -> u64 {
+    GRANT_LOOKUPS.with(std::cell::Cell::get)
+}
+
+enum GrantLookup {
+    Missing,
+    Present { authorized: bool },
+}
+
+/// Looks up one caller's capability without holding the lock across kernel
+/// resolution, a foreign call, an instance lock, or logging (C4).
+fn lookup_grant(activation: &Activation, service: &str) -> GrantLookup {
+    #[cfg(test)]
+    GRANT_LOOKUPS.with(|count| count.set(count.get() + 1));
+    GRANTS
+        .lock()
+        .get(service)
+        .map_or(GrantLookup::Missing, |entries| GrantLookup::Present {
+            authorized: entries
+                .iter()
+                .any(|entry| entry.target_activation == Some(activation.instance_id)),
+        })
+}
+
+#[cfg(test)]
+fn grant_entries(service: &str) -> Vec<(u64, Option<u64>)> {
+    GRANTS.lock().get(service).map_or_else(Vec::new, |entries| {
+        entries
+            .iter()
+            .map(|entry| (entry.granter, entry.target_activation))
+            .collect()
+    })
+}
+
+/// Removes one granter activation's entries and drops their target Arcs only
+/// after releasing the table lock. A new activation never inherits them.
+fn clear_grants(activation: &Activation) {
+    let mut removed = Vec::new();
+    {
+        let mut grants = GRANTS.lock();
+        for entries in grants.values_mut() {
+            let mut index = 0;
+            while index < entries.len() {
+                if entries[index].granter == activation.instance_id {
+                    removed.push(entries.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        grants.retain(|_, entries| !entries.is_empty());
+    }
+    if removed.is_empty() {
+        return;
+    }
+    activation.ctx.logger().log_record(
+        &dougong::LogRecord::new(
+            dougong::LogLevel::Info,
+            "dylib",
+            "outbound_grant",
+            format!("cleared {} grant(s)", removed.len()),
+        )
+        .with_trace(Some(activation.ctx.trace_id()))
+        .with_boundary(Some("dylib")),
+    );
 }
 
 /// `Send`/`Sync` wrapper for the raw `Activation` reference carried by
@@ -357,7 +453,9 @@ impl ActivationPtr {
     unsafe fn reclaim(self) {
         // SAFETY: per the caller contract, this is the unique reclaim of the
         // reference produced by the single `Arc::into_raw` at construction.
-        drop(unsafe { Arc::from_raw(self.0.cast::<Activation>()) });
+        let activation = unsafe { Arc::from_raw(self.0.cast::<Activation>()) };
+        clear_grants(&activation);
+        drop(activation);
     }
 }
 
@@ -492,6 +590,19 @@ unsafe extern "C" fn host_require(
     })
 }
 
+/// Writes the legacy undeclared-require response verbatim (G2/C3).
+fn undeclared_require(service: &str, out_buf: *mut u8, cap: usize, out_len: *mut usize) -> i32 {
+    write_detail(
+        out_buf,
+        cap,
+        out_len,
+        "undeclared_dependency",
+        dougong::ErrorClass::Logic.as_str(),
+        &format!("cannot get property \"{service}\" without inject"),
+        STATUS_UNDECLARED,
+    )
+}
+
 /// The `require` bridge's prescribed steps: capability check, realm-scoped
 /// resolution, dynamic-channel invocation, result write-back.
 #[expect(
@@ -522,20 +633,22 @@ fn require_impl(
             STATUS_UNDECLARED,
         );
     };
-    // Step 1: capability check against the descriptor `inject` set.
-    if !activation.inject.iter().any(|declared| declared == service) {
-        return write_detail(
-            out_buf,
-            cap,
-            out_len,
-            "undeclared_dependency",
-            dougong::ErrorClass::Logic.as_str(),
-            &format!("cannot get property \"{service}\" without inject"),
-            STATUS_UNDECLARED,
-        );
-    }
-    // Step 2: resolution in the activation's realm; `None` here means the
-    // provider is not committed (step 1 already proved the declaration).
+    // Step 1: descriptor injection bypasses the grant table entirely (G7).
+    // A static miss consults the name index; an absent name is the legacy
+    // undeclared path with byte-identical detail (C1/C3).
+    let authorized = if activation.inject.iter().any(|declared| declared == service) {
+        true
+    } else {
+        match lookup_grant(activation, service) {
+            GrantLookup::Missing => {
+                return undeclared_require(service, out_buf, cap, out_len);
+            }
+            GrantLookup::Present { authorized } => authorized,
+        }
+    };
+    // Step 2: resolution in the activation's realm. Resolution precedes the
+    // unauthorized rejection for grant-known names, preserving INACTIVE for
+    // an absent provider and UNDECLARED for a committed one (C3).
     let Some(invoker) = activation.ctx.get::<Invoker>(service) else {
         return write_detail(
             out_buf,
@@ -547,6 +660,9 @@ fn require_impl(
             STATUS_INACTIVE,
         );
     };
+    if !authorized {
+        return undeclared_require(service, out_buf, cap, out_len);
+    }
     // SAFETY: vtable input contract.
     let payload = unsafe { input_slice(in_data, in_len) }.to_vec();
     let bytes_in = payload.len();
@@ -664,6 +780,135 @@ fn emit_impl(
     let _runtime = activation.rt.enter();
     activation.ctx.emit(event, value);
     STATUS_OK
+}
+
+/// Internal grant failure: the C entry returns only `status` because the v4
+/// signature deliberately has no out-buffer; tests retain the detail code.
+#[derive(Debug)]
+struct GrantFailure {
+    code: &'static str,
+    message: String,
+    status: i32,
+}
+
+impl GrantFailure {
+    fn invalid_name() -> Self {
+        Self {
+            code: "invalid_grant_name",
+            message: "grant service names must be valid UTF-8".to_string(),
+            status: STATUS_FAILED,
+        }
+    }
+}
+
+/// Registers one narrow capability grant without invoking either activation.
+fn grant_impl(
+    activation: &Activation,
+    target_service: &[u8],
+    granted_service: &[u8],
+) -> std::result::Result<(), GrantFailure> {
+    let (Ok(target_service), Ok(granted_service)) = (
+        std::str::from_utf8(target_service),
+        std::str::from_utf8(granted_service),
+    ) else {
+        return Err(GrantFailure::invalid_name());
+    };
+    if !activation
+        .provide
+        .iter()
+        .any(|provided| provided == granted_service)
+    {
+        return Err(GrantFailure {
+            code: "grant_not_owned",
+            message: format!("cannot grant service \"{granted_service}\" without provide"),
+            status: STATUS_FAILED,
+        });
+    }
+    // Resolution is fail-closed and uses the same realm path as require. It
+    // happens outside the grant lock and never invokes the target (A3/B2).
+    let Some(target) = activation.ctx.get::<Invoker>(target_service) else {
+        return Err(GrantFailure {
+            code: "inactive_dependency",
+            message: format!(
+                "cannot get required service \"{target_service}\" in inactive context"
+            ),
+            status: STATUS_INACTIVE,
+        });
+    };
+    let target_activation = target.inner.activation_id();
+    let mut grants = GRANTS.lock();
+    let entries = grants.entry(granted_service.to_string()).or_default();
+    let duplicate = entries.iter().any(|entry| {
+        entry.granter == activation.instance_id
+            && match (entry.target_activation, target_activation) {
+                (Some(left), Some(right)) => left == right,
+                (None, None) => Arc::ptr_eq(&entry.target, &target.inner),
+                _ => false,
+            }
+    });
+    if !duplicate {
+        entries.push(GrantEntry {
+            granter: activation.instance_id,
+            target_activation,
+            target: Arc::clone(&target.inner),
+        });
+    }
+    drop(grants);
+    // Every successful grant, including an idempotent re-grant, is audited
+    // after unlocking. The target name is in the message; service is granted.
+    activation.ctx.logger().log_record(
+        &dougong::LogRecord::new(
+            dougong::LogLevel::Info,
+            "dylib",
+            "outbound_grant",
+            format!("grant {granted_service} target={target_service} ok"),
+        )
+        .with_service(granted_service)
+        .with_trace(Some(activation.ctx.trace_id()))
+        .with_boundary(Some("dylib")),
+    );
+    Ok(())
+}
+
+/// vtable entry: grants one committed target activation a require capability.
+///
+/// # Safety
+///
+/// Per the [`HostExports`] contract: `host` names a live activation and both
+/// service names are readable for their lengths.
+unsafe extern "C" fn host_grant(
+    host: *mut std::ffi::c_void,
+    target_service: *const u8,
+    target_service_len: usize,
+    granted_service: *const u8,
+    granted_service_len: usize,
+) -> i32 {
+    // SAFETY: the vtable contract keeps `host` valid until teardown returns.
+    let activation = unsafe { &*host.cast::<Activation>() };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: vtable input contract (null pairs with length 0).
+        let target = unsafe { input_slice(target_service, target_service_len) };
+        // SAFETY: same input contract for the granted name.
+        let granted = unsafe { input_slice(granted_service, granted_service_len) };
+        match grant_impl(activation, target, granted) {
+            Ok(()) => STATUS_OK,
+            Err(err) => {
+                activation.ctx.logger().log_record(
+                    &dougong::LogRecord::new(
+                        dougong::LogLevel::Error,
+                        "dylib",
+                        "outbound_grant",
+                        format!("grant rejected: {}", err.message),
+                    )
+                    .with_trace(Some(activation.ctx.trace_id()))
+                    .with_boundary(Some("dylib"))
+                    .with_cause(err.code),
+                );
+                err.status
+            }
+        }
+    }))
+    .unwrap_or(STATUS_HOST_ERROR)
 }
 
 /// Resolved export table plus the mapped library that backs it.
@@ -981,6 +1226,10 @@ unsafe impl Send for DylibInvoke {}
 unsafe impl Sync for DylibInvoke {}
 
 impl dougong::Invoke for DylibInvoke {
+    fn activation_id(&self) -> Option<u64> {
+        Some(self.instance_id)
+    }
+
     fn call(&self, method: u32, payload: Vec<u8>) -> BoxFuture<Result<Vec<u8>>> {
         let exports = self.exports.clone();
         let handle = self.handle.clone();
@@ -1160,7 +1409,9 @@ impl Plugin for DynPlugin {
                 Arc::into_raw(Arc::new(Activation {
                     ctx: ctx.clone(),
                     rt: tokio::runtime::Handle::current(),
+                    instance_id,
                     inject: inject_names,
+                    provide: provide.clone(),
                 }))
                 .cast_mut()
                 .cast::<std::ffi::c_void>(),
@@ -1176,6 +1427,7 @@ impl Plugin for DynPlugin {
                     host_handle: activation.0,
                     require: host_require,
                     emit: host_emit,
+                    grant: host_grant,
                 };
                 exports.setup(&host_exports)
             };

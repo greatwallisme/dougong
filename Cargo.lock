@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "dougong"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "serde",
@@ -419,11 +419,11 @@ dependencies = [
 
 [[package]]
 name = "dougong-abi"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "dougong-dylib"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dougong",
  "dougong-abi",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "dougong-loader"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dougong",
  "dougong-dylib",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "dougong-wasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dougong",
  "parking_lot",
@@ -676,14 +676,14 @@ dependencies = [
 
 [[package]]
 name = "greeter-plugin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dougong-abi",
 ]
 
 [[package]]
 name = "greeter-wasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "wit-bindgen",
 ]

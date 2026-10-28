@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 dougong (斗拱) is a Rust implementation of the cordis composition kernel: time composability (every environmental mutation is a revertible effect, undone LIFO) meets spatial composability (declared dependencies resolve reactively as providers come and go). Plugins come in three forms sharing one semantic: in-process Rust (`dougong::Plugin`), dylib/so via C-ABI (trusted code), and wasm components (sandboxed).
 
-`doc/research/` is the semantic source of truth: `cordis.md` (the paper), `study-1..4` (evidence), `dougong-design.md` (decisions D4–D30 plus user rulings R1–R4 and the ABI v3 rulings D-V3-1/3/4/5). When changing behavior that a D-decision governs, update its landing record there.
+`doc/research/` is the semantic source of truth: `cordis.md` (the paper), `study-1..4` (evidence), `dougong-design.md` (decisions D4–D31 plus user rulings R1–R4 and the ABI v3 rulings D-V3-1/3/4/5). When changing behavior that a D-decision governs, update its landing record there.
 
 ## Commands
 
@@ -25,7 +25,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # End-to-end demos (each must exit 0):
 cargo run -p dougong-dylib  --example dylib_demo    # needs: cargo build --workspace (builds greeter-plugin)
-cargo run -p dougong-dylib  --example outbound_demo # ABI v3 outbound arms; same dylib artifact
+cargo run -p dougong-dylib  --example outbound_demo # ABI v3/v4 outbound + grant arms; same artifact
 cargo run -p dougong-wasm   --example wasm_demo     # needs the wasm32-wasip2 guest artifact
 cargo run -p dougong-loader --example loader_demo   # needs the dylib artifact
 cargo run -p dougong-loader --example harness_demo  # multi-plugin composition: needs the dylib artifact + wasip2 guest
@@ -61,6 +61,7 @@ Cross-cutting semantics that span files:
 - **Bounded event dispatch (P2, D22)**: fire-and-forget `emit`/`emit_internal` enqueue listener invocations onto per-event ready lanes and a fixed worker pool (default 4) instead of per-listener `tokio::spawn`. Reliable synchronous emit stays lossless through the unbounded lane; `ContextOptions.events` (`EventQueueConfig`) configures bounded lanes, and `Context::emit_with_policy` provides async backpressure while `OverflowPolicy::Drop` is per-event opt-in. `queue_capacity` counts pending bounded listener invocations; per-event `max_concurrency` cannot head-of-line block other event names. Listener work still enters its fiber's `CancelScope` via `run`/`run_tracked`; parallel/serial/bail/waterfall and C5/C7 are unchanged. Benchmarks live in `crates/dougong/tests/bench_events.rs`.
 - **Two-level capability check (TS Alg. 6)**: `Context::require` distinguishes `inactive_dependency` (declared but not committed) from `undeclared_dependency` (never declared). Boundary hosts must preserve this distinction when mapping to WIT `kernel-error`.
 - **Dynamic channel (D6)**: cross-boundary services are `service-key{name, abi-hash} + method: u32 + bytes`, exposed through `dougong::Invoker`/`Invoke`. In-process typed keys (`Any` downcast) coexist; the kernel stores plain names.
+- **Dylib runtime grants (D31, ABI v4)**: a provider's `HostExports.grant` authorizes one committed target activation to require one owned service without static injection. Target identity is the process-unique activation id (`Invoke::activation_id`, forwarded by `BoundaryInvoke`), never a service name or decorator Arc address. Static-inject require hits bypass the global grant table; static misses use the name index and preserve UNDECLARED/INACTIVE priority. The grant lock is a leaf with no resolution, calls, instance locks, or logging inside; `ActivationPtr::reclaim` clears every grant on all teardown/rollback paths. No revoke, wildcard, delegation, cross-activation inheritance, wasm grant, in-process grant, or loader declaration override.
 - **Boundary adapters are isomorphic**: `dougong-dylib`'s `DynPlugin` and `dougong-wasm`'s `WasmPlugin` follow the identical ordering — register the teardown effect *first* (LIFO runs it last), then let the guest/exports provide; and both serialize every foreign call per instance (dylib's `InstanceLock`, wasm's store mutex) — consumer fibers call from their own tasks, so the kernel does not order those calls for you. Keep them in sync.
 - **Event modes live at dispatch**: emit/parallel/serial/bail/waterfall are chosen by the dispatcher (`events.rs`), not at registration. `internal/*` events are framework extension points with scope filtering. In waterfall, a listener pulls `Next` to advance; dropping it vetoes the chain. Mode-aware bridges (`Context::on_dispatch`) receive the dispatch mode — boundary adapters use them, and `internal/*` names reject bridges.
 - **Dylib events are CPS (D14, ABI v2)**: the descriptor's `listen` map registers bridges; in waterfall the plugin returns `STATUS_DEFERRED` from `on_event` (output = continuation payload, empty = original) and the host re-enters through `on_next` with the chain result. The v1 synchronous `NextFn` was removed — do not reintroduce sync continuations across the C boundary.
