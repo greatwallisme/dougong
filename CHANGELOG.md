@@ -3,6 +3,30 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.5.0] - 2026-11-02
+
+### ABI v5：dylib 出站同步派发 dispatch（破坏性变更）
+
+dylib 插件可向内核事件总线按五模式（既有 `MODE_*` 词表）同步派发一次事件：
+await 型模式阻塞调用线程至链收敛并把终值 JSON 写回 out_buf，`MODE_EMIT`
+入队即返（`emit` 保留为规范火忘入口）。裁决全文见 D32；需求来源为
+fly-rafter 压缩切片的六个跨插件事件监听（裁决定必须有回程值，事件面
+rendezvous 受跨实例等待环检测阻断不可实现）。本版本**推翻 v3 需求文档
+§5.5**（出站非 emit 模式结构性排除；依据修正见 D32）。
+
+v4 → v5 diff 清单仅一项：`HostExports` 在 `grant` 后追加 `dispatch` 字段及
+配套派发语义。`PluginExports`、descriptor schema（监听仍 = `listen` 静态
+声明）、require/emit/grant、CPS 协议、wasm/WIT、loader JSON 不变。
+
+- waterfall fallback = 固定恒等续体：无监听者生效 ⇔ 链终值 == 载荷字节
+  （桥回写原始字节，键序归一下字节稳定）；差异化默认值由载荷协议承载。
+- 链内监听者失败 = `STATUS_FAILED` + `{"code","class","message"}` 详情
+  （请求语义非广播）；serial/bail 传播首个失败、parallel 聚合。
+- 姿态门：必须自插件自有线程发起；外来入口帧内调用 = 确定性
+  `STATUS_REENTRANCY`（锁死组合检测不可达，保守前置拒绝，D32 B6）。
+- 非法 mode 值 = `STATUS_FAILED`（`invalid_dispatch_mode`）；`internal/*`
+  事件名与非 JSON 载荷对齐 `emit` 既有拒绝。
+
 ## [0.4.0] - 2026-10-28
 
 ### ABI v4：dylib 回调能力授予（破坏性变更）

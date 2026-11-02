@@ -24,11 +24,13 @@ use std::time::Duration;
 
 use dougong::{Context, Error, Invoke, Invoker, LogLevel, plugin};
 use dougong_abi::{
-    HostExports, PluginExports, STATUS_CAPACITY, STATUS_OK, STATUS_REENTRANCY, STATUS_UNDECLARED,
-    write_out,
+    HostExports, PluginExports, STATUS_CAPACITY, STATUS_FAILED, STATUS_OK, STATUS_REENTRANCY,
+    STATUS_UNDECLARED, write_out,
 };
 use dougong_dylib::{from_static, load};
-use greeter_plugin::{GREETER_GRANT, GREETER_HELLO, GREETER_REQUIRE, GREETER_WORKER_REPLY};
+use greeter_plugin::{
+    GREETER_GRANT, GREETER_HELLO, GREETER_REQUIRE, GREETER_WORKER_DISPATCH, GREETER_WORKER_REPLY,
+};
 use serde_json::Value;
 
 fn plugin_path() -> PathBuf {
@@ -102,6 +104,135 @@ fn detail_code(payload: &[u8]) -> dougong::Result<String> {
         .map(str::to_string)
         .ok_or_else(|| Error::msg("detail document lacks a \"code\" field"))
 }
+
+// ---------------------------------------------------------------------------
+// Dispatch arm fixture (D32/E2): a statically-resolved listener that
+// transforms the greeter worker's `greeter/dispatch` waterfall and returns
+// the merged chain value, proving the dispatcher receives a listener ruling.
+// ---------------------------------------------------------------------------
+
+const DISPATCH_EV: u32 = 1;
+
+unsafe extern "C" fn dispatch_listener_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: caller-owned buffer contract.
+    if unsafe { write_out(b"demo-dispatch-listener", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn dispatch_listener_descriptor(
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> i32 {
+    // SAFETY: caller-owned buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"demo-dispatch-listener","provide":[],"inject":[],"listen":{"greeter/dispatch":1}}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn dispatch_listener_setup(_host: *const HostExports) -> *mut std::ffi::c_void {
+    Box::into_raw(Box::new(0u8)).cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn dispatch_listener_teardown(handle: *mut std::ffi::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: allocated by this fixture's setup; torn down exactly once.
+    drop(unsafe { Box::from_raw(handle.cast::<u8>()) });
+}
+
+/// Waterfall listener: tag the payload and pull the continuation (the CPS
+/// protocol, D14); the chain value comes back through `on_next` and rides
+/// out unchanged.
+unsafe extern "C" fn dispatch_listener_on_event(
+    _handle: *mut std::ffi::c_void,
+    event: u32,
+    _mode: u32,
+    data: *const u8,
+    len: usize,
+    next_available: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if event != DISPATCH_EV || next_available != 1 {
+        return STATUS_FAILED;
+    }
+    // SAFETY: host input contract (call-scoped payload slice).
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        return STATUS_FAILED;
+    };
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert("handled".to_string(), serde_json::Value::Bool(true));
+    }
+    let transformed = serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec());
+    // SAFETY: caller-owned buffer contract; raw JSON rides the bridge.
+    if unsafe { write_out(&transformed, out, cap, out_len) } {
+        dougong_abi::STATUS_DEFERRED
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn dispatch_listener_on_next(
+    _handle: *mut std::ffi::c_void,
+    event: u32,
+    chain_status: i32,
+    data: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if event != DISPATCH_EV || chain_status != STATUS_OK {
+        return STATUS_FAILED;
+    }
+    // SAFETY: host input contract.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    // SAFETY: caller-owned buffer contract.
+    if unsafe { write_out(bytes, out, cap, out_len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+const unsafe extern "C" fn dispatch_listener_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _data: *const u8,
+    _len: usize,
+    _out: *mut u8,
+    _cap: usize,
+    _out_len: *mut usize,
+) -> i32 {
+    STATUS_FAILED
+}
+
+static DISPATCH_LISTENER_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: dispatch_listener_name,
+    descriptor: dispatch_listener_descriptor,
+    setup: dispatch_listener_setup,
+    call: dispatch_listener_call,
+    on_event: dispatch_listener_on_event,
+    on_next: dispatch_listener_on_next,
+    teardown: dispatch_listener_teardown,
+};
 
 // ---------------------------------------------------------------------------
 // Cross-instance arm fixtures: two statically-resolved dylib-form instances
@@ -466,25 +597,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
+        // Dispatch arm (D32/E2): the listener registers before greeter so
+        // the worker's waterfall dispatch finds the bridge in place.
+        let dispatch_listener: Arc<dyn dougong::Plugin> =
+            Arc::new(from_static(&DISPATCH_LISTENER_TABLE)?);
+        ctx.plugin(dispatch_listener, None)?.join().await?;
+
         let greeter_fiber = ctx.plugin(greeter, None)?;
         greeter_fiber.join().await?;
 
-        // Full chain: the worker thread's emit arrived, and its synchronous
-        // require reply is read back through greeter's own service.
-        let ready = tokio::time::timeout(Duration::from_secs(5), ready_rx)
-            .await
-            .map_err(|err| Error::msg(format!("greeter/ready did not arrive: {err}")))?
-            .map_err(|err| Error::msg(format!("greeter/ready listener dropped: {err}")))?;
-        assert_eq!(
-            ready.get("source").and_then(Value::as_str),
-            Some("greeter-worker")
-        );
-        let greeting = ctx
-            .get::<Invoker>("greeting")
-            .ok_or_else(|| Error::msg("greeting is not committed"))?;
-        let reply = greeting.call(GREETER_WORKER_REPLY, Vec::new()).await?;
-        assert_eq!(reply, b"oracle:worker-hello");
-        log("-- full chain: own-thread require + emit verified --".to_string());
+        let greeting = full_chain_arm(&ctx, ready_rx, &log).await?;
+
+        dispatch_arm(&greeting, &log).await?;
 
         // Permission arm: `unlisted` is not in greeter's descriptor `inject`
         // list, so the require is rejected before any resolution happens.
@@ -541,6 +665,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         log("-- outbound demo done --".to_string());
         Ok::<(), Error>(())
     })?;
+    Ok(())
+}
+
+/// The full-chain arm: the worker's emit arrived through the in-process
+/// listener and its parked require reply reads back through the service;
+/// returns the committed `greeting` invoker for the later arms.
+async fn full_chain_arm(
+    ctx: &Context,
+    ready_rx: tokio::sync::oneshot::Receiver<Value>,
+    log: &(dyn Fn(String) + Send + Sync),
+) -> dougong::Result<Arc<Invoker>> {
+    let ready = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .map_err(|err| Error::msg(format!("greeter/ready did not arrive: {err}")))?
+        .map_err(|err| Error::msg(format!("greeter/ready listener dropped: {err}")))?;
+    assert_eq!(
+        ready.get("source").and_then(Value::as_str),
+        Some("greeter-worker")
+    );
+    let greeting = ctx
+        .get::<Invoker>("greeting")
+        .ok_or_else(|| Error::msg("greeting is not committed"))?;
+    let reply = greeting.call(GREETER_WORKER_REPLY, Vec::new()).await?;
+    assert_eq!(reply, b"oracle:worker-hello");
+    log("-- full chain: own-thread require + emit verified --".to_string());
+    Ok(greeting)
+}
+
+/// The dispatch arm (D32/E2): the worker's waterfall dispatch rode the
+/// listener bridge (transform + CPS continuation); the parked ruling is the
+/// merged chain value.
+async fn dispatch_arm(
+    greeting: &Invoker,
+    log: &(dyn Fn(String) + Send + Sync),
+) -> dougong::Result<()> {
+    let ruled = greeting.call(GREETER_WORKER_DISPATCH, Vec::new()).await?;
+    let (status, ruling) = unpack_framed(&ruled)?;
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(
+        ruling, br#"{"handled":true,"source":"greeter-worker"}"#,
+        "listener transform must reach the dispatcher's ruling"
+    );
+    log("-- dispatch arm: synchronous waterfall ruling verified --".to_string());
     Ok(())
 }
 

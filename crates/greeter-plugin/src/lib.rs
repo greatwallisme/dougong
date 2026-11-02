@@ -28,6 +28,9 @@
 //!   carry the host's JSON detail document as the reply bytes.
 //! - [`GREETER_GRANT`]: an activation-scoped capability grant. Input is
 //!   `target\0granted`, with the same status framing and no reply payload.
+//! - [`GREETER_WORKER_DISPATCH`]: the worker thread's parked outbound
+//!   `dispatch` ruling, framed as `i32 LE status || chain value bytes`
+//!   (empty until the worker has finished; ABI v5, design decision D32).
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -51,6 +54,10 @@ pub const GREETER_REQUIRE: u32 = 2;
 /// [`GREETER_REQUIRE`].
 pub const GREETER_GRANT: u32 = 3;
 
+/// Method selector: returns the worker thread's parked outbound `dispatch`
+/// ruling (empty while the worker has not completed).
+pub const GREETER_WORKER_DISPATCH: u32 = 4;
+
 /// Event id: `ping` — echo a pong.
 pub const GREETER_EV_PING: u32 = 1;
 
@@ -67,9 +74,17 @@ const ORACLE_SERVICE: &[u8] = b"greeter.oracle";
 /// The event the worker thread publishes once its `require` completes.
 const READY_EVENT: &[u8] = b"greeter/ready";
 
+/// The event the worker thread dispatches synchronously (waterfall mode);
+/// a listening plugin transforms the payload and the ruling lands in the
+/// [`GREETER_WORKER_DISPATCH`] slot (ABI v5, design decision D32).
+const DISPATCH_EVENT: &[u8] = b"greeter/dispatch";
+
 /// Fixed JSON document: the reply bytes never ride the event, so no JSON
 /// escaping ever happens inside the plugin.
 const READY_PAYLOAD: &[u8] = br#"{"source":"greeter-worker"}"#;
+
+/// The worker's parked `dispatch` ruling: `status || chain value bytes`.
+type DispatchRuling = Arc<Mutex<Option<(i32, Vec<u8>)>>>;
 
 /// `Send` wrapper for the copied vtable: the ABI contract explicitly allows
 /// all callable entries from any plugin thread, concurrently.
@@ -116,13 +131,60 @@ fn plugin_require(
     }
 }
 
+/// Plugin-side growable `dispatch`: retries with a doubled buffer whenever
+/// the host asks for more room (the caller-owned buffer protocol); await-
+/// style modes park the calling thread until the chain settles (D32).
+fn plugin_dispatch(host: &HostExports, event: &[u8], mode: u32, payload: &[u8]) -> (i32, Vec<u8>) {
+    let mut cap = 4096_usize;
+    loop {
+        let mut buf = vec![0_u8; cap];
+        let mut len = 0_usize;
+        // SAFETY: the copied vtable is live until this activation's
+        // `teardown` returns, and every caller below finishes before then
+        // (`teardown` joins the worker); buffers are caller-owned.
+        let status = unsafe {
+            (host.dispatch)(
+                host.host_handle,
+                event.as_ptr(),
+                event.len(),
+                mode,
+                payload.as_ptr(),
+                payload.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
+            )
+        };
+        if status == dougong_abi::STATUS_CAPACITY {
+            cap = cap.saturating_mul(2);
+            continue;
+        }
+        buf.truncate(len);
+        return (status, buf);
+    }
+}
+
 /// The outbound demonstration body: one synchronous `require` from the
-/// plugin's own thread, then one `emit`; the reply is parked for
-/// [`GREETER_WORKER_REPLY`] to read back.
-fn worker_main(host: &SendHost, sink: &Arc<Mutex<Option<Vec<u8>>>>) {
+/// plugin's own thread, one synchronous waterfall `dispatch` whose ruling
+/// parks for [`GREETER_WORKER_DISPATCH`], then one `emit`; the require
+/// reply parks for [`GREETER_WORKER_REPLY`] to read back.
+fn worker_main(
+    host: &SendHost,
+    sink: &Arc<Mutex<Option<Vec<u8>>>>,
+    dispatch_slot: &DispatchRuling,
+) {
     let (_status, reply) = plugin_require(&host.0, ORACLE_SERVICE, 0, b"worker-hello");
     if let Ok(mut slot) = sink.lock() {
         *slot = Some(reply);
+    }
+    let ruling = plugin_dispatch(
+        &host.0,
+        DISPATCH_EVENT,
+        dougong_abi::MODE_WATERFALL,
+        READY_PAYLOAD,
+    );
+    if let Ok(mut slot) = dispatch_slot.lock() {
+        *slot = Some(ruling);
     }
     // SAFETY: the vtable is valid until `teardown` returns and `teardown`
     // joins this worker first; the payload is a fixed valid JSON document.
@@ -165,6 +227,8 @@ struct State {
     /// Shared with the worker. The host's per-instance lock does NOT cover
     /// plugin-owned threads, so this slot carries its own mutex.
     worker_reply: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The worker's parked `dispatch` ruling: `status || chain value`.
+    worker_dispatch: DispatchRuling,
 }
 
 unsafe extern "C" fn name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
@@ -178,7 +242,7 @@ unsafe extern "C" fn name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
 }
 
 unsafe extern "C" fn descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
-    let descriptor = br#"{"name":"greeter","version":"0.4.0","provide":["greeting"],"inject":["greeter.oracle"],"listen":{"ping":1,"upper":2}}"#;
+    let descriptor = br#"{"name":"greeter","version":"0.5.0","provide":["greeting"],"inject":["greeter.oracle"],"listen":{"ping":1,"upper":2}}"#;
     // SAFETY: same host buffer contract as `name`.
     if unsafe { write_out(descriptor, out, cap, len) } {
         dougong_abi::STATUS_OK
@@ -195,12 +259,14 @@ unsafe extern "C" fn setup(host: *const HostExports) -> *mut std::ffi::c_void {
     // the vtable is copied by value (v3 contract).
     let host = unsafe { *host };
     let worker_reply = Arc::new(Mutex::new(None));
+    let worker_dispatch = Arc::new(Mutex::new(None));
     let worker = {
         let host = SendHost(host);
         let sink = Arc::clone(&worker_reply);
+        let dispatch_slot = Arc::clone(&worker_dispatch);
         std::thread::Builder::new()
             .name("greeter-worker".to_string())
-            .spawn(move || worker_main(&host, &sink))
+            .spawn(move || worker_main(&host, &sink, &dispatch_slot))
     };
     let Ok(worker) = worker else {
         // The outbound demonstration is half of this plugin's contract: a
@@ -214,6 +280,7 @@ unsafe extern "C" fn setup(host: *const HostExports) -> *mut std::ffi::c_void {
         host,
         worker: Some(worker),
         worker_reply,
+        worker_dispatch,
     }))
     .cast::<std::ffi::c_void>()
 }
@@ -271,6 +338,15 @@ unsafe extern "C" fn call(
             );
             let (status, reply) = plugin_require(&state.host, service, 0, payload);
             pack_out(status, &reply, out, cap, out_len)
+        }
+        GREETER_WORKER_DISPATCH => {
+            let (status, ruling) = state
+                .worker_dispatch
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .unwrap_or((dougong_abi::STATUS_OK, Vec::new()));
+            pack_out(status, &ruling, out, cap, out_len)
         }
         GREETER_GRANT => {
             let (target, granted) = input.iter().position(|byte| *byte == 0).map_or_else(

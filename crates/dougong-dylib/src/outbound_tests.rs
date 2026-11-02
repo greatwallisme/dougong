@@ -1000,6 +1000,7 @@ async fn require_enforces_capability_and_liveness() {
         require: host_require,
         emit: super::host_emit,
         grant: super::host_grant,
+        dispatch: super::host_dispatch,
     });
     let outcome = std::thread::spawn(move || shared.require(b"svc-host", 0, b"t"))
         .join()

@@ -12,8 +12,9 @@ providers come and go). A plugin never hand-writes teardown - it declares and
 registers, and the kernel derives reversal from registration.
 
 All plugin forms implement **one semantic contract**. Version anchors for the
-current code: ABI_VERSION 4 (`dougong-abi`: v2 CPS event protocol per D14,
-v3 outbound `HostExports` per D16, plus the v4 `grant` entry per D31), WIT world
+current code: ABI_VERSION 5 (`dougong-abi`: v2 CPS event protocol per D14,
+v3 outbound `HostExports` per D16, the v4 `grant` entry per D31, plus the v5
+`dispatch` entry per D32), WIT world
 `dougong:kernel@0.1.0` (`wit/dougong-plugin.wit`), contract hash
 `dougong-dynamic-channel-v1`, wasmtime 48 / wit-bindgen 0.61, toolchain pinned
 in `rust-toolchain.toml`.
@@ -71,7 +72,10 @@ Five obligations, same shape in all three forms:
    a waterfall continuation through the v2 CPS protocol (`STATUS_DEFERRED`
    -> host resolves -> `on_next`). The reverse direction exists too:
    `HostExports.emit` publishes a fire-and-forget event from a dylib plugin
-   (valid JSON payload, never an `internal/*` name).
+   (valid JSON payload, never an `internal/*` name), and since ABI v5
+   `HostExports.dispatch` performs one synchronous five-mode dispatch from a
+   plugin-owned thread - the await modes block until the chain settles and
+   return the chain value; `emit` stays the canonical fire-and-forget face.
 5. **Dispose** - the kernel reverses registrations LIFO on withdrawal; the
    provide-disposer removes the implementation, notifies dependents, and
    joins every touched consumer fiber, so consumers converge before the
@@ -88,7 +92,7 @@ Config arrives as `serde_json::Value` (in-process) or JSON bytes
 | Reference | Read when |
 |-----------|-----------|
 | [kernel-model.md](references/kernel-model.md) | Writing in-process Rust plugins; need the Context API, event modes, effect collection, error model, or loader config format. Explains the shared semantics all forms inherit. |
-| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: v4 export table + `HostExports` outbound vtable (including grants), JSON descriptor (incl. `listen`), buffer protocol, CPS event protocol, reentrancy and thread discipline, state and teardown. |
+| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: v5 export table + `HostExports` outbound vtable (including grants and dispatch), JSON descriptor (incl. `listen`), buffer protocol, CPS event protocol, reentrancy and thread discipline, state and teardown. |
 | [wasm-plugin.md](references/wasm-plugin.md) | Building a wasm component: crate layout, WIT bindings, Guest impl, JSON payload rules, sandbox expectations, host-side requirements. |
 
 ## 4. Verification
@@ -102,7 +106,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # End-to-end proof per form (each must exit 0):
 cargo run -p dougong-dylib  --example dylib_demo    # dylib artifact, needs cargo build --workspace first
-cargo run -p dougong-dylib  --example outbound_demo # ABI v3/v4 outbound + grant arms (greeter + grant-partner artifacts)
+cargo run -p dougong-dylib  --example outbound_demo # ABI v3/v4/v5 outbound + grant + dispatch arms (greeter + grant-partner artifacts)
 cargo run -p dougong-wasm   --example wasm_demo     # wasm artifact, needs the wasip2 build above
 cargo run -p dougong-loader --example loader_demo   # loader lifecycle over the dylib artifact
 ```
@@ -125,6 +129,12 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   and events additionally need the `listen` declaration.
 - Dylib waterfall: return `STATUS_DEFERRED` only when `next_available == 1`;
   deferring outside waterfall, or from `on_next`, is rejected by the host.
+- Dylib `dispatch` (v5): blocks the calling thread until the chain settles
+  (await modes) and must originate on a plugin-owned thread — calling it
+  while any foreign entry executes on the thread fails deterministically
+  with `STATUS_REENTRANCY`. An untouched waterfall chain reports the
+  original payload bytes (identity continuation); a listener failure is
+  `STATUS_FAILED` with the JSON detail triple.
 - Wasm replies must be **valid JSON bytes** - a bare string needs quotes
   (`"\"pong\""`), or the host-side decode fails.
 - Wasm host: a `wasm32-wasip2` guest built with std always declares

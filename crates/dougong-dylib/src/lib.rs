@@ -13,7 +13,7 @@
 //! registers a [`dougong::Invoker`] service so any consumer can call the
 //! plugin through the dynamic channel (`method` selector + byte payload).
 //!
-//! # Outbound surface (ABI v4)
+//! # Outbound surface (ABI v4/v5)
 //!
 //! Each activation receives a [`dougong_abi::HostExports`] vtable at `setup`:
 //! `require` performs a synchronous blocking call into another plugin's
@@ -22,7 +22,12 @@
 //! kernel bus. `grant` (D31) additionally lets a provider authorize one
 //! committed target activation to require one owned service without static
 //! injection; grants bind activation identities and are reclaimed with the
-//! granter. Reentrancy is governed by a per-thread activation stack
+//! granter. `dispatch` (D32, v5) publishes one synchronous kernel-bus event
+//! in any of the five dispatch modes: the await-style modes block the
+//! calling thread until the chain settles and report the chain value, and
+//! the call must originate on a plugin-owned thread (a foreign entry frame
+//! on the calling thread fails deterministically with `STATUS_REENTRANCY`).
+//! Reentrancy is governed by a per-thread activation stack
 //! (design decision D-V3-3 option b'): any foreign entry — `setup`, `call`,
 //! `on_event`/`on_next`, `teardown` — records its instance for the duration
 //! of the synchronous FFI segment, and a service call that would re-enter an
@@ -61,6 +66,7 @@
 //! plugin's `teardown`. Never unmap a library whose handles or disposers may
 //! still run.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -995,6 +1001,186 @@ unsafe extern "C" fn host_grant(
     .unwrap_or(STATUS_HOST_ERROR)
 }
 
+/// Caller-owned reply buffer for the await-style `dispatch` modes (the
+/// same growable protocol `require` follows, bundled to keep the bridge's
+/// argument list readable).
+#[derive(Clone, Copy)]
+struct ReplyBuffer {
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+}
+
+impl ReplyBuffer {
+    /// Writes one settled dispatch outcome: `Ok` values serialize into the
+    /// buffer (falling back to the original payload bytes when the settled
+    /// value equals the parsed input, keeping identity observable
+    /// byte-for-byte); `Err` values surface as request-visible failures
+    /// with the detail triple.
+    fn write_settled(
+        self,
+        settled: dougong::Result<Value>,
+        reference: &Value,
+        original_bytes: &[u8],
+    ) -> i32 {
+        match settled {
+            Ok(value) => {
+                // Serializing a kernel-produced `Value` cannot fail in a way
+                // a caller could act on; fall back to echoing the input. The
+                // identity branch borrows the input instead of copying it.
+                let bytes = if &value == reference {
+                    Cow::Borrowed(original_bytes)
+                } else {
+                    serde_json::to_vec(&value).map_or(Cow::Borrowed(original_bytes), Cow::Owned)
+                };
+                // SAFETY: the host honors the same caller-owned buffer
+                // contract it requires of plugin exports.
+                if unsafe { write_out(&bytes, self.out_buf, self.cap, self.out_len) } {
+                    STATUS_OK
+                } else {
+                    STATUS_CAPACITY
+                }
+            }
+            Err(err) => write_detail(
+                self.out_buf,
+                self.cap,
+                self.out_len,
+                err.code,
+                err.class.as_str(),
+                &err.message,
+                STATUS_FAILED,
+            ),
+        }
+    }
+
+    /// Writes one failure detail document (see `write_detail`). The bridge's
+    /// own rejections are logic-class by the S5 mapping (D20).
+    fn write_failure(self, code: &str, message: &str, status: i32) -> i32 {
+        write_detail(
+            self.out_buf,
+            self.cap,
+            self.out_len,
+            code,
+            dougong::ErrorClass::Logic.as_str(),
+            message,
+            status,
+        )
+    }
+}
+
+/// vtable entry: one synchronous outbound dispatch in `mode`.
+///
+/// # Safety
+///
+/// Per the [`HostExports`] contract: `host` names a live activation and
+/// `event`/`payload` are readable for their lengths; `out_buf`/`out_len`
+/// follow the caller-owned buffer protocol for the await-style modes.
+unsafe extern "C" fn host_dispatch(
+    host: *mut std::ffi::c_void,
+    event: *const u8,
+    event_len: usize,
+    mode: u32,
+    payload: *const u8,
+    payload_len: usize,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    // SAFETY: the vtable contract keeps `host` valid until teardown returns.
+    let activation = unsafe { &*host.cast::<Activation>() };
+    let reply = ReplyBuffer {
+        out_buf,
+        cap,
+        out_len,
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: vtable input contract (null pairs with length 0).
+        let event_bytes = unsafe { input_slice(event, event_len) };
+        // SAFETY: same input contract for the payload.
+        let payload_bytes = unsafe { input_slice(payload, payload_len) };
+        dispatch_impl(activation, event_bytes, mode, payload_bytes, reply)
+    }))
+    .unwrap_or(STATUS_HOST_ERROR)
+}
+
+/// The `dispatch` bridge: validates the frame posture, name, payload, and
+/// mode, then drives the kernel's same-named dispatch face to settlement on
+/// the calling thread (D32). Await-style modes write the settled value into
+/// the reply buffer; a listener failure is request-visible `STATUS_FAILED`.
+fn dispatch_impl(
+    activation: &Activation,
+    event_bytes: &[u8],
+    mode: u32,
+    payload_bytes: &[u8],
+    reply: ReplyBuffer,
+) -> i32 {
+    // B6 posture gate (D32): dispatch must originate on a plugin-owned
+    // thread. A foreign entry frame means the calling thread holds that
+    // instance's lock; a chain listener requiring that instance would park
+    // on the lock while the dispatcher parks on chain completion — a wait
+    // edge pair the instance-lock cycle detector cannot see. Rejecting up
+    // front keeps the deadlock deterministic instead of silent.
+    let foreign_entry = ENTRY_STACK.with(|stack| !stack.borrow().is_empty());
+    if foreign_entry {
+        return reply.write_failure(
+            "reentrancy_cycle",
+            "dispatch must originate on a plugin-owned thread: a foreign entry \
+             is executing on the calling thread",
+            STATUS_REENTRANCY,
+        );
+    }
+    let Ok(event) = std::str::from_utf8(event_bytes) else {
+        return STATUS_INVALID_EVENT;
+    };
+    // Bridges never touch the framework-reserved prefix (aligned with the
+    // `emit` bridge rejection rule).
+    if event.starts_with("internal/") {
+        return STATUS_INVALID_EVENT;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(payload_bytes) else {
+        return STATUS_INVALID_PAYLOAD;
+    };
+    match mode {
+        MODE_EMIT => {
+            // `Context::emit` spawns the dispatch; entering the captured
+            // runtime makes that legal on plugin-owned threads too. The
+            // caller neither expects nor receives listener outcomes (the
+            // canonical fire-and-forget face stays the `emit` entry).
+            let _runtime = activation.rt.enter();
+            activation.ctx.emit(event, value);
+            STATUS_OK
+        }
+        MODE_WATERFALL | MODE_SERIAL | MODE_BAIL | MODE_PARALLEL => {
+            // Identity reference for the await-style modes: a settled value
+            // equal to the parsed input echoes the original payload bytes
+            // (B4 byte stability). Only these arms need it, so `MODE_EMIT`
+            // never pays the clone.
+            let reference = value.clone();
+            // Identity continuation (B4): an untouched chain reports the
+            // original payload bytes verbatim. Key order is normalized by
+            // `serde_json`'s map, so byte stability comes from echoing the
+            // input bytes when the settled value equals the parsed input.
+            let settled = match mode {
+                MODE_WATERFALL => drive(
+                    &activation.rt,
+                    activation
+                        .ctx
+                        .waterfall(event, value, |value| Box::pin(async move { Ok(value) })),
+                ),
+                MODE_SERIAL => drive(&activation.rt, activation.ctx.serial(event, value)),
+                MODE_BAIL => drive(&activation.rt, activation.ctx.bail(event, value)),
+                _ => drive(&activation.rt, activation.ctx.parallel(event, value)),
+            };
+            reply.write_settled(settled, &reference, payload_bytes)
+        }
+        _ => reply.write_failure(
+            "invalid_dispatch_mode",
+            "dispatch mode is not one of the MODE_* constants",
+            STATUS_FAILED,
+        ),
+    }
+}
+
 /// Resolved export table plus the mapped library that backs it.
 ///
 /// # Safety contract
@@ -1536,6 +1722,7 @@ impl Plugin for DynPlugin {
                     require: host_require,
                     emit: host_emit,
                     grant: host_grant,
+                    dispatch: host_dispatch,
                 };
                 exports.setup(&host_exports)
             };
@@ -1759,6 +1946,8 @@ pub fn from_static(table: &'static PluginExports) -> Result<DynPlugin> {
     from_exports(Exports { table, _lib: None })
 }
 
+#[cfg(test)]
+mod dispatch_tests;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]

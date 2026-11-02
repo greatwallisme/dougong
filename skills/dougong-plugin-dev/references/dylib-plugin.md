@@ -44,8 +44,9 @@ pub static DOUGONG_PLUGIN_EXPORTS: PluginExports = PluginExports {
 };
 ```
 
-`ABI_VERSION` is 4 (v2 = CPS event protocol, D14; v3 = outbound
-`HostExports` vtable, D16; v4 = activation-scoped grants, D31). Any change to
+`ABI_VERSION` is 5 (v2 = CPS event protocol, D14; v3 = outbound
+`HostExports` vtable, D16; v4 = activation-scoped grants, D31; v5 = outbound
+synchronous `dispatch`, D32). Any change to
 `PluginExports`, `HostExports`, or the constants breaks the ABI: bump it and
 update every duplicate table in the same commit.
 
@@ -57,7 +58,7 @@ registrations, so it must match what `call`/`on_event` actually serve:
 
 ```rust
 unsafe extern "C" fn descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
-    let json = br#"{"name":"greeter","version":"0.4.0","provide":["greeting"],
+    let json = br#"{"name":"greeter","version":"0.5.0","provide":["greeting"],
 "inject":[],"listen":{"ping":1,"upper":2}}"#;
     if unsafe { write_out(json, out, cap, len) } { dougong_abi::STATUS_OK }
     else { dougong_abi::STATUS_CAPACITY }
@@ -141,7 +142,7 @@ MODE_WATERFALL(4)` - chosen at dispatch by the host, never at registration.
   host guarantees no other foreign call interleaves between your deferred
   `on_event` and its `on_next`.
 
-## Outbound calls and grants (ABI v3/v4, D16/D31)
+## Outbound calls, grants, and dispatch (ABI v3/v4/v5, D16/D31/D32)
 
 `setup` receives a `HostExports` vtable, valid only for that call - copy it
 by value. The copy stays callable until **this activation's** `teardown`
@@ -162,6 +163,9 @@ pub struct HostExports {
     pub grant: unsafe extern "C" fn(
         host, target_service, target_service_len, granted_service, granted_service_len,
     ) -> i32,                     // activation-scoped require authorization
+    pub dispatch: unsafe extern "C" fn(
+        host, event, event_len, mode, payload, payload_len, out_buf, cap, out_len,
+    ) -> i32,                     // one synchronous outbound dispatch (five modes)
 }
 ```
 
@@ -228,6 +232,32 @@ acceptance arms.
   The host calls it exactly once per successful `setup`, after all disposers
   referencing the handle drained.
 
+## Outbound dispatch (ABI v5, D32)
+
+`HostExports.dispatch(host, event, event_len, mode, payload, payload_len, out_buf, cap, out_len) -> i32`
+publishes one synchronous dispatch in `mode` (the same `MODE_*` constants the
+`on_event` delivery uses):
+
+- `MODE_WATERFALL` composes the listener chain around a fixed identity
+  continuation: an untouched chain (no listener, or listeners that pass the
+  payload through) reports the **original payload bytes** — compare bytes to
+  detect "nobody acted"; encode default rulings in your payload protocol.
+- `MODE_SERIAL`/`MODE_BAIL` report the first non-null value (cordis `isBailed`:
+  every non-null value bails); `MODE_PARALLEL` reports the settled state and
+  aggregates listener failures; `MODE_EMIT` enqueues and returns without
+  writing `out_buf` (the `emit` entry stays the canonical fire-and-forget).
+- A listener failure is `STATUS_FAILED` with the
+  `{"code","class","message"}` detail in `out_buf` — dispatch is request
+  semantics, never broadcast.
+- **Thread posture**: the call blocks the calling thread until the chain
+  settles and must originate on a plugin-owned thread. Calling it while any
+  foreign entry executes on the thread fails deterministically with
+  `STATUS_REENTRANCY` (`reentrancy_cycle` detail): the chain could require
+  your own instance, and that wait edge is invisible to the wait-cycle
+  detector. Spawn a worker thread for dispatches, as the greeter demo does.
+- `internal/*` names and non-JSON payloads fail like the `emit` entry;
+  an out-of-vocabulary mode fails with `invalid_dispatch_mode`.
+
 ## Loading
 
 Via the loader document (`dougong-loader`) or directly:
@@ -252,7 +282,7 @@ cargo build -p my-plugin                          # produces the .so
 nm -D target/debug/libmy_plugin.so | rg DOUGONG_PLUGIN_EXPORTS
 cargo clippy -p my-plugin --all-targets -- -D warnings
 cargo run -p dougong-loader --example loader_demo # end-to-end (uses the greeter artifact)
-cargo run -p dougong-dylib --example outbound_demo # ABI v3/v4 outbound + grant arms
+cargo run -p dougong-dylib --example outbound_demo # ABI v3/v4/v5 outbound + grant + dispatch arms
 ```
 
 ## Pitfalls

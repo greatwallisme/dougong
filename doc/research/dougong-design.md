@@ -555,12 +555,47 @@ dougong = 内核（约 3k 行级）+ ABI 契约与 dylib 宿主（数百行级�
 - **R3** ABI 契约 crate 命名 = `dougong-abi`。
 - **R4 工具链纪律**（2026-10-21）：仓库工件一律且仅由 `rust-toolchain.toml` 钉定的工具链（1.99.1）编译；禁止以任何其他工具链构建或替换 `target/` 内的工件（含一次性实验）。MSRV 声明已整体移除（2026-10-21 追记）——未实测过的兼容下限一律不宣称；如需版本证明，走隔离环境（独立 worktree/CI）实测后再写进清单。
 
-## 附录 A：语义等价表（in-process vs dylib-v4，D16/D31）
+### D32 dylib 出站同步派发 = ABI v5 `HostExports.dispatch`（五模式，waterfall 恒等续体）
+
+2026-11-02 用户裁决（维护者）：**推翻 v3 需求文档 §5.5「emit 非 emit 模式出站」
+结构性排除**（仅此一条；v3 §5 其余各项维持）。依据修正：排除文本称「次序/否决
+语义在应用层组装（dsh 会话域实证：全部手工调用）」，但 dsh 真源复核表明其
+agent 主循环与压缩恢复就是 cordis 内核事件面向插件的形态（compaction-basic
+`ctx.on('agent/pre-step')`、`ctx.waterfall('compaction/summary-error', …)`）——
+cordis 的 `ctx.waterfall` 对全部插件可用，dougong 中对应物 `Context::waterfall`
+只对进程内插件存在，dylib 无出站对应。「应用层自建注册表」路径会迫使每个
+消费者重建平行监听机制，恰是内核组合本应承载的职责。
+
+裁决要点（全文见 doc/maintenance/dispatch_requirements.md）：
+
+- `dispatch(event, mode, payload, out_buf)` = 出站同步派发，`mode` 取值 =
+  既有 `MODE_*` 词表；await 型模式（waterfall/serial/bail/parallel）阻塞调用
+  线程至链收敛并把终值 JSON 写回 out_buf，`MODE_EMIT` 入队即返（与 `emit`
+  等价面，`emit` 保留为规范火忘入口）。
+- 监听侧零变更：注册仍 = descriptor `listen` 静态声明（v3 §5.2 维持），CPS
+  协议（D14）、匹配语义、五模式语义全部现状复用；派发语义与进程内同名方法
+  逐点同型（G4 同型铁律）。
+- waterfall fallback = **恒等续体**（ABI 面唯一可固定的闭包替代；跨 FFI 只有
+  字节）：无监听者生效时链终值 == 载荷字节。桥实现以「终值 == 解析输入」
+  判等并回写原始载荷字节，键序归一下仍字节稳定。
+- 链内监听者失败 = 请求可见 `STATUS_FAILED` + `{"code","class","message"}`
+  详情（派发=请求语义，非广播；`MODE_EMIT` 臂对齐 emit 现状仅 log）。
+- **B6 姿态门**：dispatch 必须自插件自有线程发起；调用线程携带任何外来入口
+  帧 → 确定性 `STATUS_REENTRANCY`。结构性理由：外来入口帧持本实例锁，链内
+  监听者 require 该实例的等待边落在实例锁上，而派发方等待落在派发完成
+  channel 上——channel 等待不是 armed 实例锁边，跨线程等待图无环可循，检测
+  不可达；保守前置拒绝换确定性。
+- `ABI_VERSION` 4→5（「HostExports 变更即 bump」铁律）；最小 diff（vtable
+  +1 字段）；wasm 出站维持 v3 §5.1 排除。
+
+## 附录 A：语义等价表（in-process vs dylib-v5，D16/D31/D32）
 
 | 面 | in-process | dylib v4 | 锚 |
 |---|---|---|---|
 | require 能力检查基准 | fiber 兴趣集（声明注入解析承诺） | 实例 descriptor `inject` 集（常量，激活期捕获进 vtable 闭包）；拥有者可另授运行期窄能力 | B2；两级语义（undeclared/inactive）一致，检查对象不同 |
 | 动态授予 | 不需要：依赖面在装配期已知，需动态边时改用 dylib 或静态声明 | `grant`：拥有者授一个自有服务名给一个已提交目标激活；随授予者激活失效 | D31 + 2026-10-28 修订：名级索引 root 作用域化、授权绑定解析到的提供者、无 id 目标拒绝；undeclared→inactive 优先序与无跨激活继承不变 |
+| 出站同步派发 | `ctx.waterfall`/`serial`/`bail`/`parallel`（闭包 fallback/续体） | `dispatch(event, mode, …)`：五模式同型；waterfall fallback = 固定恒等续体（无监听者生效 ⇔ 终值 == 载荷字节）；失败 = `STATUS_FAILED` + 详情三元组（请求语义） | D32；v3 §5.5 由本裁决推翻 |
+| 出站姿态约束 | 无（Context 方法任意可调） | 必须自插件自有线程发起；外来入口帧内调用 = 确定性 `STATUS_REENTRANCY`（channel 等待不进实例锁等待图，锁死不可检测） | D32 B6 |
 | require 载荷 | 类型化键（`Any` 下转）与动态通道字节并存 | 仅动态通道字节，对宿主不透明（编码归服务契约） | B6 |
 | emit 载荷 | `serde_json::Value` | 必须合法 JSON 字节，非法 = `STATUS_INVALID_PAYLOAD` | C2（显式非对称） |
 | `internal/*` 事件 | 桥禁订（`on_dispatch` 拒绝） | 出站禁发（`STATUS_INVALID_EVENT`） | C3 |

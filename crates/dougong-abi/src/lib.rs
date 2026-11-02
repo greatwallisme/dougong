@@ -237,7 +237,16 @@ pub const STATUS_INVALID_EVENT: i32 = -8;
 /// v4 (2026-10-28): callback capability grants — [`HostExports`] gains
 /// `grant`, an activation-scoped registration primitive for narrow runtime
 /// delegation of `require` capability (design decision D31).
-pub const ABI_VERSION: u32 = 4;
+///
+/// v5 (2026-11-02): outbound synchronous dispatch — [`HostExports`] gains
+/// `dispatch`, one synchronous kernel-bus event publication per call whose
+/// await-style modes (`MODE_PARALLEL`/`MODE_SERIAL`/`MODE_BAIL`/
+/// `MODE_WATERFALL`) block the calling thread until the chain settles and
+/// write the chain value into `out_buf` (`MODE_EMIT` enqueues and returns,
+/// mirroring the `emit` entry). Waterfall composes around a fixed identity
+/// continuation: an untouched chain returns the original payload bytes
+/// (design decision D32; `dispatch_requirements.md` §2).
+pub const ABI_VERSION: u32 = 5;
 
 /// Event dispatch mode: run listeners without waiting for returned values.
 pub const MODE_EMIT: u32 = 0;
@@ -352,6 +361,36 @@ pub struct HostExports {
         target_service_len: usize,
         granted_service: *const u8,
         granted_service_len: usize,
+    ) -> i32,
+    /// Publishes `event` with a JSON `payload` to the kernel bus, dispatched
+    /// in `mode` (one of the [`MODE_*`](MODE_EMIT) constants).
+    ///
+    /// Await-style modes block the calling thread until the dispatch settles
+    /// and follow the same growable `out_buf` protocol as `require`:
+    /// `MODE_WATERFALL` composes the listener chain around a fixed identity
+    /// continuation (an untouched chain reports the original payload bytes),
+    /// `MODE_SERIAL`/`MODE_BAIL` report the bail value, and `MODE_PARALLEL`
+    /// reports the settled state. A listener failure is `STATUS_FAILED` with
+    /// a JSON `{"code","class","message"}` detail in `out_buf` — dispatch is
+    /// request semantics, never the fire-and-forget broadcast of `emit`.
+    /// `MODE_EMIT` enqueues and returns without writing `out_buf`.
+    ///
+    /// The call must originate on a plugin-owned thread: invoking it while
+    /// any foreign entry executes on the calling thread fails deterministically
+    /// with [`STATUS_REENTRANCY`] (the chain may legally `require` the
+    /// dispatcher's own services, and a chain-side wait on that instance lock
+    /// is invisible to the wait-cycle detector). `internal/*` event names are
+    /// rejected like the `emit` entry.
+    pub dispatch: unsafe extern "C" fn(
+        host: *mut std::os::raw::c_void,
+        event: *const u8,
+        event_len: usize,
+        mode: u32,
+        payload: *const u8,
+        payload_len: usize,
+        out_buf: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
     ) -> i32,
 }
 
@@ -504,7 +543,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(ABI_VERSION, 4);
+        assert_eq!(ABI_VERSION, 5);
         assert_eq!(STATUS_DEFERRED, 2);
     }
 
