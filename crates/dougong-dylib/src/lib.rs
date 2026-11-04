@@ -345,6 +345,10 @@ struct Activation {
     /// Descriptor `provide` names: the only services this activation may
     /// grant to another activation (D31).
     provide: Vec<String>,
+    /// The activation's liveness gate: shared with the disposer, the
+    /// outbound require path, the event bridges, and the dispatch entry
+    /// (`teardown_requirements.md` R3/R5 — pre-lock teardown quiescence).
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One activation-granular grant: pure identity bookkeeping, never a call
@@ -1103,6 +1107,14 @@ unsafe extern "C" fn host_dispatch(
     .unwrap_or(STATUS_HOST_ERROR)
 }
 
+/// The `provider_gone` wire pair (code + detail message) shared by every
+/// teardown gate: the require pre/under-lock checks, both event-bridge
+/// gates, and the dispatch entry. One definition pins the byte-for-byte
+/// contract (`teardown_requirements.md` R3/R4/R5).
+const fn provider_gone_detail() -> (&'static str, &'static str) {
+    ("provider_gone", "dylib provider activation is tearing down")
+}
+
 /// The `dispatch` bridge: validates the frame posture, name, payload, and
 /// mode, then drives the kernel's same-named dispatch face to settlement on
 /// the calling thread (D32). Await-style modes write the settled value into
@@ -1128,6 +1140,16 @@ fn dispatch_impl(
              is executing on the calling thread",
             STATUS_REENTRANCY,
         );
+    }
+    // Teardown-quiescence early gate (teardown_requirements.md R5): a
+    // dispatch that starts after the flip fails here. An in-flight dispatch
+    // settles through its listeners — a chain listener requiring this
+    // tearing-down instance unwinds at that require's gate, the chain
+    // settles with the failure, and the dispatch returns without holding
+    // this instance's lock (no lock-order inversion is possible).
+    if !activation.alive.load(Ordering::Acquire) {
+        let (code, message) = provider_gone_detail();
+        return reply.write_failure(code, message, STATUS_FAILED);
     }
     let Ok(event) = std::str::from_utf8(event_bytes) else {
         return STATUS_INVALID_EVENT;
@@ -1521,6 +1543,15 @@ impl dougong::Invoke for DylibInvoke {
                     "dylib service call would re-enter an instance already executing on this thread",
                 ));
             }
+            // Teardown-quiescence pre-lock gate (teardown_requirements.md
+            // R3): once the gate flips, a require that has not yet queued on
+            // the lock fails here instead of becoming a lock waiter — the
+            // teardown join can then never race a thread parked on this
+            // instance's lock (the 0.5.0 lock-order inversion).
+            if !alive.load(Ordering::Acquire) {
+                let (code, message) = provider_gone_detail();
+                return Err(Error::transport(code, message));
+            }
             // Cross-instance discipline: wait edges while parking, this
             // instance on the lock chain while held — a `require` issued
             // from inside the handler must see this lock as held.
@@ -1532,10 +1563,8 @@ impl dougong::Invoke for DylibInvoke {
             // foreign call. The flag was cleared under this very lock before
             // the teardown export ran; whoever holds the lock second sees it.
             if !alive.load(Ordering::Acquire) {
-                return Err(Error::transport(
-                    "provider_gone",
-                    "dylib provider activation is tearing down",
-                ));
+                let (code, message) = provider_gone_detail();
+                return Err(Error::transport(code, message));
             }
             let _entry = EntryGuard::enter(instance_id);
             exports.call_full(&handle, method, &payload)
@@ -1556,16 +1585,34 @@ fn event_bridge(
     lock: InstanceLock,
     event_id: u32,
     instance_id: u64,
+    alive: Arc<std::sync::atomic::AtomicBool>,
 ) -> DispatchListener {
     Arc::new(move |_ctx, payload, next, mode| {
         let exports = exports.clone();
         let handle = handle.clone();
         let lock = Arc::clone(&lock);
+        let alive = Arc::clone(&alive);
         Box::pin(async move {
+            // Teardown-quiescence pre-lock gate (teardown_requirements.md
+            // R3): same rationale as the require path — post-flip arrivals
+            // fail before queueing on the lock.
+            if !alive.load(Ordering::Acquire) {
+                let (code, message) = provider_gone_detail();
+                return Err(Error::transport(code, message));
+            }
             // The bridge takes the instance lock under the full
             // cross-instance discipline (same as `call`): wait edges while
             // parking, the instance on the lock chain while held.
             let hold = enter_exclusive(&lock, instance_id).await?;
+            // Under-lock liveness gate (teardown_requirements.md R4): the
+            // 0.5.0 bridge had no gate here, so a listener queued on this
+            // lock during teardown would enter the freed vtable after the
+            // teardown export returned. The check is also the drain point
+            // that empties the queue ahead of the disposer (R2 convergence).
+            if !alive.load(Ordering::Acquire) {
+                let (code, message) = provider_gone_detail();
+                return Err(Error::transport(code, message));
+            }
             let bytes = serde_json::to_vec(&payload).map_err(|err| {
                 Error::transport("payload_codec", format!("encode payload: {err}"))
             })?;
@@ -1673,6 +1720,10 @@ impl Plugin for DynPlugin {
         Some("dylib")
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the activation body spans setup, teardown registration, grants, and listener bridges; splitting it would hide the lifecycle order"
+    )]
     fn apply(&self, ctx: dougong::Context, _config: Value) -> BoxFuture<Result<()>> {
         let exports = self.exports.clone();
         let provide = self.provide.clone();
@@ -1706,6 +1757,7 @@ impl Plugin for DynPlugin {
                     instance_id,
                     inject: inject_names,
                     provide: provide.clone(),
+                    alive: Arc::clone(&alive),
                 }))
                 .cast_mut()
                 .cast::<std::ffi::c_void>(),
@@ -1758,15 +1810,20 @@ impl Plugin for DynPlugin {
                         // nothing else while parking, so it can never close a
                         // wait cycle — plain parking is safe; the chain push
                         // still exposes this lock to nested `require` arms.
+                        //
+                        // Teardown-quiescence order (teardown_requirements.md
+                        // R1+R2, the 0.5.1 lock-inversion fix): the liveness
+                        // gate flips BEFORE the lock acquisition. The mutex
+                        // grants locks in request order, so every queued
+                        // outbound entry acquires ahead of the disposer,
+                        // unwinds at the under-lock gate, and releases — the
+                        // disposer's turn arrives with the queue drained, and
+                        // the teardown export can never race a thread parked
+                        // on this lock (the 0.5.0 lock-order inversion).
+                        teardown_alive.store(false, Ordering::Release);
                         let _instance = teardown_lock.lock().await;
                         let _chain = ChainGuard::hold(instance_id);
                         let _entry = EntryGuard::enter(instance_id);
-                        // Clear the liveness gate while holding the lock and
-                        // before the teardown export frees plugin state: a
-                        // require that acquires the lock later must observe
-                        // the store (mutex release/acquire pairs with the
-                        // flag's own ordering as a belt-and-suspenders).
-                        teardown_alive.store(false, Ordering::Release);
                         teardown_exports.teardown(&teardown_handle);
                     }
                     // SAFETY: teardown has returned, so the vtable is dead;
@@ -1784,14 +1841,14 @@ impl Plugin for DynPlugin {
                 // failure arms are a dispose racing this body or an effect
                 // budget breach, and in both the activation is dead weight.
                 {
-                    // Same one-lock shape as the disposer: no wait edges
-                    // needed (nothing else is held), but the chain push keeps
-                    // this lock visible to nested `require` arms.
+                    // Same one-lock shape as the disposer, with the same
+                    // teardown-quiescence order (teardown_requirements.md
+                    // R1+R2+R6): gate first, plain queue acquisition second,
+                    // teardown export last — both arms share one lock order.
+                    alive.store(false, Ordering::Release);
                     let _instance = instance.lock().await;
                     let _chain = ChainGuard::hold(instance_id);
                     let _entry = EntryGuard::enter(instance_id);
-                    // Same liveness gate as the disposer arm (review F2).
-                    alive.store(false, Ordering::Release);
                     exports.teardown(&Handle(handle.0));
                 }
                 // SAFETY: the disposer was never registered, so this is the
@@ -1808,6 +1865,7 @@ impl Plugin for DynPlugin {
                     Arc::clone(&instance),
                     *event_id,
                     instance_id,
+                    Arc::clone(&alive),
                 );
                 ctx.on_dispatch(event_name, bridge).await?;
             }

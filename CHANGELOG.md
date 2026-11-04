@@ -3,6 +3,38 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.5.1] - 2026-11-04
+
+### 修复：dylib 拆除与插件自有线程出站 require 的锁序倒置（停摆纪律）
+
+disposer 在实例锁内运行 teardown，而插件按 v3 纪律在 teardown 中 join 自有
+worker 线程；该 worker 的出站 require 以同一把实例锁为 caller 串行化点，
+排队等待者「获锁后见门翻」的退场条件与 disposer「join 到该线程」互为前提
+——0.5.0 中该环无解，首次全量真共载（20 dylib 工件 + 信号关停）以 ≈50%
+概率挂死。修复（需求规格全文见 `doc/maintenance/teardown_requirements.md`）：
+
+- disposer 两臂（registered effect 与 inline fallback）：liveness 门翻转
+  上移到锁获取**之前**；获取保持普通 `lock().await`（tokio Mutex 公平队列
+  —— disposer 之前的每个排队等待者获锁即撞锁内门、以 `provider_gone`
+  退场，disposer 的轮次到达时队列必空，有限步收敛，无轮询无睡眠）。
+- `DylibInvoke::call` 与事件桥新增**预锁** alive 检查：门翻之后的新 require
+  / 监听者在排队前即失败，从源头保证无新等待者。
+- 事件桥补上**锁内** alive 检查：0.5.0 桥无任何门，teardown 后获锁的排队
+  监听者会进入已释放的 vtable（既有 UB 洞，一并封口）。
+- `dispatch` 入口新增早门：门翻后新发起的 dispatch 即刻
+  `provider_gone`；在途 dispatch 经链内监听者在门处退场自然收敛。
+
+语义零变更：`provider_gone` 状态码与文案、`STATUS_OK` 路径、reentrancy
+纪律、同一实例外来入口不交错的串行化保证逐字节不变；loader JSON、wasm/
+WIT、CPS 协议、descriptor schema 不变。新增回归钉测
+`teardown_joins_a_requiring_worker_without_deadlock`（插件自有 worker 循环
+dispatch、链路进入被拆激活自身事件桥，与 disposer 的 teardown join 竞争
+同一把实例锁，限时收敛；require 面因 descriptor 自注入会死锁响应式解析，
+无法在不借助 grant 自授权的条件下构造，钉测注释内注明）。已实证钉测对
+0.5.0 判别：旧码挂死、新码限时收敛。验证：四关零警告零错误，workspace
+241 passed / 0 failed，六 demo exit 0；下游 fly-rafter 18a 真共载复验：
+修前关停挂死 ≈50%，修后 boot 5/5 稳定、SIGINT 130 / SIGTERM 0 界内收敛。
+
 ## [0.5.0] - 2026-11-02
 
 ### ABI v5：dylib 出站同步派发 dispatch（破坏性变更）

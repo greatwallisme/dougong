@@ -73,6 +73,37 @@ impl SendHost {
     fn grant(&self, target: &[u8], granted: &[u8]) -> i32 {
         plugin_grant(&self.0, target, granted)
     }
+
+    /// Calls `dispatch` through the copied vtable (ABI v5; the growable
+    /// out-buffer protocol, same as `require`).
+    fn dispatch(&self, event: &[u8], mode: u32, payload: &[u8]) -> (i32, Vec<u8>) {
+        let mut cap = 4096_usize;
+        loop {
+            let mut buf = vec![0_u8; cap];
+            let mut len = 0_usize;
+            // SAFETY: the vtable is live (fixtures never outlive their
+            // activation); buffers are caller-owned.
+            let status = unsafe {
+                (self.0.dispatch)(
+                    self.0.host_handle,
+                    event.as_ptr(),
+                    event.len(),
+                    mode,
+                    payload.as_ptr(),
+                    payload.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &raw mut len,
+                )
+            };
+            if status == STATUS_CAPACITY {
+                cap = cap.saturating_mul(2);
+                continue;
+            }
+            buf.truncate(len);
+            return (status, buf);
+        }
+    }
 }
 
 /// Plugin-side grant: the v4 registration primitive has no out-buffer.
@@ -897,6 +928,7 @@ fn bare_activation_with_provide(
         instance_id: super::next_instance_id(),
         inject: inject.iter().map(|name| (*name).to_string()).collect(),
         provide: provide.iter().map(|name| (*name).to_string()).collect(),
+        alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     }))
     .cast_mut()
     .cast::<std::ffi::c_void>()
@@ -2320,5 +2352,175 @@ async fn target_reactivation_rebinds_grant_through_granter_reactivation() {
     );
     consumer.dispose().await;
     target2.dispose().await;
+    ctx.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Teardown quiescence (teardown_requirements.md, 0.5.1): the R7
+// discrimination pin. The worker's outbound entry must serialize on the
+// activation being disposed — its own — so the parked waiter and the
+// joining disposer each wait for the other (the 0.5.0 lock-order inversion,
+// fly-rafter 18a first-co-load hang). The require face of that shape is not
+// constructible at descriptor level (requiring your own provided service
+// needs it in `inject`, which deadlocks reactive resolution as a
+// self-dependency), so the pin drives the documented equivalent face: the
+// worker dispatches an event whose chain enters this activation's own event
+// bridge — the bridge's `enter_exclusive` serializes on the same instance
+// lock the disposer holds across the teardown-time join (spec §1.2/§1.3).
+// The slow `on_event` export widens the in-flight window so the disposer's
+// lock request deterministically queues while the worker holds the lock:
+// on 0.5.0 the next chain's bridge parks forever and the join hangs (this
+// pin times out red), on 0.5.1 the flipped gate retires the dispatch entry
+// (R5) or its bridge (R3/R4) with `provider_gone` before it can park.
+
+struct QuiesceState {
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+static QUIESCE_DISPATCH_GONE: AtomicBool = AtomicBool::new(false);
+
+/// Parses a failure detail and reports whether it is the teardown gate's
+/// `provider_gone` (the worker's exit signal — never retry into a stale
+/// handle, D31 amendment).
+fn is_provider_gone(detail: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(detail)
+        .ok()
+        .and_then(|value| value["code"].as_str().map(str::to_owned))
+        .as_deref()
+        == Some("provider_gone")
+}
+
+unsafe extern "C" fn quiesce_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe { write_out(b"fake-quiesce", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn quiesce_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    let descriptor = concat!(
+        "{\"name\":\"fake-quiesce\",\"version\":\"0.0.0\",",
+        "\"provide\":[],\"inject\":[],\"listen\":{\"evt-quiesce\":7}}"
+    );
+    // SAFETY: host buffer contract.
+    if unsafe { write_out(descriptor.as_bytes(), out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn quiesce_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+    if host.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the vtable contract states the entries are callable from any
+    // thread; SendHost is the sanctioned Send wrapper (the spawn hammer
+    // judgment) — wrapped before the spawn so the closure captures Send.
+    let host = SendHost(unsafe { *host });
+    let worker = std::thread::spawn(move || {
+        // The loop only exits on the gate's verdict. On 0.5.0 it parks
+        // inside the chain's bridge on the disposer-held lock instead of
+        // ever observing provider_gone.
+        while {
+            let (status, detail) = host.dispatch(b"evt-quiesce", dougong_abi::MODE_SERIAL, b"{}");
+            let gone = status != STATUS_OK && is_provider_gone(&detail);
+            if gone {
+                QUIESCE_DISPATCH_GONE.store(true, Ordering::SeqCst);
+            }
+            !gone
+        } {
+            std::thread::yield_now();
+        }
+    });
+    Box::into_raw(Box::new(QuiesceState {
+        worker: Some(worker),
+    }))
+    .cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn quiesce_teardown(handle: *mut std::ffi::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: the handle came from `quiesce_setup` and is torn down once.
+    let mut state = unsafe { Box::from_raw(handle.cast::<QuiesceState>()) };
+    // The join is the discipline point (v3 contract). On 0.5.1 the worker
+    // has already unwound at the flipped gate; on 0.5.0 this join never
+    // returns (the parked chain bridge holds the loop forever) — that hang
+    // is the R7 discrimination this pin exists to keep.
+    if let Some(worker) = state.worker.take() {
+        let _joined = worker.join();
+    }
+}
+
+unsafe extern "C" fn quiesce_on_event(
+    _handle: *mut std::ffi::c_void,
+    _event: u32,
+    _mode: u32,
+    _data: *const u8,
+    _len: usize,
+    _next: u32,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    // Widen the in-flight window: the disposer's lock request then queues
+    // while the worker holds the instance lock mid-listener (FIFO grants
+    // the disposer ahead of the next chain's bridge attempt).
+    std::thread::sleep(Duration::from_millis(300));
+    // SAFETY: host buffer contract; the reply must be valid JSON.
+    if unsafe { write_out(b"null", out, cap, out_len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn quiesce_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _in_data: *const u8,
+    _in_len: usize,
+    _out: *mut u8,
+    _cap: usize,
+    _out_len: *mut usize,
+) -> i32 {
+    STATUS_FAILED
+}
+
+static QUIESCE_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: quiesce_name,
+    descriptor: quiesce_descriptor,
+    setup: quiesce_setup,
+    call: quiesce_call,
+    on_event: quiesce_on_event,
+    on_next: consumer_on_next,
+    teardown: quiesce_teardown,
+};
+
+/// The dispose converges while a plugin-owned worker's dispatch chain keeps
+/// entering this activation's own bridge: the chain unwinds at the flipped
+/// gate (`provider_gone`) instead of parking on the disposer-held lock, and
+/// the teardown-time join completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_joins_a_requiring_worker_without_deadlock() {
+    QUIESCE_DISPATCH_GONE.store(false, Ordering::SeqCst);
+    let ctx = Context::new();
+    let consumer: Arc<dyn Plugin> = Arc::new(from_static(&QUIESCE_TABLE).expect("quiesce table"));
+    let handle = start(&ctx, consumer).await;
+    // Land the dispose while the worker is mid-slow-listener: the disposer's
+    // lock request then queues ahead of the next chain's bridge attempt.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(5), handle.dispose())
+        .await
+        .expect("teardown converges without the lock-order inversion");
+    assert!(
+        QUIESCE_DISPATCH_GONE.load(Ordering::SeqCst),
+        "the worker's dispatch must unwind at the gate with provider_gone"
+    );
     ctx.stop().await;
 }

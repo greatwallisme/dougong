@@ -209,7 +209,12 @@ pub struct HostExports {
   serializes *foreign entries* (setup/call/on_event/on_next/teardown) but
   does not cover plugin-owned threads: state shared with your own threads
   needs its own synchronization, and `teardown` must join every plugin-owned
-  thread before returning (contractual, not enforced).
+  thread before returning (contractual, not enforced). The join is deadlock-
+  free against your own workers mid-`require` (0.5.1 teardown quiescence):
+  the host flips the activation's liveness gate **before** taking the
+  per-instance lock, so an outbound entry that would park on that lock
+  unwinds with `STATUS_FAILED` (`provider_gone`) instead — still, exit your
+  loops on that verdict; never retry into a stale handle.
 - **Reentrancy**: the host keeps a per-thread stack of the instances whose
   foreign entries are executing. A `require` that would re-enter an instance
   already on the calling thread's stack fails with `STATUS_REENTRANCY`
@@ -317,7 +322,9 @@ cargo run -p dougong-dylib --example outbound_demo # ABI v3/v4/v5 outbound + gra
   `STATUS_FAILED` (`grant_target_unsupported`) instead of a silent no-op.
 - A `require` racing the provider's teardown fails closed with
   `STATUS_FAILED` (`provider_gone`, transport class) - the liveness gate
-  under the per-instance lock. Granted callers are not kernel dependency
+  flips before the disposer takes the per-instance lock (0.5.1 teardown
+  quiescence), and a late arrival fails at the pre-lock gate without
+  queueing. Granted callers are not kernel dependency
   edges, so no drain joins them; treat `provider_gone` like
   `inactive_dependency` (retry after the provider re-commits, or surface the
   failure) and never retry into a stale resolved handle.

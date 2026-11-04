@@ -176,3 +176,4 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   not kernel dependency edges, so the liveness gate under the per-instance
   lock is the only teardown ordering - never retry into a stale handle.
 - Teardown code that must run last goes first in `apply` (LIFO reversal).
+- Teardown-time worker joins are safe against plugin-owned threads mid-`require`: the host flips the activation's liveness gate before taking the instance lock, so queued outbound calls unwind with `STATUS_FAILED` (`provider_gone`) instead of parking on the disposer-held lock (0.5.1 teardown quiescence; `doc/maintenance/teardown_requirements.md` in the dougong repo). Keep the join discipline itself: every plugin-owned thread joined before `teardown` returns.
