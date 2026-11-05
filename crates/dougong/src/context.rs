@@ -352,6 +352,11 @@ impl Context {
 
     /// The effective isolation label for `name` at this scope.
     #[must_use]
+    /// This is the per-name/default mapping only: it ignores realm fallback
+    /// labels. Service resolution (`get`, dependency checks) follows the
+    /// full D15 candidate order via `ScopeNode::label_candidates`; this
+    /// helper answers "which label would a provide from this scope land
+    /// in", not "where would a read resolve".
     pub fn effective_label(&self, name: &str) -> u64 {
         ScopeNode::effective_label(Some(&self.scope), name)
     }
@@ -558,6 +563,12 @@ impl Context {
     /// scoped store (provider must be active). Accessor entries are computed
     /// against this context on every read.
     ///
+    /// The scoped-store step resolves labels in D15 precedence order —
+    /// explicit per-name isolation, then the innermost realm, then the
+    /// global default — exactly like a fiber's dependency resolution, so a
+    /// read of an undeclared name inside a realm sees the realm's provider
+    /// before the global one.
+    ///
     /// When the S5 provider quarantine is enabled, an
     /// [`Invoker`](crate::Invoker) read wraps
     /// the handle so a transport-class call failure disposes the provider
@@ -596,8 +607,10 @@ impl Context {
                 return None;
             }
         }
-        let label = self.effective_label(name);
-        let provided = self.root.reflect.get_impl(&self.root, name, label, true)?;
+        let provided = ScopeNode::label_candidates(Some(&self.scope), name)
+            .as_slice()
+            .iter()
+            .find_map(|label| self.root.reflect.get_impl(&self.root, name, *label, true))?;
         if let Some(compute) = &provided.compute {
             let computed = compute(self)?;
             return crate::policy::maybe_quarantine(

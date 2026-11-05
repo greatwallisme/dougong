@@ -12,9 +12,10 @@ providers come and go). A plugin never hand-writes teardown - it declares and
 registers, and the kernel derives reversal from registration.
 
 All plugin forms implement **one semantic contract**. Version anchors for the
-current code: ABI_VERSION 5 (`dougong-abi`: v2 CPS event protocol per D14,
-v3 outbound `HostExports` per D16, the v4 `grant` entry per D31, plus the v5
-`dispatch` entry per D32), WIT world
+current code: ABI_VERSION 6 (`dougong-abi`: v2 CPS event protocol per D14,
+v3 outbound `HostExports` per D16, the v4 `grant` entry per D31, the v5
+`dispatch` entry per D32, plus the v6 realm entries `realm_spawn` /
+`realm_retire` / `realm_require` per D33), WIT world
 `dougong:kernel@0.1.0` (`wit/dougong-plugin.wit`), contract hash
 `dougong-dynamic-channel-v1`, wasmtime 48 / wit-bindgen 0.61, toolchain pinned
 in `rust-toolchain.toml`.
@@ -30,6 +31,8 @@ in `rust-toolchain.toml`.
 Reference implementations to copy structure from (not names):
 `crates/greeter-plugin` (dylib), `crates/grant-partner` (dylib grant
 target - empty inject list, callbacks ride a runtime grant),
+`crates/realm-partner` (dylib realm spawner - ABI v6 `realm_spawn`/
+`realm_require`/`realm_retire` from plugin-owned threads),
 `crates/greeter-wasm` (wasm), `crates/dougong/src/lib.rs` doctest
 (in-process).
 
@@ -76,6 +79,10 @@ Five obligations, same shape in all three forms:
    `HostExports.dispatch` performs one synchronous five-mode dispatch from a
    plugin-owned thread - the await modes block until the chain settles and
    return the chain value; `emit` stays the canonical fire-and-forget face.
+   Since ABI v6 a dylib activation can also open realms and activate child
+   artifacts inside them (`realm_spawn`, with `realm_require` to call the
+   children's services and `realm_retire` to dispose one) - the per-session
+   capability-set pattern of D15 without a loader document.
 5. **Dispose** - the kernel reverses registrations LIFO on withdrawal; the
    provide-disposer removes the implementation, notifies dependents, and
    joins every touched consumer fiber, so consumers converge before the
@@ -92,7 +99,7 @@ Config arrives as `serde_json::Value` (in-process) or JSON bytes
 | Reference | Read when |
 |-----------|-----------|
 | [kernel-model.md](references/kernel-model.md) | Writing in-process Rust plugins; need the Context API, event modes, effect collection, error model, or loader config format. Explains the shared semantics all forms inherit. |
-| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: v5 export table + `HostExports` outbound vtable (including grants and dispatch), JSON descriptor (incl. `listen`), buffer protocol, CPS event protocol, reentrancy and thread discipline, state and teardown. |
+| [dylib-plugin.md](references/dylib-plugin.md) | Building a `cdylib` plugin: v6 export table + `HostExports` outbound vtable (including grants, dispatch, and realm activation), JSON descriptor (incl. `listen`), buffer protocol, CPS event protocol, reentrancy and thread discipline, state and teardown. |
 | [wasm-plugin.md](references/wasm-plugin.md) | Building a wasm component: crate layout, WIT bindings, Guest impl, JSON payload rules, sandbox expectations, host-side requirements. |
 
 ## 4. Verification
@@ -106,7 +113,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # End-to-end proof per form (each must exit 0):
 cargo run -p dougong-dylib  --example dylib_demo    # dylib artifact, needs cargo build --workspace first
-cargo run -p dougong-dylib  --example outbound_demo # ABI v3/v4/v5 outbound + grant + dispatch arms (greeter + grant-partner artifacts)
+cargo run -p dougong-dylib  --example outbound_demo # ABI v3-v6 outbound + grant + dispatch + realm arms (greeter + grant-partner + realm-partner artifacts)
 cargo run -p dougong-wasm   --example wasm_demo     # wasm artifact, needs the wasip2 build above
 cargo run -p dougong-loader --example loader_demo   # loader lifecycle over the dylib artifact
 ```
@@ -156,6 +163,17 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   amendment): a require chain whose wait cycle spans threads or instances
   fails the same way on the thread completing the cycle - break the cycle or
   route the leg through a plugin-owned thread / in-process relay.
+- Dylib `realm_spawn`/`realm_retire` (v6): must originate on a plugin-owned
+  thread (a foreign entry frame fails with `STATUS_REENTRANCY`); the spawn
+  reply buffer must be at least `REALM_SPAWN_REPLY_MIN` bytes; a child that
+  waits on a dependency settles as `state: "pending"`, not as an error; a
+  failed child is disposed and reported with its startup error. The spawner's
+  teardown disposes every child first (the children are effects of its fiber).
+- Dylib `realm_require` (v6): reaches only services provided by children this
+  activation spawned (`STATUS_UNDECLARED` for anything else, including a
+  same-named global provider reached by the realm-to-global fallback; no
+  `inject` declaration is needed). Realm labels and child handles are valid
+  only for the activation that received them.
 - Dylib `emit` payload must be **valid JSON bytes** and the event name must
   not use the `internal/*` prefix - violations fail with
   `STATUS_INVALID_PAYLOAD` / `STATUS_INVALID_EVENT`.

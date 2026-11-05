@@ -840,7 +840,9 @@ async fn call_framed(ctx: &Context, service: &str, method: u32, payload: &[u8]) 
 
 /// Calls a service whose replies are raw payloads (no test framing).
 async fn call_raw(ctx: &Context, service: &str, method: u32, payload: &[u8]) -> Vec<u8> {
-    let invoker = ctx.get::<Invoker>(service).expect("service committed");
+    let invoker = ctx
+        .get::<Invoker>(service)
+        .unwrap_or_else(|| panic!("service {service} not committed"));
     tokio::time::timeout(
         Duration::from_secs(5),
         invoker.call(method, payload.to_vec()),
@@ -929,6 +931,8 @@ fn bare_activation_with_provide(
         inject: inject.iter().map(|name| (*name).to_string()).collect(),
         provide: provide.iter().map(|name| (*name).to_string()).collect(),
         alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        parent: None,
+        realms: parking_lot::Mutex::new(super::realm::RealmState::default()),
     }))
     .cast_mut()
     .cast::<std::ffi::c_void>()
@@ -1033,6 +1037,9 @@ async fn require_enforces_capability_and_liveness() {
         emit: super::host_emit,
         grant: super::host_grant,
         dispatch: super::host_dispatch,
+        realm_spawn: super::realm::host_realm_spawn,
+        realm_retire: super::realm::host_realm_retire,
+        realm_require: super::realm::host_realm_require,
     });
     let outcome = std::thread::spawn(move || shared.require(b"svc-host", 0, b"t"))
         .join()

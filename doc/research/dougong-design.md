@@ -588,7 +588,21 @@ cordis 的 `ctx.waterfall` 对全部插件可用，dougong 中对应物 `Context
 - `ABI_VERSION` 4→5（「HostExports 变更即 bump」铁律）；最小 diff（vtable
   +1 字段）；wasm 出站维持 v3 §5.1 排除。
 
-## 附录 A：语义等价表（in-process vs dylib-v5，D16/D31/D32）
+### D33 dylib 出站 realm 激活 = ABI v6 `realm_spawn`/`realm_retire`/`realm_require`（含 D15 完整化）
+
+2026-11-05，用户（维护者）裁决（需求文档 `doc/maintenance/realm_requirements.md`，§1.4 四分叉点全按推荐项、§9 一次修订）：
+
+- **缘起**：fly-rafter 的"每会话循环 fiber 置于会话 realm"（其 PRD 8.1，曾因 dougong 无每会话 realm 机制被勘误，19.2-24）与子 agent 的"子 realm"要求。内核进程内早有 `isolate_realm(l).plugin(..)` 与 Eq.31 级联，缺口仅在 dylib 出站面。
+- **①A 注记式**：排除项 9（事件作用域过滤出站）字面不动；本裁决不过滤事件、不改事件道广播语义；动态 realm 激活是内核能力面补充，会话/子代理的路由与事件分路仍归应用层。
+- **②S3 按路径**：`realm_spawn` 携带 dylib 路径，宿主 `load` 后在 `activation.ctx.isolate_realm(label)` 下 `Context::plugin` 启动；同一 .so 进程内仅映射一次（R1）。子激活不接收 config（dylib 无 config 通道），差异化经 spawn 后的 `realm_require` 调用承载。
+- **③R1 `realm_require`**：专用出站入口，无需 `inject` 声明；解析走内核 realm 优先规则，授权 = 解析到的提供者激活 id 属于本激活所 spawn 的子激活（进程级 spawn-link 表：子激活 id -> 父激活 id，先于子 `setup` 登记、reclaim 时摘除；复用 D31"绑定解析到的提供者激活 id"判定）。`realm_require` 与 `require` 共用 `settle_require`，故 S5 提供者隔离、O7 边界追踪与指标照常生效。
+- **④A 与 dispatch 同姿态**：`realm_spawn`/`realm_retire` 必须自插件自有线程发起，外来入口帧内调用 = `STATUS_REENTRANCY`；spawn 阻塞至子激活稳定（active 或 pending 返回，failed = 子激活自动卸载 + `STATUS_FAILED` 详情）；回复缓冲低于 `REALM_SPAWN_REPLY_MIN`（96）在任何副作用之前回 `STATUS_CAPACITY`，保证重试不会二次 spawn。
+- **生命周期**：子 fiber 是 spawner fiber 的 effect（Eq.31），spawner 的 teardown/重载先级联卸载全部子激活，再跑其 `teardown` 导出；`realm_retire` 为单子提前卸载；realm 标签与子句柄仅本激活有效。
+- **§9 修订（D15 完整化）**：实现首测暴露 `Context::get` 动态分支（未声明名）用 `effective_label` 只读全局 label、忽略 realm（D15 仅落实了 provide 落点与 fiber 依赖解析）。宿主侧注册表方案（B1）被否——内核在解析时给 Invoker 加 S5/O7 策略装饰（`maybe_quarantine`），直持原始 Invoker 会绕过。**采纳 X**：`get` 动态分支镜像 `resolve_impl_for` 的 `label_candidates` 循环（按名隔离 → 最内层 realm → 全局，首个 strict 命中）。行为变更：realm 内未声明名的 `get` 由"全局"改为"realm 优先、回退全局"；顺带修正 D31 grant 目标解析对未 inject 目标名的 realm 偏差。
+- **范围外**（需求文档 §4）：wasm 出站 realm、事件作用域过滤、运行时监听注册、`realm_require` 触达非本激活子激活的服务、子激活迁移、spawn 内建超时、嵌套 spawn（外来入口内再 spawn）、realm 级 config 热更、loader 动态 realm 槽位。
+- **验证锚**：`dougong-dylib::realm_tests`（E1 全矩阵：往返/realm 隔离/可见性/授权/未知 realm 与子句柄/加入既有 realm/加载与 ABI 版本失败无残留/setup 期 spawn 级联顺序/retire 单子/姿态拒绝/spawn 竞态 teardown/Pending 转 active/Failed 自动卸载/teardown 竞态/并发/容量前置拒绝/遮蔽失败关闭）、内核 `get_of_undeclared_names_follows_realm_precedence`（变异检验）、`outbound_demo` realm 臂（真实 `realm-partner` + `greeter-plugin` 工件）。
+
+## 附录 A：语义等价表（in-process vs dylib-v6，D16/D31/D32/D33）
 
 | 面 | in-process | dylib v4 | 锚 |
 |---|---|---|---|
@@ -605,3 +619,6 @@ cordis 的 `ctx.waterfall` 对全部插件可用，dougong 中对应物 `Context
 | require 执行器 | fiber 任务上 await | 调用线程本地 `block_on`（`rt.enter` 供 tokio 上下文） | D-V3-4 |
 | 错误形态 | `Error { code, message }`（undeclared_dependency / inactive_dependency） | 状态码 + `{"code","message"}` JSON 详情（同名 code 对齐） | D-V3-5 |
 | 解析作用域 | fiber 激活 realm（D15 候选链） | 激活 realm（vtable 闭包捕获同一 ctx，同源） | B3 / A3 |
+| realm 内激活 | `ctx.isolate_realm(l).plugin(Arc<dyn Plugin>, config)` | `realm_spawn(realm, path)`：来源 = dylib 路径（`load`），无 config；子 fiber 为 spawner fiber 的 effect；同步至稳定（active/pending，failed 自动卸载） | D33；姿态同 dispatch（自有线程） |
+| 子服务调用 | 域内 `ctx.get`/注入解析（realm 优先） | `realm_require(realm, service, ...)`：授权 = 解析到的提供者是本激活所 spawn 的子激活；同名全局提供者经回退命中 = `UNDECLARED`；realm 无该服务 = `INACTIVE` | D33 C3 |
+| 动态 `get` 的 realm 语义 | 0.6.0 起：按名隔离 → 最内层 realm → 全局（此前仅全局 label） | 同（vtable 闭包内 `ctx.get` 即此语义，grant 目标解析受益） | D33 §9 |

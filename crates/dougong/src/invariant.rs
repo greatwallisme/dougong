@@ -217,12 +217,18 @@ fn post_load_deep(fiber: &Fiber, target: &str, committed: &HashMap<String, Provi
     // Skipped under a racing re-arm (dirty) or a racing dispose (uid gone).
     let (desired, dirty) = fiber.driver_snapshot();
     if !dirty && desired == target && fiber.uid_value().is_some() {
+        // Derive from the live flags, not the atomic mirror: a concurrent
+        // re-arm can leave a stale Loading byte in the mirror after the
+        // driver consumed the flag, and the landing `cache_state` has not
+        // republished yet — the mirror catches up, the quiescence verdict
+        // must not wait for it (a debug-assert panic here wedges the driver
+        // on a tokio worker).
         invariant!(
             fiber,
             "post_load",
-            fiber.state() == crate::fiber::FiberState::Active,
+            fiber.compute_state() == crate::fiber::FiberState::Active,
             "quiesced on {target:?} but state is {}",
-            fiber.state().as_str()
+            fiber.compute_state().as_str()
         );
     }
 }

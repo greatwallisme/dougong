@@ -44,9 +44,9 @@ pub static DOUGONG_PLUGIN_EXPORTS: PluginExports = PluginExports {
 };
 ```
 
-`ABI_VERSION` is 5 (v2 = CPS event protocol, D14; v3 = outbound
+`ABI_VERSION` is 6 (v2 = CPS event protocol, D14; v3 = outbound
 `HostExports` vtable, D16; v4 = activation-scoped grants, D31; v5 = outbound
-synchronous `dispatch`, D32). Any change to
+synchronous `dispatch`, D32; v6 = outbound realm activation, D33). Any change to
 `PluginExports`, `HostExports`, or the constants breaks the ABI: bump it and
 update every duplicate table in the same commit.
 
@@ -142,7 +142,7 @@ MODE_WATERFALL(4)` - chosen at dispatch by the host, never at registration.
   host guarantees no other foreign call interleaves between your deferred
   `on_event` and its `on_next`.
 
-## Outbound calls, grants, and dispatch (ABI v3/v4/v5, D16/D31/D32)
+## Outbound calls, grants, dispatch, and realms (ABI v3-v6, D16/D31/D32/D33)
 
 `setup` receives a `HostExports` vtable, valid only for that call - copy it
 by value. The copy stays callable until **this activation's** `teardown`
@@ -166,6 +166,13 @@ pub struct HostExports {
     pub dispatch: unsafe extern "C" fn(
         host, event, event_len, mode, payload, payload_len, out_buf, cap, out_len,
     ) -> i32,                     // one synchronous outbound dispatch (five modes)
+    pub realm_spawn: unsafe extern "C" fn(
+        host, realm, path, path_len, out_buf, cap, out_len,
+    ) -> i32,                     // activate a child artifact in a realm this activation owns
+    pub realm_retire: unsafe extern "C" fn(host, child) -> i32,   // dispose one spawned child
+    pub realm_require: unsafe extern "C" fn(
+        host, realm, service, service_len, method, in_data, in_len, out_buf, cap, out_len,
+    ) -> i32,                     // require addressed to a realm, children only
 }
 ```
 
@@ -204,7 +211,7 @@ pub struct HostExports {
   granted name passes only when its own realm resolves it to the granter's
   activation - a same-name provider in another realm never receives the
   callback (2026-10-28 review amendment).
-- **All three callable entries may be called from any plugin thread,
+- **All callable entries may be called from any plugin thread,
   concurrently** - the host implementations are panic-contained. The host's per-instance lock
   serializes *foreign entries* (setup/call/on_event/on_next/teardown) but
   does not cover plugin-owned threads: state shared with your own threads
@@ -263,6 +270,63 @@ publishes one synchronous dispatch in `mode` (the same `MODE_*` constants the
 - `internal/*` names and non-JSON payloads fail like the `emit` entry;
   an out-of-vocabulary mode fails with `invalid_dispatch_mode`.
 
+## Outbound realm activation (ABI v6, D33)
+
+An activation can place child plugin artifacts in realms it owns, call the
+services they provide, and retire them - the dylib counterpart of
+`ctx.isolate_realm(label).plugin(..)` (the per-session capability-set
+pattern of D15). Reference shape: `crates/realm-partner` and the
+`outbound_demo` realm arm.
+
+- **`realm_spawn(host, realm, path, path_len, out_buf, cap, out_len)`** loads
+  the dylib at `path` (UTF-8) and activates it in `realm`, blocking until the
+  child settles. `realm == 0` allocates a fresh realm; any other value must be
+  a realm label an earlier `realm_spawn` of **this** activation returned
+  (`unknown_realm` otherwise). `out_buf` must hold at least
+  `REALM_SPAWN_REPLY_MIN` (96) bytes - a smaller buffer is answered with
+  `STATUS_CAPACITY` before anything happens, so a retry never spawns twice.
+  `STATUS_OK` carries `{"realm":L,"child":C,"state":"active"|"pending"}`
+  (`pending` = the child waits on a dependency that is not committed yet; it
+  activates later like any pending fiber). Failures are `STATUS_FAILED` with
+  the `{"code","class","message"}` detail and leave no residue:
+  `realm_spawn_load_failed` (missing library, wrong `abi_version`, bad
+  descriptor) or the child's own startup error (the failed child is disposed).
+- **`realm_retire(host, child)`** disposes one child (handles are per
+  activation, start at 1, and are never reused) and returns once its teardown
+  settled. Status-only: `STATUS_OK`, `STATUS_FAILED` (unknown or already
+  retired), `STATUS_REENTRANCY`.
+- **`realm_require(host, realm, service, method, ...)`** is `require` addressed
+  to a realm: no `inject` declaration is needed or consulted, the service is
+  resolved with the realm-first-then-global rule (D15), and the call passes
+  only when the resolved provider is a **child this activation spawned** -
+  anything else (a global provider reached by fallback, another activation's
+  realm) is `STATUS_UNDECLARED`, a realm without the service is
+  `STATUS_INACTIVE`. Everything else (statuses, detail documents, growable
+  buffer, reentrancy detection, `provider_gone`) is `require`'s.
+- **Thread posture**: `realm_spawn` and `realm_retire` must originate on a
+  plugin-owned thread; a foreign entry frame on the calling thread fails with
+  `STATUS_REENTRANCY` (the child may `require` your services during its
+  setup, and your instance lock would turn that into an undetectable wait).
+  Spawn from a worker thread — and never join that thread from inside the
+  service call that started it while your own instance lock is held (the
+  call entry holds it): if a child can require your services back, initiate
+  spawns from threads started in `setup`, which hold no lock. `realm-partner`
+  documents the constraint on its helper.
+- **Shadowing (fail-closed)**: `realm_require` resolves through your
+  activation's context; a service name your own descriptor `inject`s reads
+  your fiber's committed view first. If that view resolves a provider that is
+  not your child, the call is refused with `STATUS_UNDECLARED` — spawners
+  must not inject the names their children provide.
+- **Lifecycle**: every child's fiber is an effect of the spawning activation's
+  fiber, so the spawner's teardown (or reload) disposes all children *before*
+  the spawner's own `teardown` export runs - no explicit retire is needed at
+  shutdown. Realm labels and child handles die with the activation.
+- Children are activations of ordinary artifacts: their own `inject`/`provide`
+  descriptor applies, their `require`/`emit`/`dispatch` resolve in their realm,
+  and they receive no config (the loader's `config` does not reach dylib
+  activations) - differentiate children through `realm_require` calls after
+  `realm_spawn` returns.
+
 ## Loading
 
 Via the loader document (`dougong-loader`) or directly:
@@ -287,7 +351,7 @@ cargo build -p my-plugin                          # produces the .so
 nm -D target/debug/libmy_plugin.so | rg DOUGONG_PLUGIN_EXPORTS
 cargo clippy -p my-plugin --all-targets -- -D warnings
 cargo run -p dougong-loader --example loader_demo # end-to-end (uses the greeter artifact)
-cargo run -p dougong-dylib --example outbound_demo # ABI v3/v4/v5 outbound + grant + dispatch arms
+cargo run -p dougong-dylib --example outbound_demo # ABI v3-v6 outbound + grant + dispatch + realm arms
 ```
 
 ## Pitfalls
@@ -328,6 +392,15 @@ cargo run -p dougong-dylib --example outbound_demo # ABI v3/v4/v5 outbound + gra
   edges, so no drain joins them; treat `provider_gone` like
   `inactive_dependency` (retry after the provider re-commits, or surface the
   failure) and never retry into a stale resolved handle.
+- `realm_spawn`/`realm_retire` from a foreign entry (`call`, `on_event`,
+  `setup`, ...) fail with `STATUS_REENTRANCY`: hand the work to a plugin-owned
+  thread. A `realm_spawn` reply buffer below `REALM_SPAWN_REPLY_MIN` bytes
+  gets `STATUS_CAPACITY` with nothing spawned.
+- `realm_require` reaches only the children *you* spawned: a retired child's
+  realm usually still resolves a same-named global provider by fallback, and
+  that call is `STATUS_UNDECLARED` (not `INACTIVE`) because the provider is
+  not your child. Realm labels and child handles are meaningful only to the
+  activation that received them.
 - Keep only `dougong-abi` as a dependency; pulling in the kernel or tokio
   across artifacts duplicates runtime state and breaks the portability
   contract (`#[repr(C)]` only, no `TypeId`/statics crossing).

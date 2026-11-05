@@ -186,6 +186,11 @@ pub struct Fiber {
     committed_uid: Mutex<Option<u64>>,
     loaded: Mutex<String>,
     disposables: Mutex<Vec<Disposable>>,
+    /// The parent's cascade effect guard for this fiber (Eq. 31), when this
+    /// fiber was started by `Context::plugin`. Held so an early dispose can
+    /// retire the parent's cascade slot instead of leaking it until the
+    /// parent's own unload.
+    pub(crate) cascade: Mutex<Option<EffectGuard>>,
     next_effect_id: AtomicU64,
     /// Events emitted this activation window (P7 budget); reset at every
     /// body start in `load_once`. Touched only when a budget is configured.
@@ -243,6 +248,7 @@ impl Fiber {
             committed_uid: Mutex::new(None),
             loaded: Mutex::new(EPOCH_INACTIVE.to_string()),
             disposables: Mutex::new(Vec::new()),
+            cascade: Mutex::new(None),
             next_effect_id: AtomicU64::new(1),
             emitted_events: AtomicU64::new(0),
             emit_breach_logged: AtomicBool::new(false),
@@ -286,6 +292,7 @@ impl Fiber {
             committed_uid: Mutex::new(None),
             loaded: Mutex::new(EPOCH_INACTIVE.to_string()),
             disposables: Mutex::new(Vec::new()),
+            cascade: Mutex::new(None),
             next_effect_id: AtomicU64::new(1),
             emitted_events: AtomicU64::new(0),
             emit_breach_logged: AtomicBool::new(false),
@@ -457,7 +464,11 @@ impl Fiber {
     }
 
     /// Derives the converged state from live flags (TS `_getState`).
-    fn compute_state(&self) -> FiberState {
+    ///
+    /// This is the source of truth behind the atomic mirror; readers that
+    /// must not observe a stale mirror byte (e.g. `invariant::post_load`)
+    /// call it directly.
+    pub(crate) fn compute_state(&self) -> FiberState {
         if self.uid_value().is_none() {
             return FiberState::Disposed;
         }
@@ -1576,6 +1587,17 @@ impl Fiber {
         self.current_scope().cancel();
         self.request_epoch(EPOCH_INACTIVE.to_string());
         let _ = self.join().await;
+        // The fiber is fully unloaded: retire the parent's cascade slot now
+        // (the slot's disposer re-disposes this fiber, which converges
+        // immediately through the single-winner path). Without this, every
+        // early child disposal would leak its slot in the parent's
+        // disposables until the parent's own unload.
+        let cascade_guard = self.cascade.lock().take();
+        if let Some(guard) = cascade_guard {
+            // The guarded work (this fiber's disposal) is already complete:
+            // remove the parent's cascade slot without re-running it.
+            guard.release();
+        }
         self.publish_transition(from);
         invariant::post_dispose(self, old_uid);
     }
@@ -1700,6 +1722,27 @@ impl EffectGuard {
         };
         fiber.run_disposer(self.id).await;
         Ok(())
+    }
+
+    /// Removes the effect from its fiber without running its disposer. Used
+    /// when the guarded work completed by another path (the cascade slot
+    /// after the child fiber disposed itself): dropping the disposer is
+    /// equivalent to running it — the cascade disposer only re-disposes a
+    /// fiber that is already disposed.
+    pub(crate) fn release(self) {
+        let Some(fiber) = self.fiber.upgrade() else {
+            return;
+        };
+        let removed = fiber
+            .disposables
+            .lock()
+            .iter_mut()
+            .find_map(|slot| match slot {
+                Some((entry_id, _, _, _)) if *entry_id == self.id => slot.take(),
+                _ => None,
+            });
+        drop(removed);
+        fiber.bump_settle();
     }
 
     /// True while the effect is still registered.

@@ -391,6 +391,135 @@ async fn realm_scope_namespaces_services_with_global_fallback() -> dougong::Resu
     Ok(())
 }
 
+/// D15 completion: a dynamic `Context::get` of an undeclared name follows the
+/// same label precedence as a fiber's dependency resolution — the innermost
+/// realm first, then the global default — instead of reading the global label
+/// only. A sibling realm never sees another realm's provider.
+#[tokio::test]
+async fn get_of_undeclared_names_follows_realm_precedence() -> dougong::Result<()> {
+    let ctx = Context::new();
+    let global = plugin("global-svc", vec![], |ctx, _| {
+        Box::pin(async move {
+            ctx.provide("svc", "global".to_string()).await?;
+            ctx.provide("only-global", "only-global".to_string())
+                .await?;
+            Ok(())
+        })
+    });
+    ctx.plugin(global, None)?.join().await?;
+
+    let realm = ctx.isolate_realm(7);
+    let realm_provider = plugin("realm-svc", vec![], |ctx, _| {
+        Box::pin(async move {
+            ctx.provide("svc", "in-realm".to_string()).await?;
+            Ok(())
+        })
+    });
+    realm.plugin(realm_provider, None)?.join().await?;
+
+    // Outside any fiber: the realm context prefers its own provider and falls
+    // back to the global default; the root and a sibling realm see global.
+    assert_eq!(&*realm.get::<String>("svc").expect("realm svc"), "in-realm");
+    assert_eq!(
+        &*realm.get::<String>("only-global").expect("fallback"),
+        "only-global"
+    );
+    assert_eq!(&*ctx.get::<String>("svc").expect("root svc"), "global");
+    let sibling = ctx.isolate_realm(8);
+    assert_eq!(&*sibling.get::<String>("svc").expect("sibling"), "global");
+
+    // Explicit per-name isolation is strict and beats the realm: a read on a
+    // context that maps `svc` to label 5 resolves label 5 only, even inside
+    // the realm chain.
+    let label5 = ctx.isolate_with_label("svc", 5);
+    let label5_provider = plugin("label5-svc", vec![], |ctx, _| {
+        Box::pin(async move {
+            ctx.provide("svc", "in-label5".to_string()).await?;
+            Ok(())
+        })
+    });
+    label5.plugin(label5_provider, None)?.join().await?;
+    let strict = realm.isolate_with_label("svc", 5);
+    assert_eq!(
+        &*strict.get::<String>("svc").expect("strict label"),
+        "in-label5"
+    );
+
+    // Inside a fiber that declares nothing, the same precedence applies.
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let probe_seen = Arc::clone(&seen);
+    let probe = plugin("undeclared-probe", vec![], move |ctx, _| {
+        let probe_seen = Arc::clone(&probe_seen);
+        Box::pin(async move {
+            let mut seen = probe_seen.lock();
+            seen.push(ctx.get::<String>("svc").map(|value| (*value).clone()));
+            seen.push(
+                ctx.get::<String>("only-global")
+                    .map(|value| (*value).clone()),
+            );
+            drop(seen);
+            Ok(())
+        })
+    });
+    realm.plugin(probe, None)?.join().await?;
+    assert_eq!(
+        *seen.lock(),
+        vec![
+            Some("in-realm".to_string()),
+            Some("only-global".to_string())
+        ]
+    );
+    Ok(())
+}
+
+/// Cascade accounting (Eq. 31): a child fiber's cascade effect lives in the
+/// parent's disposables only while the child is alive; an early child
+/// dispose retires the slot, so spawn/dispose cycles do not accumulate
+/// effects (or trip `max_effects` budgets) on the parent.
+#[tokio::test]
+async fn child_dispose_retires_the_cascade_slot() -> dougong::Result<()> {
+    let ctx = Context::new();
+    // A parent plugin that captures its own context so children can be
+    // spawned from it (the cascade effect registers on the spawning fiber).
+    let holder: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(None));
+    let h2 = Arc::clone(&holder);
+    let parent = plugin("cascade-parent", vec![], move |ctx, _| {
+        let h2 = Arc::clone(&h2);
+        Box::pin(async move {
+            *h2.lock().expect("holder") = Some(ctx);
+            Ok(())
+        })
+    });
+    let parent_handle = ctx.plugin(parent, None)?;
+    parent_handle.join().await?;
+    let parent_ctx = holder
+        .lock()
+        .expect("holder")
+        .clone()
+        .expect("parent stored its ctx");
+    assert_eq!(parent_handle.effect_count(), 0);
+
+    for _ in 0..3 {
+        let child: Arc<dyn dougong::Plugin> = plugin("cascade-child", vec![], |_ctx, _| {
+            Box::pin(async { Ok(()) })
+        });
+        let child_handle = parent_ctx.plugin(Arc::clone(&child), None)?;
+        child_handle.join().await?;
+        assert_eq!(
+            parent_handle.effect_count(),
+            1,
+            "one live cascade slot while the child is alive"
+        );
+        child_handle.dispose().await;
+        assert_eq!(
+            parent_handle.effect_count(),
+            0,
+            "the early dispose retired the cascade slot"
+        );
+    }
+    Ok(())
+}
+
 /// Regression for the pre-P1 notify lock topology (findings §17, L1):
 /// `notify` held the global fiber-table lock across `check_impl`, whose
 /// strict resolution of a *checked* service re-locks the fiber table for the

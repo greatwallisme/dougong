@@ -498,13 +498,33 @@ async fn start(ctx: &Context, plugin: Arc<dyn Plugin>) {
         .expect("activation ok");
 }
 
+/// Starts the bridged listener and the driver it injects, then waits until
+/// the listener has converged. The listener declares `inject: [svc-dispatcher]`,
+/// so its first `join` returns while it is still `Pending` (nothing is busy
+/// until the driver provides the service); only a second `join` after the
+/// driver is up observes the activation that registers the event bridges.
+/// Dispatching before that point races the registration.
+async fn start_pair(ctx: &Context) {
+    arm_deadlock_watchdog();
+    let listener: Arc<dyn Plugin> = Arc::new(from_static(&LISTENER_TABLE).expect("listener table"));
+    let listener = ctx.plugin(listener, None).expect("spawn listener");
+    let driver: Arc<dyn Plugin> = Arc::new(from_static(&DRIVER_TABLE).expect("driver table"));
+    start(ctx, driver).await;
+    tokio::time::timeout(Duration::from_secs(5), listener.join())
+        .await
+        .expect("listener settles")
+        .expect("listener ok");
+    assert_eq!(
+        listener.state(),
+        dougong::FiberState::Active,
+        "the listener converged once its dependency arrived"
+    );
+}
+
 /// Boots listener then driver and returns the context.
 async fn boot() -> Context {
     let ctx = Context::new();
-    let listener: Arc<dyn Plugin> = Arc::new(from_static(&LISTENER_TABLE).expect("listener table"));
-    start(&ctx, listener).await;
-    let driver: Arc<dyn Plugin> = Arc::new(from_static(&DRIVER_TABLE).expect("driver table"));
-    start(&ctx, driver).await;
+    start_pair(&ctx).await;
     ctx
 }
 
@@ -514,10 +534,7 @@ async fn boot() -> Context {
 async fn boot_with_in_process_listener(name: &str, result: Value) -> Context {
     let ctx = Context::new();
     in_process_listener(&ctx, name, result).await;
-    let listener: Arc<dyn Plugin> = Arc::new(from_static(&LISTENER_TABLE).expect("listener table"));
-    start(&ctx, listener).await;
-    let driver: Arc<dyn Plugin> = Arc::new(from_static(&DRIVER_TABLE).expect("driver table"));
-    start(&ctx, driver).await;
+    start_pair(&ctx).await;
     ctx
 }
 
@@ -644,10 +661,7 @@ async fn mixed_chain_runs_in_registration_order() {
     ctx.on("evt-order", listener)
         .await
         .expect("listener registers");
-    let dylib: Arc<dyn Plugin> = Arc::new(from_static(&LISTENER_TABLE).expect("listener table"));
-    start(&ctx, dylib).await;
-    let driver: Arc<dyn Plugin> = Arc::new(from_static(&DRIVER_TABLE).expect("driver table"));
-    start(&ctx, driver).await;
+    start_pair(&ctx).await;
     let (status, reply) = dispatch_join(&ctx, "evt-order", MODE_WATERFALL, json!({})).await;
     assert_eq!(status, STATUS_OK);
     let value: Value = serde_json::from_slice(&reply).expect("reply parses");
@@ -724,10 +738,11 @@ async fn chain_listener_reaches_dispatcher_service_without_deadlock() {
     assert_eq!(value, json!({ "ping": "dispatcher-ping" }));
 }
 
-/// E1.10: a v4 export table is rejected by the v5 host with both versions
+/// E1.10: export tables of earlier ABI revisions (v4 and the immediately
+/// preceding revision) are rejected by the current host with both versions
 /// named (D1 version gate).
 #[test]
-fn v4_export_table_is_rejected_by_v5_host() {
+fn earlier_export_tables_are_rejected_by_the_current_host() {
     static V4_TABLE: PluginExports = PluginExports {
         abi_version: 4,
         name: driver_name,
@@ -738,11 +753,29 @@ fn v4_export_table_is_rejected_by_v5_host() {
         on_next: driver_on_next,
         teardown: driver_teardown,
     };
-    let message = from_static(&V4_TABLE)
-        .expect_err("v4 table rejected")
-        .to_string();
-    assert!(message.contains("plugin exports 4"), "{message}");
-    assert!(message.contains("host expects 5"), "{message}");
+    static PREVIOUS_TABLE: PluginExports = PluginExports {
+        abi_version: ABI_VERSION - 1,
+        name: driver_name,
+        descriptor: driver_descriptor,
+        setup: driver_setup,
+        call: driver_call,
+        on_event: driver_on_event,
+        on_next: driver_on_next,
+        teardown: driver_teardown,
+    };
+    for (table, seen) in [(&V4_TABLE, 4), (&PREVIOUS_TABLE, ABI_VERSION - 1)] {
+        let message = from_static(table)
+            .expect_err("earlier table rejected")
+            .to_string();
+        assert!(
+            message.contains(&format!("plugin exports {seen}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("host expects {ABI_VERSION}")),
+            "{message}"
+        );
+    }
 }
 
 /// E1.12: concurrent background dispatches from many plugin threads all

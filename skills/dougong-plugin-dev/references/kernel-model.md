@@ -171,6 +171,19 @@ service name can exist once per realm with different implementations
 default, and a global provider (registered outside any realm) stays visible
 to every realm through the fallback.
 
+`ctx.get`/`ctx.require` follow the same precedence for every name (0.6.0, D33
+completes D15): declared names read the fiber's committed view, which was
+resolved realm-first; **undeclared** names are resolved at read time through
+the same candidate order (explicit per-name isolation, then the innermost
+realm, then the global default). Before 0.6.0 an undeclared `get` inside a
+realm saw only the global label, so a realm-local provider of that name was
+invisible to it.
+
+A dylib activation does not need a loader document to create realms: ABI v6
+`realm_spawn` is `ctx.isolate_realm(fresh_label).plugin(..)` across the C
+boundary, with the children as effects of the spawning activation's fiber
+(see `dylib-plugin.md`).
+
 ## Logging
 
 `ctx.logger() -> Arc<dyn Logger>` resolves the `logger` service with a

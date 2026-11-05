@@ -51,6 +51,15 @@
 //!   otherwise); event names must be UTF-8 and must not use the `internal/*`
 //!   prefix ([`STATUS_INVALID_EVENT`]). Emission is enqueue-and-return: no
 //!   ordering or delivery result is reported to the caller.
+//! - `realm_spawn` / `realm_retire` / `realm_require` (ABI v6, D33) let an
+//!   activation place child plugin activations in a realm it owns and call the
+//!   services those children provide. The children's fibers are effects of the
+//!   spawning activation: its teardown cascades to them. All three are
+//!   capability-narrow: a realm label or child handle is valid only for the
+//!   activation that received it, and `realm_require` reaches only services
+//!   provided by that activation's own children. `realm_spawn` and
+//!   `realm_retire` must originate on a plugin-owned thread (a foreign entry
+//!   frame on the calling thread fails with [`STATUS_REENTRANCY`]).
 //! - Thread discipline: the plugin must terminate and join its own threads
 //!   before this activation's `teardown` returns (the per-instance lock does
 //!   not cover plugin-owned threads). This is contractual, not enforced.
@@ -246,7 +255,21 @@ pub const STATUS_INVALID_EVENT: i32 = -8;
 /// mirroring the `emit` entry). Waterfall composes around a fixed identity
 /// continuation: an untouched chain returns the original payload bytes
 /// (design decision D32; `dispatch_requirements.md` §2).
-pub const ABI_VERSION: u32 = 5;
+///
+/// v6 (2026-11-05): outbound realm activation — [`HostExports`] gains
+/// `realm_spawn`, `realm_retire`, and `realm_require`: an activation opens a
+/// realm, activates child plugin artifacts inside it (children are effects of
+/// the spawning activation's fiber), retires them individually, and calls the
+/// services they provide (design decision D33; `realm_requirements.md` §2).
+pub const ABI_VERSION: u32 = 6;
+
+/// Minimum `out_buf` capacity `realm_spawn` accepts.
+///
+/// The success reply (`{"realm":L,"child":C,"state":"active"|"pending"}`)
+/// always fits within it, and a smaller buffer is rejected with
+/// [`STATUS_CAPACITY`] *before* any side effect, so a retry with a larger
+/// buffer never spawns twice.
+pub const REALM_SPAWN_REPLY_MIN: usize = 96;
 
 /// Event dispatch mode: run listeners without waiting for returned values.
 pub const MODE_EMIT: u32 = 0;
@@ -290,7 +313,7 @@ pub unsafe fn write_out(src: &[u8], out_buf: *mut u8, cap: usize, out_len: *mut 
     true
 }
 
-/// Host-provided outbound vtable handed to `setup` (ABI v4).
+/// Host-provided outbound vtable handed to `setup` (ABI v6).
 ///
 /// The pointer passed to `setup` is valid for the duration of that call
 /// only; the plugin copies this struct by value. `host_handle` is an opaque
@@ -321,8 +344,24 @@ pub unsafe fn write_out(src: &[u8], out_buf: *mut u8, cap: usize, out_len: *mut 
 ///   idempotent repeated grant, [`STATUS_INACTIVE`] when the target has no
 ///   committed provider, or [`STATUS_FAILED`] for an invalid name or a
 ///   service the granter does not own. No output buffer is written.
+/// - `dispatch` runs one synchronous event dispatch in any of the five modes
+///   (ABI v5); see the field documentation.
+/// - `realm_spawn` activates a child plugin artifact in a realm owned by this
+///   activation (ABI v6). Realm `0` allocates a fresh realm; a non-zero
+///   realm must be one an earlier spawn returned. The call blocks until the
+///   child settles: success replies with a JSON document carrying the realm
+///   label, a child handle, and the settled state (`"active"`, or `"pending"`
+///   when the child waits on a dependency that is not yet committed). A
+///   child that fails to start is disposed and reported as
+///   [`STATUS_FAILED`] with the usual JSON detail.
+/// - `realm_retire` disposes one child this activation spawned and returns
+///   once the child's teardown has settled; it writes no output buffer.
+/// - `realm_require` is `require` addressed to a realm: it resolves the
+///   service in the named realm and authorizes the call only when the
+///   provider is a child this activation spawned (no `inject` declaration is
+///   needed or consulted).
 ///
-/// All three callable entries are implemented by the host with full panic
+/// All callable entries are implemented by the host with full panic
 /// containment and are safe to call concurrently from arbitrary plugin
 /// threads. `grant` only registers capability: it neither invokes a plugin
 /// nor participates in reentrancy detection.
@@ -388,6 +427,59 @@ pub struct HostExports {
         mode: u32,
         payload: *const u8,
         payload_len: usize,
+        out_buf: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32,
+    /// Activates the dylib artifact at `path` (UTF-8) as a child of this
+    /// activation inside `realm`, blocking until the child settles.
+    ///
+    /// `realm == 0` allocates a fresh realm; any other value must be a realm
+    /// label an earlier `realm_spawn` of this activation returned
+    /// (`unknown_realm` otherwise). `out_buf` must hold at least
+    /// [`REALM_SPAWN_REPLY_MIN`] bytes; a smaller buffer is answered with
+    /// [`STATUS_CAPACITY`] before anything happens. On [`STATUS_OK`] the
+    /// buffer carries `{"realm":L,"child":C,"state":"active"|"pending"}`.
+    /// Failures are [`STATUS_FAILED`] with a JSON `{"code","class","message"}`
+    /// detail (`realm_spawn_load_failed` for an unloadable artifact, the
+    /// child's own startup error otherwise) and leave no residue.
+    ///
+    /// The call must originate on a plugin-owned thread: a foreign entry
+    /// frame on the calling thread fails with [`STATUS_REENTRANCY`] (the child
+    /// may require this activation's own services during its setup, which a
+    /// held instance lock would turn into an undetectable wait).
+    pub realm_spawn: unsafe extern "C" fn(
+        host: *mut std::os::raw::c_void,
+        realm: u64,
+        path: *const u8,
+        path_len: usize,
+        out_buf: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32,
+    /// Disposes the child `child` (a handle `realm_spawn` returned for this
+    /// activation) and returns once its teardown has settled.
+    ///
+    /// Status-only like `grant`: [`STATUS_OK`], [`STATUS_FAILED`] for an
+    /// unknown or already retired handle, or [`STATUS_REENTRANCY`] when a
+    /// foreign entry frame is on the calling thread.
+    pub realm_retire: unsafe extern "C" fn(host: *mut std::os::raw::c_void, child: u64) -> i32,
+    /// `require` addressed to `realm`: resolves `service` in that realm and
+    /// calls `method` with the `in_data` payload.
+    ///
+    /// The realm must be one this activation opened (`unknown_realm`
+    /// otherwise) and the resolved provider must be a child this activation
+    /// spawned ([`STATUS_UNDECLARED`] otherwise); no descriptor `inject`
+    /// declaration is consulted. Statuses, detail documents, reentrancy
+    /// behavior, and the growable `out_buf` protocol are those of `require`.
+    pub realm_require: unsafe extern "C" fn(
+        host: *mut std::os::raw::c_void,
+        realm: u64,
+        service: *const u8,
+        service_len: usize,
+        method: u32,
+        in_data: *const u8,
+        in_len: usize,
         out_buf: *mut u8,
         cap: usize,
         out_len: *mut usize,
@@ -543,8 +635,18 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(ABI_VERSION, 5);
+        assert_eq!(ABI_VERSION, 6);
         assert_eq!(STATUS_DEFERRED, 2);
+    }
+
+    #[test]
+    fn realm_spawn_reply_fits_its_minimum_capacity() {
+        let widest = format!(
+            r#"{{"realm":{},"child":{},"state":"pending"}}"#,
+            u64::MAX,
+            u64::MAX
+        );
+        assert!(widest.len() <= REALM_SPAWN_REPLY_MIN);
     }
 
     #[test]

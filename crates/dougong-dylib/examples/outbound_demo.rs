@@ -1,5 +1,5 @@
-// Rust guideline compliant 2026-10-28
-//! ABI v3/v4 outbound acceptance demo: the greeter dylib's own worker thread
+// Rust guideline compliant 2026-11-05
+//! ABI v3-v6 outbound acceptance demo: the greeter dylib's own worker thread
 //! performs a synchronous cross-plugin `require` and publishes an event
 //! (the full chain), then further arms prove grants and deterministic
 //! failure modes of the vtable contract:
@@ -15,7 +15,11 @@
 //! - cross-instance: two dylib-form instances whose gated handlers require
 //!   through an in-process relay close a wait cycle across threads; the
 //!   arming that completes the cycle fails with `STATUS_REENTRANCY` while
-//!   the other leg unwinds (D-V3-3, 2026-10-25 amendment).
+//!   the other leg unwinds (D-V3-3, 2026-10-25 amendment);
+//! - realm (D33, E2): the realm-partner cdylib spawns two greeter
+//!   activations, each in its own realm, calls their same-named `greeting`
+//!   service through `realm_require`, and retires them; an unknown realm and
+//!   a retired child's realm fail closed.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +61,20 @@ fn partner_path() -> PathBuf {
         "grant_partner.dll"
     } else {
         "libgrant_partner.so"
+    };
+    path.join(name)
+}
+
+/// Locates the realm-partner cdylib (E2's spawning artifact).
+fn realm_partner_path() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.extend(["../../", "target", "debug"]);
+    let name = if cfg!(target_os = "macos") {
+        "librealm_partner.dylib"
+    } else if cfg!(windows) {
+        "realm_partner.dll"
+    } else {
+        "librealm_partner.so"
     };
     path.join(name)
 }
@@ -660,11 +678,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         cross_instance_arm(&ctx, &log).await?;
 
+        realm_arm(&ctx, &log).await?;
+
         greeter_fiber.dispose().await;
         ctx.stop().await;
         log("-- outbound demo done --".to_string());
         Ok::<(), Error>(())
     })?;
+    Ok(())
+}
+
+/// Method selectors of the realm-partner artifact.
+const PARTNER_SPAWN: u32 = 0;
+const PARTNER_REQUIRE: u32 = 1;
+const PARTNER_RETIRE: u32 = 2;
+
+/// One framed call into the realm-partner's `realm-spawner` service.
+async fn partner_call(
+    spawner: &Invoker,
+    method: u32,
+    payload: Vec<u8>,
+) -> dougong::Result<(i32, Vec<u8>)> {
+    let reply = spawner.call(method, payload).await?;
+    unpack_framed(&reply).map(|(status, body)| (status, body.to_vec()))
+}
+
+/// Spawns the greeter artifact into a fresh realm and returns the host's
+/// `(realm, child)` pair after checking the child settled active.
+async fn spawn_greeter(spawner: &Invoker) -> dougong::Result<(u64, u64)> {
+    let artifact = plugin_path().to_string_lossy().into_owned().into_bytes();
+    let (status, body) = partner_call(spawner, PARTNER_SPAWN, artifact).await?;
+    assert_eq!(status, STATUS_OK);
+    let reply: Value = serde_json::from_slice(&body)
+        .map_err(|err| Error::msg(format!("spawn reply is not JSON: {err}")))?;
+    assert_eq!(reply.get("state").and_then(Value::as_str), Some("active"));
+    let field = |key: &str| {
+        reply
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::msg(format!("spawn reply lacks \"{key}\"")))
+    };
+    Ok((field("realm")?, field("child")?))
+}
+
+/// Calls the realm's `greeting` service through the partner's
+/// `realm_require`.
+async fn realm_greeting(spawner: &Invoker, realm: u64) -> dougong::Result<(i32, Vec<u8>)> {
+    let mut payload = realm.to_le_bytes().to_vec();
+    payload.extend_from_slice(b"greeting");
+    partner_call(spawner, PARTNER_REQUIRE, payload).await
+}
+
+/// The realm arm (D33/E2): a real cdylib spawns two greeter activations into
+/// separate realms next to the global greeter, reaches each through
+/// `realm_require`, and retires them.
+async fn realm_arm(ctx: &Context, log: &(dyn Fn(String) + Send + Sync)) -> dougong::Result<()> {
+    let partner = ctx.plugin(load(&realm_partner_path())?, None)?;
+    partner.join().await?;
+    let spawner = ctx
+        .get::<Invoker>("realm-spawner")
+        .ok_or_else(|| Error::msg("realm-spawner is not committed"))?;
+
+    let (first_realm, first_child) = spawn_greeter(&spawner).await?;
+    let (second_realm, second_child) = spawn_greeter(&spawner).await?;
+    assert_ne!(first_realm, second_realm);
+    for realm in [first_realm, second_realm] {
+        let (status, hello) = realm_greeting(&spawner, realm).await?;
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(hello, b"hello from a dougong dylib");
+    }
+    log("-- realm arm: two same-named children answer from their own realms --".to_string());
+
+    // An unknown realm fails closed with its own detail code.
+    let (status, detail) = realm_greeting(&spawner, u64::MAX).await?;
+    assert_eq!(status, STATUS_FAILED);
+    assert_eq!(detail_code(&detail)?, "unknown_realm");
+
+    // After the first child is retired its realm resolves the global greeter
+    // by fallback, which the partner never spawned: the call is refused.
+    let (status, _) =
+        partner_call(&spawner, PARTNER_RETIRE, first_child.to_le_bytes().to_vec()).await?;
+    assert_eq!(status, STATUS_OK);
+    let (status, detail) = realm_greeting(&spawner, first_realm).await?;
+    assert_eq!(status, STATUS_UNDECLARED);
+    assert_eq!(detail_code(&detail)?, "undeclared_dependency");
+    let (status, _) = realm_greeting(&spawner, second_realm).await?;
+    assert_eq!(status, STATUS_OK);
+    let (status, _) = partner_call(
+        &spawner,
+        PARTNER_RETIRE,
+        second_child.to_le_bytes().to_vec(),
+    )
+    .await?;
+    assert_eq!(status, STATUS_OK);
+    log("-- realm arm: retire and fail-closed fallback verified --".to_string());
+
+    partner.dispose().await;
     Ok(())
 }
 

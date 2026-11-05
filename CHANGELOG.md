@@ -3,6 +3,52 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.6.0] - 2026-11-05
+
+### ABI v6：dylib 出站 realm 激活（破坏性变更）+ `Context::get` 的 realm 语义（D15 完整化）
+
+dylib 插件可在自有线程上新建 realm、在其中激活子插件工件、调用子激活提供的
+服务并单独卸载它们——`ctx.isolate_realm(l).plugin(..)` 的跨 C 边界对应物，
+面向"每会话能力集"（fly-rafter 的会话 realm / 子 agent 子 realm）。裁决全文见
+D33，需求规格见 `doc/maintenance/realm_requirements.md`（含 §9 实现期修订）。
+
+v5 → v6 diff 清单：`HostExports` 在 `dispatch` 后追加 `realm_spawn`、
+`realm_retire`、`realm_require` 三字段；新增常量 `REALM_SPAWN_REPLY_MIN`。
+`PluginExports`、descriptor schema、require/emit/grant/dispatch、CPS 协议、
+wasm/WIT、loader JSON 不变。
+
+- `realm_spawn(realm, path)`：`realm == 0` 分配新 realm，否则须为本激活此前
+  返回的标签；按路径加载并同步启动子激活，回复
+  `{"realm","child","state":"active"|"pending"}`；加载失败
+  （`realm_spawn_load_failed`，含 `abi_version` 不符）与子激活启动失败均无残留。
+  回复缓冲低于 `REALM_SPAWN_REPLY_MIN`（96）在任何副作用之前回
+  `STATUS_CAPACITY`。
+- `realm_retire(child)`：卸载单个子激活并等其 teardown 收敛；状态码形，无详情缓冲。
+- `realm_require(realm, service, ...)`：`require` 的 realm 寻址版，无需 `inject`
+  声明；仅放行本激活所 spawn 的子激活提供的服务（授权绑定解析到的提供者激活
+  id），其余 = `STATUS_UNDECLARED`；与 `require` 共用同一调用路径，S5 提供者
+  隔离与 O7 边界追踪照常生效。
+- 姿态与生命周期：`realm_spawn`/`realm_retire` 必须自插件自有线程发起，外来入口
+  帧内 = `STATUS_REENTRANCY`；子 fiber 是 spawner fiber 的 effect，spawner
+  teardown 先级联卸载全部子激活再跑自身 `teardown` 导出。
+- 加载门：`ABI_VERSION` 5 → 6，v5 工件硬拒载（错误消息含两侧版本）。
+- 新增示例工件 `realm-partner`；`outbound_demo` 增 realm 臂。
+
+**行为变更（内核）**：`Context::get` 动态分支（fiber 未声明的名字）此前只读全局
+label、忽略 realm；现与依赖解析同序（按名隔离 → 最内层 realm → 全局，首个
+strict 命中）。realm 内未声明名的 `get` 因此优先取域内提供者；D31 grant 的目标
+解析对未在授予者 `inject` 内的目标名同样获得 realm 优先（修正 0.4.0"按授予者
+realm 解析"声明与实现的偏差）。无 realm 使用的宿主不受影响。
+
+测试夹具修复：`dispatch_tests` 的监听插件声明 `inject: [svc-dispatcher]`，先于
+driver 启动时首次 `join` 在 Pending 返回，派发可能抢在事件桥注册之前（基线约
+6% 间歇失败）；夹具改为 driver 就绪后再 `join` 监听插件并断言 Active。
+
+升级清单：
+
+1. 插件对齐 `ABI_VERSION` 重编译（`HostExports` 按值复制时自然带上新字段）。
+2. 宿主依赖升 `dougong* = "0.6.0"`；不使用 realm 的插件无需代码变更。
+
 ## [0.5.1] - 2026-11-04
 
 ### 修复：dylib 拆除与插件自有线程出站 require 的锁序倒置（停摆纪律）

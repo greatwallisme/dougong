@@ -13,7 +13,7 @@
 //! registers a [`dougong::Invoker`] service so any consumer can call the
 //! plugin through the dynamic channel (`method` selector + byte payload).
 //!
-//! # Outbound surface (ABI v4/v5)
+//! # Outbound surface (ABI v4-v6)
 //!
 //! Each activation receives a [`dougong_abi::HostExports`] vtable at `setup`:
 //! `require` performs a synchronous blocking call into another plugin's
@@ -27,6 +27,10 @@
 //! calling thread until the chain settles and report the chain value, and
 //! the call must originate on a plugin-owned thread (a foreign entry frame
 //! on the calling thread fails deterministically with `STATUS_REENTRANCY`).
+//! `realm_spawn`, `realm_retire` and `realm_require` (D33, v6) let an
+//! activation open realms, activate child plugin artifacts inside them (the
+//! children's fibers are effects of the spawner's fiber) and call the
+//! services those children provide (implemented in the private `realm` module).
 //! Reentrancy is governed by a per-thread activation stack
 //! (design decision D-V3-3 option b'): any foreign entry — `setup`, `call`,
 //! `on_event`/`on_next`, `teardown` — records its instance for the duration
@@ -85,6 +89,8 @@ use libloading::Library;
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+mod realm;
 
 /// Serializes every foreign call into one plugin instance (see the crate
 /// documentation: cross-fiber callers are not ordered by the kernel).
@@ -349,6 +355,13 @@ struct Activation {
     /// outbound require path, the event bridges, and the dispatch entry
     /// (`teardown_requirements.md` R3/R5 — pre-lock teardown quiescence).
     alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Instance id of the activation that spawned this one through
+    /// `realm_spawn` (D33), or `None` for a loader/kernel-started activation.
+    /// Registered in the spawn-link table before `setup`, removed on reclaim.
+    parent: Option<u64>,
+    /// Realm labels and child handles this activation opened through
+    /// `realm_spawn` (D33); empty for an activation that never spawns.
+    realms: Mutex<realm::RealmState>,
 }
 
 /// One activation-granular grant: pure identity bookkeeping, never a call
@@ -527,6 +540,7 @@ impl ActivationPtr {
         // reference produced by the single `Arc::into_raw` at construction.
         let activation = unsafe { Arc::from_raw(self.0.cast::<Activation>()) };
         clear_grants(&activation);
+        realm::unlink_child(&activation);
         drop(activation);
     }
 }
@@ -746,12 +760,33 @@ fn require_impl(
     if !authorized {
         return undeclared_require(service, out_buf, cap, out_len);
     }
+    settle_require(
+        activation, service, &invoker, method, in_data, in_len, out_buf, cap, out_len,
+    )
+}
+
+/// Steps 3-5 of `require`, shared with `realm_require` (D33): the reentrancy
+/// check fires at the target's entry (`DylibInvoke::call`) and surfaces as
+/// the `reentrancy_cycle` code; the invocation is driven on this thread and
+/// its outcome is written back under the growable buffer protocol.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the vtable signature is fixed by the ABI contract"
+)]
+fn settle_require(
+    activation: &Activation,
+    service: &str,
+    invoker: &Invoker,
+    method: u32,
+    in_data: *const u8,
+    in_len: usize,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
     // SAFETY: vtable input contract.
     let payload = unsafe { input_slice(in_data, in_len) }.to_vec();
     let bytes_in = payload.len();
-    // Steps 3-5: the reentrancy check fires at the target's entry
-    // (`DylibInvoke::call`) and surfaces as the `reentrancy_cycle` code;
-    // the invocation is driven on this thread.
     // O7: the outbound leg of a cross-boundary call carries the guest
     // fiber's own identity (realm logger, trace id) and the call outcome.
     let started = std::time::Instant::now();
@@ -1695,6 +1730,9 @@ pub struct DynPlugin {
     inject: Vec<dougong::Injection>,
     provide: Vec<String>,
     listen: Vec<(String, u32)>,
+    /// Instance id of the activation that spawned this plugin through
+    /// `realm_spawn` (D33); `None` for plugins the loader or kernel starts.
+    spawned_by: Option<u64>,
 }
 
 impl std::fmt::Debug for DynPlugin {
@@ -1728,6 +1766,7 @@ impl Plugin for DynPlugin {
         let exports = self.exports.clone();
         let provide = self.provide.clone();
         let listen = self.listen.clone();
+        let spawned_by = self.spawned_by;
         let plugin_name = self.name.clone();
         let inject_names: Vec<String> = self
             .inject
@@ -1758,10 +1797,88 @@ impl Plugin for DynPlugin {
                     inject: inject_names,
                     provide: provide.clone(),
                     alive: Arc::clone(&alive),
+                    parent: spawned_by,
+                    realms: Mutex::new(realm::RealmState::default()),
                 }))
                 .cast_mut()
                 .cast::<std::ffi::c_void>(),
             );
+            // The teardown effect is registered BEFORE `setup` runs so that
+            // everything registered later — provide disposers, event bridges,
+            // and realm children spawned from plugin-owned threads started
+            // inside `setup` — drains ahead of the teardown export (LIFO).
+            // The setup handle travels through a shared slot: the disposer
+            // runs the export only when setup actually succeeded (on a
+            // failed setup the effect rollback finds the slot empty and
+            // skips the export), so "teardown exactly once per successful
+            // setup" holds on every arm.
+            let teardown_slot: Arc<Mutex<Option<Handle>>> = Arc::new(Mutex::new(None));
+            let disposer_slot = Arc::clone(&teardown_slot);
+            let disposer_activation = ActivationPtr(activation.0);
+            let teardown_exports = exports.clone();
+            let teardown_lock = Arc::clone(&instance);
+            let teardown_alive = Arc::clone(&alive);
+            let disposer: dougong::Disposer = Box::new(move || {
+                Box::pin(async move {
+                    {
+                        // Teardown-quiescence order (teardown_requirements.md
+                        // R1+R2, the 0.5.1 lock-inversion fix): the liveness
+                        // gate flips BEFORE the lock acquisition. The mutex
+                        // grants locks in request order, so every queued
+                        // outbound entry acquires ahead of the disposer,
+                        // unwinds at the under-lock gate, and releases — the
+                        // disposer's turn arrives with the queue drained, and
+                        // the teardown export can never race a thread parked
+                        // on this lock (the 0.5.0 lock-order inversion).
+                        teardown_alive.store(false, Ordering::Release);
+                        let slot = disposer_slot.lock().take();
+                        if let Some(handle) = slot {
+                            // Teardown acquires exactly one lock and holds
+                            // nothing else while parking, so it can never
+                            // close a wait cycle — plain parking is safe; the
+                            // chain push still exposes this lock to nested
+                            // `require` arms.
+                            let _instance = teardown_lock.lock().await;
+                            let _chain = ChainGuard::hold(instance_id);
+                            let _entry = EntryGuard::enter(instance_id);
+                            teardown_exports.teardown(&handle);
+                        }
+                    }
+                    // The Eq. 31 cascade has already disposed any realm
+                    // children (they registered after this effect); reclaim
+                    // their registry runtime records and the activation.
+                    // SAFETY: the disposer runs before the reclaim below,
+                    // while the activation reference is still owned by this
+                    // pointer (the same contract as the vtable entries).
+                    let activation = unsafe { &*disposer_activation.0.cast::<Activation>() };
+                    realm::teardown_realms(activation).await;
+                    // SAFETY: teardown has returned (or never ran), so the
+                    // vtable is dead; this is the unique reclaim of the
+                    // activation reference.
+                    unsafe { disposer_activation.reclaim() };
+                })
+            });
+            if let Err(err) = ctx
+                .effect("dylib.teardown", async move { Ok(Some(disposer)) })
+                .await
+            {
+                // The effect was never registered, so nothing will reclaim
+                // the activation; do it inline. Setup has not run yet, so
+                // there is no teardown export to call.
+                // SAFETY: the teardown disposer was never registered, so
+                // this is the unique reclaim of the activation reference.
+                unsafe { ActivationPtr(activation.0).reclaim() };
+                return Err(err);
+            }
+
+            // A realm-spawned child is linked to its spawner before `setup`,
+            // hence before any `provide` commits: the spawner's
+            // `realm_require` authorization can never observe a committed
+            // child whose link is still missing (D33 C5). The link dies with
+            // the activation's reclaim.
+            if let Some(parent) = spawned_by {
+                realm::link_child(instance_id, parent);
+            }
             // Setup runs under the instance lock on the reentrancy stack
             // (uniform entry discipline); a fresh id cannot cycle. The
             // vtable is built inside the block: raw pointers are not `Send`
@@ -1775,87 +1892,37 @@ impl Plugin for DynPlugin {
                     emit: host_emit,
                     grant: host_grant,
                     dispatch: host_dispatch,
+                    realm_spawn: realm::host_realm_spawn,
+                    realm_retire: realm::host_realm_retire,
+                    realm_require: realm::host_realm_require,
                 };
                 exports.setup(&host_exports)
             };
             let Some(handle) = setup else {
-                // SAFETY: setup failed, the vtable was never published; this
-                // is the unique reclaim of the raw activation reference.
-                unsafe { activation.reclaim() };
+                // Setup failed: return without filling the slot. The effect
+                // rollback runs the teardown disposer, which finds the slot
+                // empty (skipping the export), reclaims any realm residue,
+                // and reclaims the activation exactly once.
                 return Err(Error::new(
                     "setup_failed",
                     format!("dylib plugin \"{plugin_name}\" setup returned null"),
                 ));
             };
+            *teardown_slot.lock() = Some(Handle(handle.0));
 
-            // Teardown runs exactly once per successful setup, after every
-            // other effect (provide disposers, bridges) has drained — LIFO
-            // places it first in the queue because it is registered here,
-            // before the effects below. It also reclaims the activation:
-            // vtable calls after teardown returns are outside the contract.
-            // SAFETY-shared token: exactly one of the disposer and the inline
-            // fallback below ever runs, so exactly one copy reclaims; keeping
-            // the copy in the wrapper (not the raw pointer) keeps the apply
-            // future `Send` across the effect registration await.
-            let fallback_activation = ActivationPtr(activation.0);
-            let teardown_exports = exports.clone();
-            let teardown_handle = Handle(handle.0);
-            let teardown_lock = Arc::clone(&instance);
-            let teardown_alive = Arc::clone(&alive);
-            let teardown_activation = activation;
-            let disposer: dougong::Disposer = Box::new(move || {
+            // Liveness-gate flip registered LAST so it drains FIRST: from
+            // this point until the teardown disposer runs, late outbound
+            // entries (`require`, `realm_require`, dispatch) fail at the
+            // gate instead of queueing on the instance lock (D33 C6 extends
+            // the 0.5.1 quiescence discipline to the realm entries).
+            let gate_alive = Arc::clone(&alive);
+            let gate_disposer: dougong::Disposer = Box::new(move || {
                 Box::pin(async move {
-                    {
-                        // Teardown acquires exactly one lock and holds
-                        // nothing else while parking, so it can never close a
-                        // wait cycle — plain parking is safe; the chain push
-                        // still exposes this lock to nested `require` arms.
-                        //
-                        // Teardown-quiescence order (teardown_requirements.md
-                        // R1+R2, the 0.5.1 lock-inversion fix): the liveness
-                        // gate flips BEFORE the lock acquisition. The mutex
-                        // grants locks in request order, so every queued
-                        // outbound entry acquires ahead of the disposer,
-                        // unwinds at the under-lock gate, and releases — the
-                        // disposer's turn arrives with the queue drained, and
-                        // the teardown export can never race a thread parked
-                        // on this lock (the 0.5.0 lock-order inversion).
-                        teardown_alive.store(false, Ordering::Release);
-                        let _instance = teardown_lock.lock().await;
-                        let _chain = ChainGuard::hold(instance_id);
-                        let _entry = EntryGuard::enter(instance_id);
-                        teardown_exports.teardown(&teardown_handle);
-                    }
-                    // SAFETY: teardown has returned, so the vtable is dead;
-                    // this is the unique reclaim of the activation reference.
-                    unsafe { teardown_activation.reclaim() };
+                    gate_alive.store(false, Ordering::Release);
                 })
             });
-            if let Err(err) = ctx
-                .effect("dylib.teardown", async move { Ok(Some(disposer)) })
-                .await
-            {
-                // The effect was never registered, so the disposer above (and
-                // with it the plugin's `teardown` and the activation reclaim)
-                // would silently never run. Tear down inline instead: the
-                // failure arms are a dispose racing this body or an effect
-                // budget breach, and in both the activation is dead weight.
-                {
-                    // Same one-lock shape as the disposer, with the same
-                    // teardown-quiescence order (teardown_requirements.md
-                    // R1+R2+R6): gate first, plain queue acquisition second,
-                    // teardown export last — both arms share one lock order.
-                    alive.store(false, Ordering::Release);
-                    let _instance = instance.lock().await;
-                    let _chain = ChainGuard::hold(instance_id);
-                    let _entry = EntryGuard::enter(instance_id);
-                    exports.teardown(&Handle(handle.0));
-                }
-                // SAFETY: the disposer was never registered, so this is the
-                // unique reclaim of the activation reference.
-                unsafe { fallback_activation.reclaim() };
-                return Err(err);
-            }
+            ctx.effect("dylib.gate", async move { Ok(Some(gate_disposer)) })
+                .await?;
 
             // Mode-aware bridges: one per declared listened event.
             for (event_name, event_id) in &listen {
@@ -1898,6 +1965,11 @@ impl Plugin for DynPlugin {
 /// Fails when the library cannot be mapped, the export symbol is missing,
 /// or the ABI version mismatches.
 pub fn load(path: &Path) -> Result<Arc<dyn Plugin>> {
+    Ok(Arc::new(from_exports(open_exports(path)?)?))
+}
+
+/// Maps the shared library at `path` and resolves its export table.
+fn open_exports(path: &Path) -> Result<Exports> {
     // SAFETY: `Library::new` maps a shared library the user asked for;
     // dougong keeps every plugin mapped for the process lifetime (D5), so
     // the returned handle is never used to unmap code that may still run.
@@ -1914,11 +1986,10 @@ pub fn load(path: &Path) -> Result<Arc<dyn Plugin>> {
                 format!("missing DOUGONG_PLUGIN_EXPORTS: {err}"),
             )
         })?;
-    let exports = Exports {
+    Ok(Exports {
         table: *table,
         _lib: Some(lib),
-    };
-    Ok(Arc::new(from_exports(exports)?))
+    })
 }
 
 /// Adapts an already-resolved export table (used by tests and by hosts that
@@ -1990,6 +2061,7 @@ pub fn from_exports(exports: Exports) -> Result<DynPlugin> {
         inject,
         provide,
         listen,
+        spawned_by: None,
     })
 }
 
@@ -2010,6 +2082,8 @@ mod dispatch_tests;
 mod fault_tests;
 #[cfg(test)]
 mod outbound_tests;
+#[cfg(test)]
+mod realm_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

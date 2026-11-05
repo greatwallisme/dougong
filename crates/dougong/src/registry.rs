@@ -95,17 +95,25 @@ pub fn plugin(
                 cascade_child.dispose().await;
             })
         });
-        if let Err(err) = parent_fiber.register_effect(
+        match parent_fiber.register_effect(
             label,
             // The cascade is kernel-structural: a child dispose must never
             // be orphaned by the parent's cleanup budget (S3).
             crate::fiber::Teardown::Critical,
             Some(disposer),
         ) {
-            tokio::spawn(async move {
-                child.dispose().await;
-            });
-            return Err(err);
+            Ok(guard) => {
+                // Keep the guard on the child: an early dispose retires the
+                // parent's cascade slot instead of leaking it (the slot
+                // otherwise outlives the child until the parent's unload).
+                *child.cascade.lock() = Some(guard);
+            }
+            Err(err) => {
+                tokio::spawn(async move {
+                    child.dispose().await;
+                });
+                return Err(err);
+            }
         }
     }
 
