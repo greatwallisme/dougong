@@ -3,6 +3,22 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.6.1] - 2026-11-06
+
+### 修复：`Context::get` 的自提供快照短路 realm 优先解析（realm_require 同名全局 provide 必拒）
+
+realm 作用域读（`isolate_realm` 上下文，含 `realm_require` 的解析步骤）此前命中纤维
+提交视图快照时**不经 realm 候选**直接返回——而自提供快照（`commit_self`，「provider
+must see itself」）记录的是本纤维 provide 的落点。对「spawner 自身全局 provide 与
+realm 子 provide 同名」的组合（fly-rafter agent-loop 同工件父子形态），realm 读被
+快照绑到 spawner 的全局 provide，`realm_require` 的子激活授权（仅放行本激活所 spawn
+的子）必然拒绝（`STATUS_UNDECLARED`）。
+
+修复：realm 作用域读跳过**自提供**快照、走 label_candidates 实时解析（realm →
+全局）。注入依赖快照不受影响——「spawner 不得 inject 其子 provide 的名字」的
+fail-closed 遮蔽臂（E1.6）语义不变。回归测试
+`realm_child_wins_over_the_spawners_same_named_global_provide`（E1.10）。
+
 ## [0.6.0] - 2026-11-05
 
 ### ABI v6：dylib 出站 realm 激活（破坏性变更）+ `Context::get` 的 realm 语义（D15 完整化）

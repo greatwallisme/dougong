@@ -593,6 +593,19 @@ impl Context {
             if let Some(snapshot) = snapshot {
                 if snapshot.dynamic {
                     // Fall through to the live computation below.
+                } else if self.realm_scoped_self_provide_short_circuits(&snapshot) {
+                    // A realm-scoped read (D15/D33: `isolate_realm`
+                    // contexts) must resolve realm-first. A self-provide
+                    // snapshot (the provider's own committed view, written
+                    // so a provider sees itself during activation) knows
+                    // nothing about the realm label and would bind the
+                    // caller's global provide — observed as
+                    // `realm_require`'s child-only authorization rejecting
+                    // a spawner that provides the same name its realm
+                    // children provide. Injected-dependency snapshots keep
+                    // winning (the documented fail-closed shadowing arm:
+                    // spawners must not inject the names their children
+                    // provide).
                 } else {
                     let value = crate::policy::maybe_quarantine(
                         &self.root,
@@ -625,6 +638,22 @@ impl Context {
         crate::policy::maybe_quarantine(&self.root, provided.provider_uid, name, provided.value)
             .downcast::<T>()
             .ok()
+    }
+
+    /// Whether a realm-scoped read must skip a self-provide snapshot: the
+    /// snapshot binds the fiber's own provide (a global label for a
+    /// non-realm fiber), while the live computation is realm-aware. Only
+    /// self-provides are skipped — injected-dependency snapshots are the
+    /// documented shadowing arm and keep the fast path.
+    fn realm_scoped_self_provide_short_circuits(
+        &self,
+        snapshot: &crate::fiber::ProviderSnapshot,
+    ) -> bool {
+        ScopeNode::realm_label(Some(&self.scope)).is_some()
+            && self
+                .fiber()
+                .and_then(|fiber| fiber.uid_value())
+                .is_some_and(|uid| snapshot.provider_uid == uid)
     }
 
     /// Typed read or a descriptive error (TS proxy-miss diagnostics).

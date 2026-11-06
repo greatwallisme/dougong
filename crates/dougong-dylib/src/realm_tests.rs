@@ -730,6 +730,77 @@ async fn spawned_child_answers_realm_require() {
     drop(rig);
 }
 
+// ---------------------------------------------------------------------------
+// PROBE (diagnostic, not for commit): the spawner itself provides the same
+// service name globally that its realm children provide in the realm
+// (the fr-agent-loop parent/child same-artifact shape).
+// ---------------------------------------------------------------------------
+
+descriptor_fns!(
+    agentchild_name,
+    agentchild_descriptor,
+    b"realm-agentchild",
+    br#"{"name":"realm-agentchild","provide":["svc-agent"],"inject":[],"listen":{}}"#
+);
+
+static AGENTCHILD_TABLE: PluginExports = PluginExports {
+    abi_version: ABI_VERSION,
+    name: agentchild_name,
+    descriptor: agentchild_descriptor,
+    setup: child_setup,
+    call: child_call,
+    on_event: listens_to_nothing,
+    on_next: continues_nothing,
+    teardown: child_teardown,
+};
+
+descriptor_fns!(
+    global_spawner_name,
+    global_spawner_descriptor,
+    b"global-spawner",
+    br#"{"name":"global-spawner","provide":["svc-spawner","svc-agent"],"inject":[],"listen":{}}"#
+);
+
+static GLOBAL_SPAWNER_TABLE: PluginExports = PluginExports {
+    abi_version: ABI_VERSION,
+    name: global_spawner_name,
+    descriptor: global_spawner_descriptor,
+    setup: spawner_setup,
+    call: spawner_call,
+    on_event: listens_to_nothing,
+    on_next: continues_nothing,
+    teardown: spawner_teardown,
+};
+
+/// E1.10 (regression): the spawner's own global provide of the same name
+/// must not shadow the realm child — `realm_require` resolves realm-first
+/// even when the caller's fiber holds a self-provide snapshot for the name
+/// (fly-rafter's agent-loop parent/child same-artifact shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realm_child_wins_over_the_spawners_same_named_global_provide() {
+    let serial = SERIAL.lock().await;
+    register_test_source("agentchild", &AGENTCHILD_TABLE);
+    LOG.lock().expect("teardown log").clear();
+    let ctx = Context::new();
+    let spawner = start(&ctx, &GLOBAL_SPAWNER_TABLE).await;
+    let reply = spawn_ok(&ctx, 0, "agentchild").await;
+    assert_eq!(reply["state"], "active");
+    let realm = reply["realm"].as_u64().expect("realm");
+    let (status, body) = realm_require(&ctx, realm, "svc-agent", "q").await;
+    assert_eq!(
+        status,
+        STATUS_OK,
+        "realm-first resolution: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(String::from_utf8_lossy(&body).ends_with(":q"));
+    tokio::time::timeout(Duration::from_secs(10), spawner.dispose())
+        .await
+        .expect("the spawner tears down");
+    drop(ctx);
+    drop(serial);
+}
+
 /// E1.2: the same artifact in two realms keeps the same service name without
 /// a duplicate-provide collision, and each realm answers from its own child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
