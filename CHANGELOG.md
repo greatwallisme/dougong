@@ -3,6 +3,27 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.7.0] - 2026-11-07
+
+### ABI v7：dylib 激活配置送达（破坏性变更，D34）
+
+装载链全程携带的激活配置此前在 dylib 边界被适配器丢弃——in-process 插件
+经 `apply` 第二形参、wasm 客体经 `call_apply` 字节早已拿到，唯 dylib
+`setup` 永远看不见，下游（fly-rafter）被迫把逐实例配置编译期烘焙进工件。
+本版补齐：dylib `setup` 导出增 `config`/`config_len` 两形参，承载激活配置
+的 verbatim JSON 序列化字节；无配置 = JSON 文本 `null`，与 in-process 的
+`Value::Null`、wasm 客体的字节完全等价。
+
+v6 → v7 diff 清单：`PluginExports.setup` 增两形参（`config: *const u8,
+config_len: usize`）。`HostExports`、descriptor schema、require/emit/grant/
+dispatch/realm 全家、CPS 协议、wasm/WIT、loader JSON 不变。
+
+- 裁决全文见 design doc D34；需求规格见
+  `doc/maintenance/config_requirements.md`。
+- 回归测试 `activation_config_reaches_setup_verbatim`（带配置 +
+  无配置两激活顺序钉字节）。
+- 发布序：abi → kernel → dylib → loader（依赖序）。
+
 ## [0.6.1] - 2026-11-06
 
 ### 修复：`Context::get` 的自提供快照短路 realm 优先解析（realm_require 同名全局 provide 必拒）

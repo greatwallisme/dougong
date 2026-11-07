@@ -594,7 +594,7 @@ cordis 的 `ctx.waterfall` 对全部插件可用，dougong 中对应物 `Context
 
 - **缘起**：fly-rafter 的"每会话循环 fiber 置于会话 realm"（其 PRD 8.1，曾因 dougong 无每会话 realm 机制被勘误，19.2-24）与子 agent 的"子 realm"要求。内核进程内早有 `isolate_realm(l).plugin(..)` 与 Eq.31 级联，缺口仅在 dylib 出站面。
 - **①A 注记式**：排除项 9（事件作用域过滤出站）字面不动；本裁决不过滤事件、不改事件道广播语义；动态 realm 激活是内核能力面补充，会话/子代理的路由与事件分路仍归应用层。
-- **②S3 按路径**：`realm_spawn` 携带 dylib 路径，宿主 `load` 后在 `activation.ctx.isolate_realm(label)` 下 `Context::plugin` 启动；同一 .so 进程内仅映射一次（R1）。子激活不接收 config（dylib 无 config 通道），差异化经 spawn 后的 `realm_require` 调用承载。
+- **②S3 按路径**：`realm_spawn` 携带 dylib 路径，宿主 `load` 后在 `activation.ctx.isolate_realm(label)` 下 `Context::plugin` 启动；同一 .so 进程内仅映射一次（R1）。子激活不接收 spawn 级 config（`realm_spawn` 无 config 形参，D34 后其子激活 `setup` 收到 `null` 文本），差异化经 spawn 后的 `realm_require` 调用承载。
 - **③R1 `realm_require`**：专用出站入口，无需 `inject` 声明；解析走内核 realm 优先规则，授权 = 解析到的提供者激活 id 属于本激活所 spawn 的子激活（进程级 spawn-link 表：子激活 id -> 父激活 id，先于子 `setup` 登记、reclaim 时摘除；复用 D31"绑定解析到的提供者激活 id"判定）。`realm_require` 与 `require` 共用 `settle_require`，故 S5 提供者隔离、O7 边界追踪与指标照常生效。
 - **④A 与 dispatch 同姿态**：`realm_spawn`/`realm_retire` 必须自插件自有线程发起，外来入口帧内调用 = `STATUS_REENTRANCY`；spawn 阻塞至子激活稳定（active 或 pending 返回，failed = 子激活自动卸载 + `STATUS_FAILED` 详情）；回复缓冲低于 `REALM_SPAWN_REPLY_MIN`（96）在任何副作用之前回 `STATUS_CAPACITY`，保证重试不会二次 spawn。
 - **生命周期**：子 fiber 是 spawner fiber 的 effect（Eq.31），spawner 的 teardown/重载先级联卸载全部子激活，再跑其 `teardown` 导出；`realm_retire` 为单子提前卸载；realm 标签与子句柄仅本激活有效。
@@ -603,10 +603,34 @@ cordis 的 `ctx.waterfall` 对全部插件可用，dougong 中对应物 `Context
 - **范围外**（需求文档 §4）：wasm 出站 realm、事件作用域过滤、运行时监听注册、`realm_require` 触达非本激活子激活的服务、子激活迁移、spawn 内建超时、嵌套 spawn（外来入口内再 spawn）、realm 级 config 热更、loader 动态 realm 槽位。
 - **验证锚**：`dougong-dylib::realm_tests`（E1 全矩阵：往返/realm 隔离/可见性/授权/未知 realm 与子句柄/加入既有 realm/加载与 ABI 版本失败无残留/setup 期 spawn 级联顺序/retire 单子/姿态拒绝/spawn 竞态 teardown/Pending 转 active/Failed 自动卸载/teardown 竞态/并发/容量前置拒绝/遮蔽失败关闭）、内核 `get_of_undeclared_names_follows_realm_precedence`（变异检验）、`outbound_demo` realm 臂（真实 `realm-partner` + `greeter-plugin` 工件）。
 
-## 附录 A：语义等价表（in-process vs dylib-v6，D16/D31/D32/D33）
+### D34 dylib 激活配置送达 = ABI v7 `setup` 增 config 字节形参
+
+2026-11-07，维护者裁决（需求文档 `doc/maintenance/config_requirements.md`，
+§1.2 三需求全采纳）：
+
+- **缘起**：装载链全程携带配置（装载行 `config` → `Context::plugin` →
+  `apply(ctx, config)`），in-process 与 wasm 两形态早达语义等价
+  （无配置 = JSON 文本 `null`），唯 dylib 适配器在 `setup` 调用点丢弃
+  配置。fly-rafter 实证：其 dylib 插件的逐实例配置全部退化为编译期
+  baked-config pins，用户动态配置（MCP 每服务器 command/url 等）无
+  通道可达。
+- **裁决**：`PluginExports.setup` 增 `config: *const u8, config_len: usize`
+  两形参，承载激活配置的 verbatim JSON 序列化字节（仅调用期有效；空
+  切片 = 空指针 + 零长度的防御性信号，内核路径不产生——无配置 =
+  `null` 文本 4 字节）。返回语义、调用次序、实例锁纪律全部不变。
+- **非对称注记**：出站 `HostExports` 零变化；descriptor schema、wasm/WIT、
+  装载文档格式零变化；破坏性升版 v6 → v7，旧工件被版本门确定性拒绝
+  （既有机制）。`realm_spawn` 子激活不带 config（D33 现状延续），其
+  `setup` 收到 `null` 文本。
+- **验证锚**：`activation_config_reaches_setup_verbatim`（带配置 + 无配置
+  两激活顺序钉字节序列）、`abi_version_is_stable` 钉 7、全工件/示例
+  `setup` 形参编译面。
+
+## 附录 A：语义等价表（in-process vs dylib-v7，D16/D31/D32/D33/D34）
 
 | 面 | in-process | dylib v4 | 锚 |
 |---|---|---|---|
+| 激活配置 | `Plugin::apply(ctx, config: Value)`（无配置 = `Value::Null`） | `setup` 收 config 的 verbatim JSON 序列化字节（无配置 = `null` 文本，同 wasm 客体） | D34 |
 | require 能力检查基准 | fiber 兴趣集（声明注入解析承诺） | 实例 descriptor `inject` 集（常量，激活期捕获进 vtable 闭包）；拥有者可另授运行期窄能力 | B2；两级语义（undeclared/inactive）一致，检查对象不同 |
 | 动态授予 | 不需要：依赖面在装配期已知，需动态边时改用 dylib 或静态声明 | `grant`：拥有者授一个自有服务名给一个已提交目标激活；随授予者激活失效 | D31 + 2026-10-28 修订：名级索引 root 作用域化、授权绑定解析到的提供者、无 id 目标拒绝；undeclared→inactive 优先序与无跨激活继承不变 |
 | 出站同步派发 | `ctx.waterfall`/`serial`/`bail`/`parallel`（闭包 fallback/续体） | `dispatch(event, mode, …)`：五模式同型；waterfall fallback = 固定恒等续体（无监听者生效 ⇔ 终值 == 载荷字节）；失败 = `STATUS_FAILED` + 详情三元组（请求语义） | D32；v3 §5.5 由本裁决推翻 |

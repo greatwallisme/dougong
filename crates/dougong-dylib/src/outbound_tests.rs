@@ -229,7 +229,11 @@ unsafe extern "C" fn grant_consumer_descriptor(out: *mut u8, cap: usize, len: *m
     }
 }
 
-unsafe extern "C" fn consumer_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn consumer_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -251,7 +255,11 @@ unsafe extern "C" fn consumer_setup(host: *const HostExports) -> *mut std::ffi::
 }
 
 /// Grant-on-setup variant used by the reactivation self-healing arm.
-unsafe extern "C" fn grant_consumer_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn grant_consumer_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -499,7 +507,11 @@ unsafe extern "C" fn target_descriptor(out: *mut u8, cap: usize, len: *mut usize
     }
 }
 
-unsafe extern "C" fn target_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn target_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -658,7 +670,11 @@ unsafe extern "C" fn emitter_descriptor(out: *mut u8, cap: usize, len: *mut usiz
     }
 }
 
-unsafe extern "C" fn emitter_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn emitter_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -1528,14 +1544,22 @@ unsafe extern "C" fn ring2_descriptor(out: *mut u8, cap: usize, len: *mut usize)
     }
 }
 
-unsafe extern "C" fn ring1_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn ring1_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     // SAFETY: the vtable contract hands `host` to `setup` exactly once; the
     // copy outlives the activation in the test's static slot.
     *RING1_HOST.lock().expect("ring1 host slot") = Some(SendHost(unsafe { *host }));
     Box::into_raw(Box::new(0_u8)).cast::<std::ffi::c_void>()
 }
 
-unsafe extern "C" fn ring2_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn ring2_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     // SAFETY: as `ring1_setup`.
     *RING2_HOST.lock().expect("ring2 host slot") = Some(SendHost(unsafe { *host }));
     Box::into_raw(Box::new(0_u8)).cast::<std::ffi::c_void>()
@@ -2419,7 +2443,11 @@ unsafe extern "C" fn quiesce_descriptor(out: *mut u8, cap: usize, len: *mut usiz
     }
 }
 
-unsafe extern "C" fn quiesce_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn quiesce_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }

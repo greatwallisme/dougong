@@ -206,7 +206,11 @@ descriptor_fns!(
     br#"{"name":"realm-failing","provide":["svc-failing"],"inject":[],"listen":{}}"#
 );
 
-unsafe extern "C" fn child_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn child_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -216,7 +220,11 @@ unsafe extern "C" fn child_setup(host: *const HostExports) -> *mut std::ffi::c_v
     .cast::<std::ffi::c_void>()
 }
 
-unsafe extern "C" fn failing_setup(_host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn failing_setup(
+    _host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     std::ptr::null_mut()
 }
 
@@ -336,7 +344,11 @@ descriptor_fns!(
     br#"{"name":"setup-spawner","provide":["svc-setup-spawner"],"inject":[],"listen":{}}"#
 );
 
-unsafe extern "C" fn setup_spawner_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn setup_spawner_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -447,7 +459,11 @@ descriptor_fns!(
     br#"{"name":"realm-spawner","provide":["svc-spawner"],"inject":[],"listen":{}}"#
 );
 
-unsafe extern "C" fn spawner_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn spawner_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }

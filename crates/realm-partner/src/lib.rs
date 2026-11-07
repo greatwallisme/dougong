@@ -60,7 +60,11 @@ unsafe extern "C" fn partner_descriptor(out: *mut u8, cap: usize, len: *mut usiz
     }
 }
 
-unsafe extern "C" fn partner_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn partner_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }

@@ -1338,11 +1338,20 @@ impl Exports {
         })
     }
 
-    fn setup(&self, host: &HostExports) -> Option<Handle> {
+    fn setup(&self, host: &HostExports, config: &[u8]) -> Option<Handle> {
+        // A null pointer stands for "no config" (the v7 contract); the kernel
+        // path always serializes at least the JSON text `null`, so the empty
+        // arm is a defensive ABI signal for foreign callers of the adapter.
+        let (config_ptr, config_len) = if config.is_empty() {
+            (std::ptr::null::<u8>(), 0)
+        } else {
+            (config.as_ptr(), config.len())
+        };
         // SAFETY: `host` points at a live `HostExports` for the duration of
-        // the call (the v3 contract); the returned handle is owned, opaque
-        // plugin state.
-        let handle = unsafe { ((*self.table).setup)(host) };
+        // the call (the v3 contract); `config_ptr` is read-only for the call
+        // and names `config_len` bytes of `config` (null only when empty).
+        // The returned handle is owned, opaque plugin state.
+        let handle = unsafe { ((*self.table).setup)(host, config_ptr, config_len) };
         if handle.is_null() {
             None
         } else {
@@ -1762,7 +1771,7 @@ impl Plugin for DynPlugin {
         clippy::too_many_lines,
         reason = "the activation body spans setup, teardown registration, grants, and listener bridges; splitting it would hide the lifecycle order"
     )]
-    fn apply(&self, ctx: dougong::Context, _config: Value) -> BoxFuture<Result<()>> {
+    fn apply(&self, ctx: dougong::Context, config: Value) -> BoxFuture<Result<()>> {
         let exports = self.exports.clone();
         let provide = self.provide.clone();
         let listen = self.listen.clone();
@@ -1774,6 +1783,15 @@ impl Plugin for DynPlugin {
             .map(|injection| injection.service.to_string())
             .collect();
         Box::pin(async move {
+            // ABI v7: the activation config crosses the boundary with the
+            // setup call as JSON bytes (in-process plugins receive the same
+            // `Value` through `apply` itself; wasm guests through their
+            // `apply` payload). Serialization of a `serde_json::Value` cannot
+            // produce invalid JSON, so a failure here is a transport-class
+            // impossibility, not plugin input.
+            let config_bytes = serde_json::to_vec(&config).map_err(|err| {
+                Error::transport("payload_codec", format!("encode activation config: {err}"))
+            })?;
             let instance: InstanceLock = Arc::new(AsyncMutex::new(()));
             let instance_id = next_instance_id();
             // Liveness gate shared by every DylibInvoke and both teardown
@@ -1896,7 +1914,7 @@ impl Plugin for DynPlugin {
                     realm_retire: realm::host_realm_retire,
                     realm_require: realm::host_realm_require,
                 };
-                exports.setup(&host_exports)
+                exports.setup(&host_exports, &config_bytes)
             };
             let Some(handle) = setup else {
                 // Setup failed: return without filling the slot. The effect
@@ -2118,7 +2136,11 @@ mod tests {
         }
     }
 
-    unsafe extern "C" fn fake_setup(_host: *const HostExports) -> *mut std::os::raw::c_void {
+    unsafe extern "C" fn fake_setup(
+        _host: *const HostExports,
+        _config: *const u8,
+        _config_len: usize,
+    ) -> *mut std::os::raw::c_void {
         // One live byte per activation; `fake_teardown` releases it, so the
         // full apply/unload cycle runs against a non-null handle.
         Box::into_raw(Box::new(0_u8)).cast::<std::os::raw::c_void>()
@@ -2305,6 +2327,65 @@ mod tests {
             .expect("waterfall");
         assert_eq!(upper, json!("MAKE-LOUD"));
         handle.dispose().await;
+    }
+
+    /// D34 regression slot: every activation's config bytes, in order. Only
+    /// `activation_config_reaches_setup_verbatim` touches it, so parallel
+    /// test threads cannot pollute the assertion.
+    static CONFIG_SEEN: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn config_capturing_setup(
+        _host: *const HostExports,
+        config: *const u8,
+        config_len: usize,
+    ) -> *mut std::os::raw::c_void {
+        let bytes = if config.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: the host contract keeps `config` readable for the
+            // duration of the setup call.
+            unsafe { std::slice::from_raw_parts(config, config_len) }.to_vec()
+        };
+        CONFIG_SEEN.lock().expect("config slot").push(bytes);
+        // Same allocation shape as `fake_setup` so `fake_teardown` releases
+        // it: one live byte per activation.
+        Box::into_raw(Box::new(0_u8)).cast::<std::os::raw::c_void>()
+    }
+
+    static CONFIG_TABLE: PluginExports = PluginExports {
+        abi_version: ABI_VERSION,
+        name: fake_name,
+        descriptor: fake_descriptor,
+        setup: config_capturing_setup,
+        call: fake_call,
+        on_event: fake_on_event,
+        on_next: fake_on_next,
+        teardown: fake_teardown,
+    };
+
+    #[tokio::test]
+    async fn activation_config_reaches_setup_verbatim() {
+        let ctx = Context::new();
+        let with_config: Arc<dyn Plugin> = Arc::new(from_static(&CONFIG_TABLE).expect("table"));
+        let handle = ctx
+            .plugin(with_config, Some(json!({ "server-name": "demo" })))
+            .expect("spawn");
+        handle.join().await.expect("active");
+        handle.dispose().await;
+
+        let without_config: Arc<dyn Plugin> = Arc::new(from_static(&CONFIG_TABLE).expect("table"));
+        let handle = ctx.plugin(without_config, None).expect("spawn");
+        handle.join().await.expect("active");
+        handle.dispose().await;
+
+        // D34: the dylib boundary hands `setup` the verbatim JSON
+        // serialization of the activation config — an absent config rides as
+        // the JSON text `null`, matching what wasm guests receive.
+        let seen = CONFIG_SEEN.lock().expect("config slot");
+        assert_eq!(
+            seen.as_slice(),
+            [br#"{"server-name":"demo"}"#.to_vec(), b"null".to_vec()]
+        );
     }
 
     /// Yields `STATUS_CAPACITY` exactly once, then succeeds: the host must

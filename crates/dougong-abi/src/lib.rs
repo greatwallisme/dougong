@@ -99,10 +99,15 @@
 //!     if unsafe { write_out(br#"{"provide":[]}"#, out, cap, len) } { 0 } else { -1 }
 //! }
 //!
-//! unsafe extern "C" fn setup(_host: *const HostExports) -> *mut std::os::raw::c_void {
+//! unsafe extern "C" fn setup(
+//!     _host: *const HostExports,
+//!     _config: *const u8,
+//!     _config_len: usize,
+//! ) -> *mut std::os::raw::c_void {
 //!     // Returning null signals initialization failure. The host exports
-//!     // pointer is valid for this call only; copy it to use `require`/`emit`
-//!     // from the plugin's own threads later.
+//!     // pointer and the activation config bytes are valid for this call
+//!     // only; copy the vtable to use `require`/`emit` from the plugin's own
+//!     // threads later.
 //!     std::ptr::null_mut()
 //! }
 //!
@@ -261,7 +266,14 @@ pub const STATUS_INVALID_EVENT: i32 = -8;
 /// realm, activates child plugin artifacts inside it (children are effects of
 /// the spawning activation's fiber), retires them individually, and calls the
 /// services they provide (design decision D33; `realm_requirements.md` §2).
-pub const ABI_VERSION: u32 = 6;
+///
+/// v7 (2026-11-07): activation config delivery — `setup` now receives the
+/// activation's config as JSON bytes (`config`/`config_len`), matching what
+/// in-process plugins already get through `Plugin::apply` and wasm guests
+/// through their `apply` payload. Earlier revisions dropped the config at
+/// the dylib boundary, forcing per-plugin config baking (design decision
+/// D34; `config_requirements.md` §2).
+pub const ABI_VERSION: u32 = 7;
 
 /// Minimum `out_buf` capacity `realm_spawn` accepts.
 ///
@@ -503,9 +515,14 @@ impl std::fmt::Debug for HostExports {
 /// # Contract
 ///
 /// - `setup` receives the [`HostExports`] vtable (valid for the call's
-///   duration; copy it to keep it) and returns an opaque plugin-private
-///   handle, or null to signal initialization failure. The host calls it
-///   exactly once per fiber activation, under the per-instance lock.
+///   duration; copy it to keep it), the activation config as JSON bytes
+///   (`config`/`config_len` — the verbatim serialization of the config
+///   `Value`, so an activation without config carries the JSON text `null`,
+///   exactly as wasm guests receive it; a null pointer accompanies a zero
+///   length as a defensive ABI signal), and returns an opaque
+///   plugin-private handle, or null to signal initialization failure.
+///   The host calls it exactly once per fiber activation, under the
+///   per-instance lock.
 /// - `call` serves one invocation of one provided service method. Method
 ///   identifiers are constants of the service contract (WIT-derived), not
 ///   global values.
@@ -538,8 +555,15 @@ pub struct PluginExports {
     /// inject, listen) into the output buffer.
     pub descriptor: unsafe extern "C" fn(out_buf: *mut u8, cap: usize, out_len: *mut usize) -> i32,
     /// Allocates plugin-private state; null signals initialization failure.
-    /// The host exports pointer is valid for this call only.
-    pub setup: unsafe extern "C" fn(host: *const HostExports) -> *mut std::os::raw::c_void,
+    /// The host exports pointer is valid for this call only. `config` points
+    /// at the activation config's verbatim JSON serialization for this call
+    /// only (`null` text when the activation carries none, as for wasm
+    /// guests).
+    pub setup: unsafe extern "C" fn(
+        host: *const HostExports,
+        config: *const u8,
+        config_len: usize,
+    ) -> *mut std::os::raw::c_void,
     /// Serves one provided-service method invocation.
     pub call: unsafe extern "C" fn(
         handle: *mut std::os::raw::c_void,
@@ -635,7 +659,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(ABI_VERSION, 6);
+        assert_eq!(ABI_VERSION, 7);
         assert_eq!(STATUS_DEFERRED, 2);
     }
 

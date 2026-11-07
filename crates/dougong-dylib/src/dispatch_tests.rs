@@ -124,7 +124,11 @@ unsafe extern "C" fn driver_descriptor(out: *mut u8, cap: usize, out_len: *mut u
     }
 }
 
-unsafe extern "C" fn driver_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn driver_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -311,7 +315,11 @@ unsafe extern "C" fn listener_descriptor(out: *mut u8, cap: usize, out_len: *mut
     }
 }
 
-unsafe extern "C" fn listener_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn listener_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     if host.is_null() {
         return std::ptr::null_mut();
     }

@@ -160,7 +160,11 @@ unsafe extern "C" fn dispatch_listener_descriptor(
     }
 }
 
-unsafe extern "C" fn dispatch_listener_setup(_host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn dispatch_listener_setup(
+    _host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     Box::into_raw(Box::new(0u8)).cast::<std::ffi::c_void>()
 }
 
@@ -372,13 +376,21 @@ unsafe extern "C" fn ring2_descriptor(out: *mut u8, cap: usize, len: *mut usize)
     }
 }
 
-unsafe extern "C" fn ring1_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn ring1_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     // SAFETY: valid for the duration of `setup`; copied by value (v3).
     *RING1_HOST.lock().expect("ring1 vtable slot") = Some(SendVtable(unsafe { *host }));
     Box::into_raw(Box::new(0u8)).cast::<std::ffi::c_void>()
 }
 
-unsafe extern "C" fn ring2_setup(host: *const HostExports) -> *mut std::ffi::c_void {
+unsafe extern "C" fn ring2_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
     // SAFETY: as `ring1_setup`.
     *RING2_HOST.lock().expect("ring2 vtable slot") = Some(SendVtable(unsafe { *host }));
     Box::into_raw(Box::new(0u8)).cast::<std::ffi::c_void>()

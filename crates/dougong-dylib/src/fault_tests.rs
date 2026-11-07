@@ -61,7 +61,11 @@ unsafe extern "C" fn fault_descriptor(out: *mut u8, cap: usize, len: *mut usize)
     }
 }
 
-unsafe extern "C" fn fault_setup(_host: *const HostExports) -> *mut std::os::raw::c_void {
+unsafe extern "C" fn fault_setup(
+    _host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::os::raw::c_void {
     // One live byte per activation; the teardowns release it.
     Box::into_raw(Box::new(0_u8)).cast::<std::os::raw::c_void>()
 }
