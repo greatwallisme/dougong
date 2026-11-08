@@ -96,9 +96,10 @@ The dougong host offers the 16 MiB reply ceiling on the *first* provider
 invocation, so a legal reply fits without a retry; a `STATUS_CAPACITY` reply
 at the ceiling is a hard protocol failure, not a retry. On the outbound
 side, a caller's `STATUS_CAPACITY` retry is answered from the deferred reply
-of the original call - the target method is never re-invoked. Do not design
-a method that relies on a CAPACITY retry to re-run it with more room: it
-will not run twice.
+of the original call - successful or a post-execution failure detail, with
+the original status preserved - so the target method is never re-invoked.
+Do not design a method that relies on a CAPACITY retry to re-run it with
+more room: it will not run twice.
 
 ## State, call, teardown
 

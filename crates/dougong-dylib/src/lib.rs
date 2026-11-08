@@ -147,10 +147,11 @@ enum PendingKey {
     },
 }
 
-/// One deferred reply and the request it answers.
+/// One deferred reply, its original status, and the request it answers.
 struct PendingReply {
     key: PendingKey,
     reply: Vec<u8>,
+    status: i32,
 }
 
 fn require_key(activation: &Activation, service: &str, method: u32, payload: &[u8]) -> PendingKey {
@@ -175,26 +176,30 @@ fn dispatch_key(activation: &Activation, event: &[u8], mode: u32, payload: &[u8]
 /// request on this thread) is discarded first. The caller's original
 /// CAPACITY response already proved the method ran, so the retry must not
 /// invoke it again.
-fn take_pending_reply(key: &PendingKey) -> Option<Vec<u8>> {
+fn take_pending_reply(key: &PendingKey) -> Option<(Vec<u8>, i32)> {
     PENDING_REPLY.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.as_ref().is_none_or(|pending| &pending.key != key) {
             *slot = None;
             return None;
         }
-        slot.take().map(|pending| pending.reply)
+        slot.take().map(|pending| (pending.reply, pending.status))
     })
 }
 
-fn store_pending_reply(key: PendingKey, reply: Vec<u8>) {
-    PENDING_REPLY.with(|slot| *slot.borrow_mut() = Some(PendingReply { key, reply }));
+fn store_pending_reply(key: PendingKey, reply: Vec<u8>, status: i32) {
+    PENDING_REPLY.with(|slot| {
+        *slot.borrow_mut() = Some(PendingReply { key, reply, status });
+    });
 }
 
-/// Writes a reply into the caller's buffer; on overflow the reply is
-/// deferred so the caller's CAPACITY retry never re-runs the method.
+/// Writes a reply into the caller's buffer; on overflow the reply and its
+/// original status are deferred so the caller's CAPACITY retry never
+/// re-runs the method.
 fn write_reply_or_defer(
     reply: Vec<u8>,
     key: PendingKey,
+    status: i32,
     out_buf: *mut u8,
     cap: usize,
     out_len: *mut usize,
@@ -202,9 +207,40 @@ fn write_reply_or_defer(
     // SAFETY: caller-owned buffer contract (the host honors the same
     // contract it requires of plugin exports).
     if unsafe { write_out(&reply, out_buf, cap, out_len) } {
-        STATUS_OK
+        status
     } else {
-        store_pending_reply(key, reply);
+        store_pending_reply(key, reply, status);
+        STATUS_CAPACITY
+    }
+}
+
+/// The failure-detail twin of [`write_reply_or_defer`]: a method that
+/// executed and then failed can also produce a detail larger than the
+/// caller's buffer. Deferring the detail and the original status keeps the
+/// caller's CAPACITY retry from executing the method a second time.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the detail triple, the original status, and the caller buffer mirror the vtable reply shape"
+)]
+fn write_detail_or_defer(
+    key: PendingKey,
+    code: &str,
+    class: &str,
+    message: &str,
+    status: i32,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    let detail = serde_json::json!({ "code": code, "class": class, "message": message });
+    let Ok(bytes) = serde_json::to_vec(&detail) else {
+        return status;
+    };
+    // SAFETY: caller-owned buffer contract (see `write_reply_or_defer`).
+    if unsafe { write_out(&bytes, out_buf, cap, out_len) } {
+        status
+    } else {
+        store_pending_reply(key, bytes, status);
         STATUS_CAPACITY
     }
 }
@@ -841,8 +877,8 @@ fn require_impl(
     // SAFETY: vtable input contract.
     let payload = unsafe { input_slice(in_data, in_len) };
     let key = require_key(activation, service, method, payload);
-    if let Some(reply) = take_pending_reply(&key) {
-        return write_reply_or_defer(reply, key, out_buf, cap, out_len);
+    if let Some((reply, status)) = take_pending_reply(&key) {
+        return write_reply_or_defer(reply, key, status, out_buf, cap, out_len);
     }
     // Step 1: descriptor injection bypasses the grant table entirely (G7).
     // A static miss consults the name index; an absent name is the legacy
@@ -912,8 +948,8 @@ fn settle_require(
     // SAFETY: vtable input contract.
     let payload = unsafe { input_slice(in_data, in_len) };
     let key = require_key(activation, service, method, payload);
-    if let Some(reply) = take_pending_reply(&key) {
-        return write_reply_or_defer(reply, key, out_buf, cap, out_len);
+    if let Some((reply, status)) = take_pending_reply(&key) {
+        return write_reply_or_defer(reply, key, status, out_buf, cap, out_len);
     }
     let payload = payload.to_vec();
     let bytes_in = payload.len();
@@ -950,21 +986,22 @@ fn settle_require(
     };
     activation.ctx.logger().log_record(&record);
     match outcome {
-        Ok(bytes) => write_reply_or_defer(bytes, key, out_buf, cap, out_len),
+        Ok(bytes) => write_reply_or_defer(bytes, key, STATUS_OK, out_buf, cap, out_len),
         Err(err) => {
             let status = if err.code == "reentrancy_cycle" {
                 STATUS_REENTRANCY
             } else {
                 STATUS_FAILED
             };
-            write_detail(
-                out_buf,
-                cap,
-                out_len,
+            write_detail_or_defer(
+                key,
                 err.code,
                 err.class.as_str(),
                 &err.message,
                 status,
+                out_buf,
+                cap,
+                out_len,
             )
         }
     }
@@ -1203,18 +1240,19 @@ impl ReplyBuffer {
                 } else {
                     // Defer the settled value so the caller's CAPACITY retry
                     // never re-runs the listener chain.
-                    store_pending_reply(key, bytes.into_owned());
+                    store_pending_reply(key, bytes.into_owned(), STATUS_OK);
                     STATUS_CAPACITY
                 }
             }
-            Err(err) => write_detail(
-                self.out_buf,
-                self.cap,
-                self.out_len,
+            Err(err) => write_detail_or_defer(
+                key,
                 err.code,
                 err.class.as_str(),
                 &err.message,
                 STATUS_FAILED,
+                self.out_buf,
+                self.cap,
+                self.out_len,
             ),
         }
     }
@@ -1291,8 +1329,15 @@ fn dispatch_impl(
     // A CAPACITY retry from this thread is answered from the deferred
     // settled value: the listener chain must not run twice.
     let key = dispatch_key(activation, event_bytes, mode, payload_bytes);
-    if let Some(pending) = take_pending_reply(&key) {
-        return write_reply_or_defer(pending, key, reply.out_buf, reply.cap, reply.out_len);
+    if let Some((pending, status)) = take_pending_reply(&key) {
+        return write_reply_or_defer(
+            pending,
+            key,
+            status,
+            reply.out_buf,
+            reply.cap,
+            reply.out_len,
+        );
     }
     // B6 posture gate (D32): dispatch must originate on a plugin-owned
     // thread. A foreign entry frame means the calling thread holds that

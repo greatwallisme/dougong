@@ -3,6 +3,19 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.7.3] - 2026-11-09
+
+### 修复：失败 detail 也走延迟回包（补齐 0.7.2 的单次执行承诺）
+
+0.7.2 只对**成功**回包做了延迟：`write_detail` 在失败 detail 放不下调用方缓冲
+时仍返回 `STATUS_CAPACITY`，调用方倍增后重试会**再次执行**已失败的有副作用
+方法（`session/append` 已落盘后报错、`drain` 已消费后失败），与"容量重试绝不
+二次执行"的承诺矛盾。本版把失败 detail 与原 status 一并延迟
+（`PendingReply.status`）：重试直接写回 detail 并返回原
+`STATUS_FAILED`/`STATUS_REENTRANCY`，provider 方法只执行一次。仅执行前的
+协议拒绝（undeclared/inactive/非法参数）仍走普通 detail。回归钉测
+`require_capacity_retry_keeps_the_failure_detail`。
+
 ## [0.7.2] - 2026-11-09
 
 ### 修复：容量重试不再二次执行有副作用的方法（缓冲区协议语义修订）

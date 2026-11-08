@@ -16,9 +16,9 @@ workspace = true
 tokio = { workspace = true }
 
 [dependencies]
-dougong = { path = "../dougong", version = "0.7.2" }
-dougong-dylib = { path = "../dougong-dylib", version = "0.7.2" }
-dougong-wasm = { path = "../dougong-wasm", version = "0.7.2" }
+dougong = { path = "../dougong", version = "0.7.3" }
+dougong-dylib = { path = "../dougong-dylib", version = "0.7.3" }
+dougong-wasm = { path = "../dougong-wasm", version = "0.7.3" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

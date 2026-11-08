@@ -2755,3 +2755,83 @@ async fn require_capacity_retry_reuses_the_reply() {
     drop(unsafe { Arc::from_raw(raw.cast::<super::Activation>()) });
     ctx.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Failure details are deferred too: a failed method runs exactly once
+// ---------------------------------------------------------------------------
+
+/// Invocations of [`large_failure_call`].
+static LARGE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// The provider's failure-detail size (above any small caller buffer).
+const LARGE_DETAIL_LEN: usize = 10_000;
+
+unsafe extern "C" fn large_failure_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _in_data: *const u8,
+    _in_len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    LARGE_FAILURES.fetch_add(1, Ordering::SeqCst);
+    let detail = vec![b'f'; LARGE_DETAIL_LEN];
+    // SAFETY: host buffer contract; the detail is the callee's diagnostic.
+    if unsafe { write_out(&detail, out, cap, out_len) } {
+        STATUS_FAILED
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+static LARGE_FAILURE_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: large_name,
+    descriptor: large_descriptor,
+    setup: large_setup,
+    call: large_failure_call,
+    on_event: large_on_event,
+    on_next: large_on_next,
+    teardown: large_teardown,
+};
+
+/// A method that executed and then failed with a detail larger than the
+/// caller's buffer: the retry must return the original failure status and
+/// detail without executing the method again.
+#[tokio::test]
+async fn require_capacity_retry_keeps_the_failure_detail() {
+    let _guard = LARGE_LOCK.lock().await;
+    LARGE_FAILURES.store(0, Ordering::SeqCst);
+    let ctx = Context::new();
+    let invoker = Invoker::new(Arc::new(DylibInvoke {
+        exports: Exports {
+            table: &raw const LARGE_FAILURE_TABLE,
+            _lib: None,
+        },
+        handle: Handle(std::ptr::null_mut()),
+        lock: InstanceLock::default(),
+        instance_id: 100,
+        alive: Arc::new(AtomicBool::new(true)),
+    }));
+    ctx.provide("svc-large-fail", invoker)
+        .await
+        .expect("provide");
+    let raw = bare_activation(&ctx, &["svc-large-fail"]);
+    // SAFETY: `raw` names the live activation above.
+    let (status, _) = unsafe { raw_require_cap(raw, b"svc-large-fail", 0, b"", 4096) };
+    assert_eq!(status, STATUS_CAPACITY);
+    assert_eq!(LARGE_FAILURES.load(Ordering::SeqCst), 1);
+    // SAFETY: same live activation; the retry fits the full detail.
+    let (status, detail) = unsafe { raw_require_cap(raw, b"svc-large-fail", 0, b"", 32 * 1024) };
+    assert_eq!(status, STATUS_FAILED);
+    assert!(detail.len() > LARGE_DETAIL_LEN);
+    assert_eq!(
+        LARGE_FAILURES.load(Ordering::SeqCst),
+        1,
+        "the failure retry must not re-run the method"
+    );
+    // SAFETY: unique reclaim; no further vtable calls.
+    drop(unsafe { Arc::from_raw(raw.cast::<super::Activation>()) });
+    ctx.stop().await;
+}
