@@ -10,7 +10,7 @@
 //! Every test builds its own `Context` root, so parallel test threads share
 //! nothing but the stateless static tables.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -2557,5 +2557,201 @@ async fn teardown_joins_a_requiring_worker_without_deadlock() {
         QUIESCE_DISPATCH_GONE.load(Ordering::SeqCst),
         "the worker's dispatch must unwind at the gate with provider_gone"
     );
+    ctx.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Capacity retries never re-execute a side-effecting method
+// ---------------------------------------------------------------------------
+
+/// Invocations of [`large_call`]; the two tests below reset it under
+/// [`LARGE_LOCK`].
+static LARGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Serializes the two capacity tests (the static table and counter are
+/// shared by the parallel test runner).
+static LARGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The reply size used to force the caller's growable-buffer path.
+const LARGE_REPLY_LEN: usize = 10_000;
+
+unsafe extern "C" fn large_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe { write_out(b"fake-large", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn large_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"fake-large","provide":["svc-large"],"inject":[],"listen":{}}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn large_setup(
+    _host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn large_call(
+    _handle: *mut std::ffi::c_void,
+    _method: u32,
+    _in_data: *const u8,
+    _in_len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    LARGE_CALLS.fetch_add(1, Ordering::SeqCst);
+    let reply = vec![b'x'; LARGE_REPLY_LEN];
+    // SAFETY: host buffer contract.
+    if unsafe { write_out(&reply, out, cap, out_len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn large_on_event(
+    _handle: *mut std::ffi::c_void,
+    _event: u32,
+    _mode: u32,
+    _in_data: *const u8,
+    _in_len: usize,
+    _next_available: u32,
+    _out: *mut u8,
+    _cap: usize,
+    _out_len: *mut usize,
+) -> i32 {
+    STATUS_FAILED
+}
+
+unsafe extern "C" fn large_on_next(
+    _handle: *mut std::ffi::c_void,
+    _event: u32,
+    _chain_status: i32,
+    _data: *const u8,
+    _len: usize,
+    _out: *mut u8,
+    _cap: usize,
+    _out_len: *mut usize,
+) -> i32 {
+    STATUS_FAILED
+}
+
+unsafe extern "C" fn large_teardown(_handle: *mut std::ffi::c_void) {}
+
+static LARGE_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: large_name,
+    descriptor: large_descriptor,
+    setup: large_setup,
+    call: large_call,
+    on_event: large_on_event,
+    on_next: large_on_next,
+    teardown: large_teardown,
+};
+
+/// One `host_require` with an explicit caller-buffer size.
+unsafe fn raw_require_cap(
+    host: *mut std::ffi::c_void,
+    service: &[u8],
+    method: u32,
+    payload: &[u8],
+    cap: usize,
+) -> (i32, Vec<u8>) {
+    let mut buf = vec![0_u8; cap];
+    let mut len = 0_usize;
+    // SAFETY: `host` names a live activation built by `bare_activation`;
+    // buffers are caller-owned.
+    let status = unsafe {
+        host_require(
+            host,
+            service.as_ptr(),
+            service.len(),
+            method,
+            payload.as_ptr(),
+            payload.len(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut len,
+        )
+    };
+    buf.truncate(len);
+    (status, buf)
+}
+
+/// The host calls a side-effecting provider method exactly once even when
+/// its 10 KiB reply exceeds the first buffer: the provider-side buffer
+/// starts at the ABI reply ceiling.
+#[tokio::test]
+async fn call_full_executes_the_method_once() {
+    let _guard = LARGE_LOCK.lock().await;
+    LARGE_CALLS.store(0, Ordering::SeqCst);
+    let exports = Exports {
+        table: &raw const LARGE_TABLE,
+        _lib: None,
+    };
+    let handle = Handle(std::ptr::null_mut());
+    let reply = exports
+        .call_full(&handle, 1, b"")
+        .expect("the reply fits the ceiling");
+    assert_eq!(reply.len(), LARGE_REPLY_LEN);
+    assert_eq!(
+        LARGE_CALLS.load(Ordering::SeqCst),
+        1,
+        "a side-effecting method must run exactly once"
+    );
+}
+
+/// The caller's CAPACITY retry is served from the deferred reply; the
+/// provider method does not run a second time.
+#[tokio::test]
+async fn require_capacity_retry_reuses_the_reply() {
+    let _guard = LARGE_LOCK.lock().await;
+    LARGE_CALLS.store(0, Ordering::SeqCst);
+    let ctx = Context::new();
+    let invoker = Invoker::new(Arc::new(DylibInvoke {
+        exports: Exports {
+            table: &raw const LARGE_TABLE,
+            _lib: None,
+        },
+        handle: Handle(std::ptr::null_mut()),
+        lock: InstanceLock::default(),
+        instance_id: 99,
+        alive: Arc::new(AtomicBool::new(true)),
+    }));
+    ctx.provide("svc-large", invoker).await.expect("provide");
+    let raw = bare_activation(&ctx, &["svc-large"]);
+    // SAFETY: `raw` names the live activation above.
+    let (status, _) = unsafe { raw_require_cap(raw, b"svc-large", 0, b"", 4096) };
+    assert_eq!(status, STATUS_CAPACITY);
+    assert_eq!(LARGE_CALLS.load(Ordering::SeqCst), 1);
+    // SAFETY: same live activation; the retry fits the full reply.
+    let (status, reply) = unsafe { raw_require_cap(raw, b"svc-large", 0, b"", 16 * 1024) };
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(reply.len(), LARGE_REPLY_LEN);
+    assert_eq!(
+        LARGE_CALLS.load(Ordering::SeqCst),
+        1,
+        "the CAPACITY retry must not re-run the method"
+    );
+    // SAFETY: unique reclaim; no further vtable calls.
+    drop(unsafe { Arc::from_raw(raw.cast::<super::Activation>()) });
     ctx.stop().await;
 }

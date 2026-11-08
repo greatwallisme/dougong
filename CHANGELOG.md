@@ -3,6 +3,38 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.7.2] - 2026-11-09
+
+### 修复：容量重试不再二次执行有副作用的方法（缓冲区协议语义修订）
+
+症状（fly-rafter `fr headless` 真实验收）：真实模型流式回答超过首个回包缓冲
+（宿主 4096 字节起步）时，调用方重试 `require` 使 provider 的 `drain` 第二次
+执行——第一次已把批次取走并在 `done` 时退休该代，第二次必得
+`unknown generation`；未 done 时则静默丢块。表现为"简单短答偶发、长回答必踩"，
+且流已完整交付后仍以 `TRANSPORT` 失败收尾。
+
+根因：`Exports::call_full` / `dispatch_event` / `deliver_next` 以 4096 字节
+起步，遇 `STATUS_CAPACITY` 倍增缓冲后**重新调用** provider 导出；而 provider
+的 `call` 是先执行方法、后 `write_out`。调用方侧同理：`settle_require` 写
+caller 缓冲失败返回 `STATUS_CAPACITY`，调用方倍增后重试 `host_require`，再次
+执行 provider。`realm_spawn` 早已有"副作用前判容量"的单独例外，通用 `call`
+没有。
+
+修复：
+
+- provider 侧首调即 16 MiB ABI 回包上限（`REPLY_POOL` 池化复用）；上限仍
+  报 `STATUS_CAPACITY` = 硬协议失败，绝不重调。
+- caller 侧 `STATUS_CAPACITY` 重试命中线程局部延迟回包槽 `PENDING_REPLY`
+  （按调用激活 + service/method/payload 或 event/mode/payload 键），直接
+  写回，结果不重入 provider。`dispatch` 的 await 模式同轨。
+- 仅 `name` / `descriptor` 等幂等元数据导出保留倍增重试。
+
+兼容性：导出签名与 `ABI_VERSION`（7）不变；这是宿主缓冲区协议的行为语义
+修订，旧工件可继续加载。回归钉测：
+`call_full_executes_the_method_once`、`require_capacity_retry_reuses_the_reply`、
+`call_offers_the_reply_ceiling_and_never_retries`。发布序：abi → kernel →
+dylib → loader（签名未变，全仓版本仍同步）。
+
 ## [0.7.0] - 2026-11-07
 
 ### ABI v7：dylib 激活配置送达（破坏性变更，D34）

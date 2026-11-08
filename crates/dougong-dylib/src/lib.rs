@@ -116,6 +116,123 @@ std::thread_local! {
     static ENTRY_STACK: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+std::thread_local! {
+    /// The reply of one side-effecting call whose write-back did not fit
+    /// the caller's buffer. The immediate CAPACITY retry from the same
+    /// thread and request is served from this slot instead of invoking the
+    /// provider again: a callee method must execute exactly once even when
+    /// its reply triggers the caller's growable-buffer protocol.
+    static PENDING_REPLY: std::cell::RefCell<Option<PendingReply>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Request identity of one deferred reply (see [`PENDING_REPLY`]).
+#[derive(PartialEq, Eq)]
+enum PendingKey {
+    /// One `require`/`realm_require` request.
+    Require {
+        /// The calling activation (the retry comes from the same one).
+        activation: usize,
+        service: String,
+        method: u32,
+        payload: Vec<u8>,
+    },
+    /// One await-style `dispatch` request.
+    Dispatch {
+        /// The calling activation (the retry comes from the same one).
+        activation: usize,
+        event: String,
+        mode: u32,
+        payload: Vec<u8>,
+    },
+}
+
+/// One deferred reply and the request it answers.
+struct PendingReply {
+    key: PendingKey,
+    reply: Vec<u8>,
+}
+
+fn require_key(activation: &Activation, service: &str, method: u32, payload: &[u8]) -> PendingKey {
+    PendingKey::Require {
+        activation: std::ptr::from_ref(activation) as usize,
+        service: service.to_owned(),
+        method,
+        payload: payload.to_vec(),
+    }
+}
+
+fn dispatch_key(activation: &Activation, event: &[u8], mode: u32, payload: &[u8]) -> PendingKey {
+    PendingKey::Dispatch {
+        activation: std::ptr::from_ref(activation) as usize,
+        event: String::from_utf8_lossy(event).into_owned(),
+        mode,
+        payload: payload.to_vec(),
+    }
+}
+
+/// Takes the deferred reply matching `key`; a stale entry (a different
+/// request on this thread) is discarded first. The caller's original
+/// CAPACITY response already proved the method ran, so the retry must not
+/// invoke it again.
+fn take_pending_reply(key: &PendingKey) -> Option<Vec<u8>> {
+    PENDING_REPLY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_none_or(|pending| &pending.key != key) {
+            *slot = None;
+            return None;
+        }
+        slot.take().map(|pending| pending.reply)
+    })
+}
+
+fn store_pending_reply(key: PendingKey, reply: Vec<u8>) {
+    PENDING_REPLY.with(|slot| *slot.borrow_mut() = Some(PendingReply { key, reply }));
+}
+
+/// Writes a reply into the caller's buffer; on overflow the reply is
+/// deferred so the caller's CAPACITY retry never re-runs the method.
+fn write_reply_or_defer(
+    reply: Vec<u8>,
+    key: PendingKey,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    // SAFETY: caller-owned buffer contract (the host honors the same
+    // contract it requires of plugin exports).
+    if unsafe { write_out(&reply, out_buf, cap, out_len) } {
+        STATUS_OK
+    } else {
+        store_pending_reply(key, reply);
+        STATUS_CAPACITY
+    }
+}
+
+/// Provider-call reply buffers sit at the ABI ceiling so a legal reply
+/// fits the first call: the callee may have performed side effects before
+/// `write_out`, so a CAPACITY retry would execute the method twice. The
+/// pool amortizes the 16 MiB allocation across calls; `Exports` owns the
+/// ceiling definition.
+static REPLY_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Idle buffers kept for reuse (in-flight buffers are always returned).
+const REPLY_POOL_IDLE: usize = 4;
+
+fn take_reply_buffer() -> Vec<u8> {
+    REPLY_POOL
+        .lock()
+        .pop()
+        .unwrap_or_else(|| vec![0_u8; Exports::MAX_OUTPUT_BYTES])
+}
+
+fn release_reply_buffer(buf: Vec<u8>) {
+    let mut pool = REPLY_POOL.lock();
+    if pool.len() < REPLY_POOL_IDLE {
+        pool.push(buf);
+    }
+}
+
 /// True when `id` is executing a foreign entry on this thread right now.
 fn entered_on_this_thread(id: u64) -> bool {
     ENTRY_STACK.with(|stack| stack.borrow().contains(&id))
@@ -719,6 +836,14 @@ fn require_impl(
             STATUS_UNDECLARED,
         );
     };
+    // A CAPACITY retry from this thread is answered from the deferred
+    // reply of the original call: the provider method must not run twice.
+    // SAFETY: vtable input contract.
+    let payload = unsafe { input_slice(in_data, in_len) };
+    let key = require_key(activation, service, method, payload);
+    if let Some(reply) = take_pending_reply(&key) {
+        return write_reply_or_defer(reply, key, out_buf, cap, out_len);
+    }
     // Step 1: descriptor injection bypasses the grant table entirely (G7).
     // A static miss consults the name index; an absent name is the legacy
     // undeclared path with byte-identical detail (C1/C3).
@@ -785,7 +910,12 @@ fn settle_require(
     out_len: *mut usize,
 ) -> i32 {
     // SAFETY: vtable input contract.
-    let payload = unsafe { input_slice(in_data, in_len) }.to_vec();
+    let payload = unsafe { input_slice(in_data, in_len) };
+    let key = require_key(activation, service, method, payload);
+    if let Some(reply) = take_pending_reply(&key) {
+        return write_reply_or_defer(reply, key, out_buf, cap, out_len);
+    }
+    let payload = payload.to_vec();
     let bytes_in = payload.len();
     // O7: the outbound leg of a cross-boundary call carries the guest
     // fiber's own identity (realm logger, trace id) and the call outcome.
@@ -820,14 +950,7 @@ fn settle_require(
     };
     activation.ctx.logger().log_record(&record);
     match outcome {
-        Ok(bytes) => {
-            // SAFETY: caller-owned buffer protocol.
-            if unsafe { write_out(&bytes, out_buf, cap, out_len) } {
-                STATUS_OK
-            } else {
-                STATUS_CAPACITY
-            }
-        }
+        Ok(bytes) => write_reply_or_defer(bytes, key, out_buf, cap, out_len),
         Err(err) => {
             let status = if err.code == "reentrancy_cycle" {
                 STATUS_REENTRANCY
@@ -1058,6 +1181,7 @@ impl ReplyBuffer {
     /// with the detail triple.
     fn write_settled(
         self,
+        key: PendingKey,
         settled: dougong::Result<Value>,
         reference: &Value,
         original_bytes: &[u8],
@@ -1077,6 +1201,9 @@ impl ReplyBuffer {
                 if unsafe { write_out(&bytes, self.out_buf, self.cap, self.out_len) } {
                     STATUS_OK
                 } else {
+                    // Defer the settled value so the caller's CAPACITY retry
+                    // never re-runs the listener chain.
+                    store_pending_reply(key, bytes.into_owned());
                     STATUS_CAPACITY
                 }
             }
@@ -1161,6 +1288,12 @@ fn dispatch_impl(
     payload_bytes: &[u8],
     reply: ReplyBuffer,
 ) -> i32 {
+    // A CAPACITY retry from this thread is answered from the deferred
+    // settled value: the listener chain must not run twice.
+    let key = dispatch_key(activation, event_bytes, mode, payload_bytes);
+    if let Some(pending) = take_pending_reply(&key) {
+        return write_reply_or_defer(pending, key, reply.out_buf, reply.cap, reply.out_len);
+    }
     // B6 posture gate (D32): dispatch must originate on a plugin-owned
     // thread. A foreign entry frame means the calling thread holds that
     // instance's lock; a chain listener requiring that instance would park
@@ -1228,7 +1361,7 @@ fn dispatch_impl(
                 MODE_BAIL => drive(&activation.rt, activation.ctx.bail(event, value)),
                 _ => drive(&activation.rt, activation.ctx.parallel(event, value)),
             };
-            reply.write_settled(settled, &reference, payload_bytes)
+            reply.write_settled(key, settled, &reference, payload_bytes)
         }
         _ => reply.write_failure(
             "invalid_dispatch_mode",
@@ -1362,53 +1495,53 @@ impl Exports {
     /// One service call: payload on success; on [`STATUS_FAILED`] the
     /// callee's best-effort UTF-8 diagnostic rides the error message (v3
     /// contract; failure is final, never retried).
+    ///
+    /// The callee executes the method before `write_out`, so a CAPACITY
+    /// retry would execute it twice. The first call therefore offers the
+    /// ABI's maximum legal reply size; a reply above the ceiling is a hard
+    /// protocol failure, never a re-execution.
     fn call_full(&self, handle: &Handle, method: u32, payload: &[u8]) -> Result<Vec<u8>> {
         let table = self.table;
         let handle = handle.0;
         let op = format!("call(method={method})");
-        let mut cap = 4096_usize;
-        loop {
-            let mut buf = vec![0_u8; cap];
-            let mut len = 0_usize;
-            // SAFETY: handle came from `setup` and was not yet torn down;
-            // buffer contract as above.
-            let status = unsafe {
-                ((*table).call)(
-                    handle,
-                    method,
-                    payload.as_ptr(),
-                    payload.len(),
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                    &raw mut len,
-                )
-            };
-            match status {
-                STATUS_OK => return Ok(buf[..len].to_vec()),
-                STATUS_CAPACITY => {
-                    cap = cap.saturating_mul(2);
-                    if cap > Self::MAX_OUTPUT_BYTES {
-                        return Err(Error::transport(
-                            "ffi_status",
-                            format!("dylib {op} output exceeds {} bytes", Self::MAX_OUTPUT_BYTES),
-                        ));
-                    }
-                }
-                STATUS_FAILED => {
-                    let detail = String::from_utf8_lossy(&buf[..len]);
-                    return Err(Error::new(
-                        "service_error",
-                        format!("dylib {op} failed: {detail}"),
-                    ));
-                }
-                other => {
-                    return Err(Error::transport(
-                        "ffi_status",
-                        format!("dylib {op} failed with status {other}"),
-                    ));
-                }
+        let mut buf = take_reply_buffer();
+        let mut len = 0_usize;
+        // SAFETY: handle came from `setup` and was not yet torn down;
+        // buffer contract as above.
+        let status = unsafe {
+            ((*table).call)(
+                handle,
+                method,
+                payload.as_ptr(),
+                payload.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
+            )
+        };
+        let reply = match status {
+            STATUS_OK => Ok(buf[..len].to_vec()),
+            STATUS_CAPACITY => Err(Error::transport(
+                "ffi_status",
+                format!(
+                    "dylib {op} output exceeds the {} byte ABI reply ceiling",
+                    Self::MAX_OUTPUT_BYTES
+                ),
+            )),
+            STATUS_FAILED => {
+                let detail = String::from_utf8_lossy(&buf[..len]);
+                Err(Error::new(
+                    "service_error",
+                    format!("dylib {op} failed: {detail}"),
+                ))
             }
-        }
+            other => Err(Error::transport(
+                "ffi_status",
+                format!("dylib {op} failed with status {other}"),
+            )),
+        };
+        release_reply_buffer(buf);
+        reply
     }
 
     /// One event dispatch result: the plugin's status plus its output.
@@ -1422,41 +1555,37 @@ impl Exports {
     ) -> Result<(i32, Vec<u8>)> {
         let table = self.table;
         let handle = handle.0;
-        let mut cap = 4096_usize;
-        loop {
-            let mut buf = vec![0_u8; cap];
-            let mut len = 0_usize;
-            // SAFETY: handle came from `setup` and was not yet torn down;
-            // buffer contract as above.
-            let status = unsafe {
-                ((*table).on_event)(
-                    handle,
-                    event,
-                    mode,
-                    payload.as_ptr(),
-                    payload.len(),
-                    next_available,
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                    &raw mut len,
-                )
-            };
-            match status {
-                dougong_abi::STATUS_CAPACITY => {
-                    cap = cap.saturating_mul(2);
-                    if cap > Self::MAX_OUTPUT_BYTES {
-                        return Err(Error::transport(
-                            "ffi_status",
-                            format!(
-                                "dylib on_event(event={event}) output exceeds {} bytes",
-                                Self::MAX_OUTPUT_BYTES
-                            ),
-                        ));
-                    }
-                }
-                other => return Ok((other, buf[..len].to_vec())),
-            }
-        }
+        // Same reply-ceiling rule as `call_full`: a listener may have
+        // performed side effects before writing its reply.
+        let mut buf = take_reply_buffer();
+        let mut len = 0_usize;
+        // SAFETY: handle came from `setup` and was not yet torn down;
+        // buffer contract as above.
+        let status = unsafe {
+            ((*table).on_event)(
+                handle,
+                event,
+                mode,
+                payload.as_ptr(),
+                payload.len(),
+                next_available,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
+            )
+        };
+        let reply = match status {
+            dougong_abi::STATUS_CAPACITY => Err(Error::transport(
+                "ffi_status",
+                format!(
+                    "dylib on_event(event={event}) output exceeds the {} byte ABI reply ceiling",
+                    Self::MAX_OUTPUT_BYTES
+                ),
+            )),
+            other => Ok((other, buf[..len].to_vec())),
+        };
+        release_reply_buffer(buf);
+        reply
     }
 
     fn deliver_next(
@@ -1468,53 +1597,45 @@ impl Exports {
     ) -> Result<Vec<u8>> {
         let table = self.table;
         let handle = handle.0;
-        let mut cap = 4096_usize;
-        loop {
-            let mut buf = vec![0_u8; cap];
-            let mut len = 0_usize;
-            // SAFETY: handle came from `setup`; the deferred continuation is
-            // still open (see the instance-lock contract); buffer protocol
-            // as above.
-            let status = unsafe {
-                ((*table).on_next)(
-                    handle,
-                    event,
-                    chain_status,
-                    data.as_ptr(),
-                    data.len(),
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                    &raw mut len,
-                )
-            };
-            match status {
-                dougong_abi::STATUS_CAPACITY => {
-                    cap = cap.saturating_mul(2);
-                    if cap > Self::MAX_OUTPUT_BYTES {
-                        return Err(Error::transport(
-                            "ffi_status",
-                            format!(
-                                "dylib on_next(event={event}) output exceeds {} bytes",
-                                Self::MAX_OUTPUT_BYTES
-                            ),
-                        ));
-                    }
-                }
-                dougong_abi::STATUS_OK => return Ok(buf[..len].to_vec()),
-                dougong_abi::STATUS_DEFERRED => {
-                    return Err(Error::transport(
-                        "ffi_status",
-                        "dylib on_next returned STATUS_DEFERRED, which is a contract violation",
-                    ));
-                }
-                other => {
-                    return Err(Error::transport(
-                        "ffi_status",
-                        format!("dylib on_next(event={event}) failed with status {other}"),
-                    ));
-                }
-            }
-        }
+        // Same reply-ceiling rule as `call_full`: the continuation listener
+        // may have performed side effects before writing its reply.
+        let mut buf = take_reply_buffer();
+        let mut len = 0_usize;
+        // SAFETY: handle came from `setup`; the deferred continuation is
+        // still open (see the instance-lock contract); buffer protocol
+        // as above.
+        let status = unsafe {
+            ((*table).on_next)(
+                handle,
+                event,
+                chain_status,
+                data.as_ptr(),
+                data.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
+            )
+        };
+        let reply = match status {
+            dougong_abi::STATUS_CAPACITY => Err(Error::transport(
+                "ffi_status",
+                format!(
+                    "dylib on_next(event={event}) output exceeds the {} byte ABI reply ceiling",
+                    Self::MAX_OUTPUT_BYTES
+                ),
+            )),
+            dougong_abi::STATUS_OK => Ok(buf[..len].to_vec()),
+            dougong_abi::STATUS_DEFERRED => Err(Error::transport(
+                "ffi_status",
+                "dylib on_next returned STATUS_DEFERRED, which is a contract violation",
+            )),
+            other => Err(Error::transport(
+                "ffi_status",
+                format!("dylib on_next(event={event}) failed with status {other}"),
+            )),
+        };
+        release_reply_buffer(buf);
+        reply
     }
 
     fn teardown(&self, handle: &Handle) {
@@ -2422,28 +2543,25 @@ mod tests {
         );
     }
 
-    /// Yields `STATUS_CAPACITY` exactly once, then succeeds: the host must
-    /// retry with a larger buffer instead of failing the call.
-    static CAPACITY_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    /// Records the offered buffer size and always reports CAPACITY: the
+    /// host must offer the ABI reply ceiling on the first call and must
+    /// never re-run a side-effecting method after a capacity response.
+    static CAPACITY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CAPACITY_OFFERED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
-    unsafe extern "C" fn capacity_then_ok_call(
+    unsafe extern "C" fn capacity_call(
         _handle: *mut std::os::raw::c_void,
         _method: u32,
         _data: *const u8,
         _len: usize,
-        out: *mut u8,
+        _out: *mut u8,
         cap: usize,
-        out_len: *mut usize,
+        _out_len: *mut usize,
     ) -> i32 {
-        if CAPACITY_ARM.swap(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            return dougong_abi::STATUS_CAPACITY;
-        }
-        // SAFETY: host buffer contract.
-        if unsafe { write_out(b"second", out, cap, out_len) } {
-            STATUS_OK
-        } else {
-            dougong_abi::STATUS_CAPACITY
-        }
+        CAPACITY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        CAPACITY_OFFERED.store(cap, std::sync::atomic::Ordering::SeqCst);
+        dougong_abi::STATUS_CAPACITY
     }
 
     static RETRY_TABLE: PluginExports = PluginExports {
@@ -2451,19 +2569,31 @@ mod tests {
         name: fake_name,
         descriptor: fake_descriptor,
         setup: fake_setup,
-        call: capacity_then_ok_call,
+        call: capacity_call,
         on_event: fake_on_event,
         on_next: fake_on_next,
         teardown: fake_teardown,
     };
 
     #[test]
-    fn call_retries_after_status_capacity() {
+    fn call_offers_the_reply_ceiling_and_never_retries() {
+        CAPACITY_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        CAPACITY_OFFERED.store(0, std::sync::atomic::Ordering::SeqCst);
         let plugin = from_static(&RETRY_TABLE).expect("adapter builds");
-        let outcome = plugin
+        let error = plugin
             .exports
-            .call_full(&Handle(std::ptr::null_mut()), 0, b"");
-        assert_eq!(outcome.expect("retry succeeds"), b"second");
+            .call_full(&Handle(std::ptr::null_mut()), 0, b"")
+            .expect_err("capacity at the reply ceiling is final");
+        assert!(error.to_string().contains("reply ceiling"), "{error}");
+        assert_eq!(
+            CAPACITY_OFFERED.load(std::sync::atomic::Ordering::SeqCst),
+            super::Exports::MAX_OUTPUT_BYTES
+        );
+        assert_eq!(
+            CAPACITY_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the method must not be retried"
+        );
     }
 
     unsafe extern "C" fn failing_call(

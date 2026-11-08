@@ -85,11 +85,20 @@ activation time through `apply`, not through descriptor fields.
 ## The buffer protocol (all callbacks)
 
 Caller-owned buffers: write at most `cap` bytes into `out_buf`, store the
-written length in `out_len`, return `STATUS_CAPACITY` when it does not fit -
-the host retries with a doubled buffer (bounded at 16 MiB). Always use
-`dougong_abi::write_out` - never hand-roll the pointer math. Input `in_data`
-is valid for `in_len` readable bytes. The plugin never allocates anything
-the host must free, and vice versa.
+written length in `out_len`, return `STATUS_CAPACITY` when it does not fit.
+Always use `dougong_abi::write_out` - never hand-roll the pointer math. Input
+`in_data` is valid for `in_len` readable bytes. The plugin never allocates
+anything the host must free, and vice versa.
+
+**Single-execution rule (ABI v7 semantics):** a side-effecting export
+(`call`, `on_event`, `on_next`) executes at most once per host invocation.
+The dougong host offers the 16 MiB reply ceiling on the *first* provider
+invocation, so a legal reply fits without a retry; a `STATUS_CAPACITY` reply
+at the ceiling is a hard protocol failure, not a retry. On the outbound
+side, a caller's `STATUS_CAPACITY` retry is answered from the deferred reply
+of the original call - the target method is never re-invoked. Do not design
+a method that relies on a CAPACITY retry to re-run it with more room: it
+will not run twice.
 
 ## State, call, teardown
 
@@ -180,7 +189,8 @@ pub struct HostExports {
   resolves the `Invoker` in the calling activation's realm and drives the
   future for you - the calling thread does not need a tokio runtime. The out
   buffer follows the same growable protocol (`STATUS_CAPACITY` = retry with a
-  doubled buffer); input payloads are uncapped. Statuses: `STATUS_OK`,
+  larger buffer); the retry is served from the deferred reply, so the target
+  method never runs twice. Input payloads are uncapped. Statuses: `STATUS_OK`,
   `STATUS_CAPACITY`, `STATUS_UNDECLARED` (neither injected nor granted),
   `STATUS_INACTIVE` (no committed provider), `STATUS_REENTRANCY`
   (same-thread cycle), `STATUS_FAILED` (target's own error, or the
