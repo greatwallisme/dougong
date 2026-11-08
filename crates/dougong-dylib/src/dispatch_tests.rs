@@ -283,6 +283,7 @@ const EVT_FAIL: u32 = 4;
 const EVT_ORDER: u32 = 5;
 const EVT_SERIAL: u32 = 6;
 const EVT_REQUIRE_LOOP: u32 = 7;
+const EVT_EMPTY_OK: u32 = 8;
 
 static ON_NEXT_HITS: AtomicU64 = AtomicU64::new(0);
 
@@ -303,7 +304,7 @@ unsafe extern "C" fn listener_descriptor(out: *mut u8, cap: usize, out_len: *mut
     // SAFETY: host buffer contract.
     if unsafe {
         write_out(
-            br#"{"name":"dispatch-listener","provide":["svc-listener"],"inject":["svc-dispatcher"],"listen":{"evt-echo":1,"evt-veto":2,"evt-fail":4,"evt-order":5,"evt-serial":6,"evt-req":7}}"#,
+            br#"{"name":"dispatch-listener","provide":["svc-listener"],"inject":["svc-dispatcher"],"listen":{"evt-echo":1,"evt-veto":2,"evt-fail":4,"evt-order":5,"evt-serial":6,"evt-req":7,"evt-empty-ok":8}}"#,
             out,
             cap,
             out_len,
@@ -388,6 +389,9 @@ unsafe extern "C" fn listener_on_event(
             write_raw(&transformed, out, cap, out_len);
             STATUS_DEFERRED
         }
+        // A void consume: STATUS_OK with no output bytes — the
+        // fire-and-forget modes (emit/parallel) must accept it.
+        EVT_EMPTY_OK => STATUS_OK,
         // EVT_FAIL lands here: a bare `STATUS_FAILED` reply is the contract
         // for a failing listener, same as any unknown event id.
         _ => STATUS_FAILED,
@@ -691,6 +695,25 @@ async fn listener_failure_is_request_visible() {
     assert_eq!(detail["code"], "listener_failed");
     assert_eq!(detail["class"], "logic");
     assert_ne!(detail["message"].as_str().expect("message"), "");
+}
+
+/// A dylib listener that consumes an event in emit or parallel mode with a
+/// void (empty) OK reply is not an error: those modes discard listener
+/// results (fire-and-forget; failure aggregation only), and in-process
+/// listeners always produce a Value (Null when unspecified). The 0.7.0
+/// catch-all decoded the empty reply and produced a spurious
+/// `payload_codec` `listener_failure` per consumed event (fly-rafter
+/// 2026-11-08 real-run finding, one record per streamed LLM chunk).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn void_ok_reply_is_not_an_error_in_emit_and_parallel() {
+    let ctx = boot().await;
+    // Parallel aggregates listener failures into the dispatch result, so
+    // it is the discriminating mode: the empty reply must settle OK.
+    let (status, _reply) =
+        dispatch_join(&ctx, "evt-empty-ok", MODE_PARALLEL, json!({ "n": 1 })).await;
+    assert_eq!(status, STATUS_OK);
+    let (status, _reply) = dispatch_join(&ctx, "evt-empty-ok", MODE_EMIT, json!({ "n": 2 })).await;
+    assert_eq!(status, STATUS_OK);
 }
 
 /// E1.7: deterministic input validation — non-JSON payload, `internal/*`

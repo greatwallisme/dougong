@@ -1616,6 +1616,13 @@ impl dougong::Invoke for DylibInvoke {
     }
 }
 
+/// Decodes one bridge payload with the shared `payload_codec` transport
+/// error (the decode sites below all classify identically).
+fn decode_payload(bytes: &[u8]) -> Result<Value> {
+    serde_json::from_slice(bytes)
+        .map_err(|err| Error::transport("payload_codec", format!("decode payload: {err}")))
+}
+
 /// Builds the mode-aware bridge for one listened event (ABI v2 CPS, D14).
 ///
 /// The instance lock spans the whole invocation including a deferred
@@ -1683,13 +1690,9 @@ fn event_bridge(
                     // continues with; empty output continues with the
                     // original.
                     let value: Value = if reply.is_empty() {
-                        serde_json::from_slice(&bytes).map_err(|err| {
-                            Error::transport("payload_codec", format!("decode payload: {err}"))
-                        })?
+                        decode_payload(&bytes)?
                     } else {
-                        serde_json::from_slice(&reply).map_err(|err| {
-                            Error::transport("payload_codec", format!("decode payload: {err}"))
-                        })?
+                        decode_payload(&reply)?
                     };
                     // The lock keeps spanning the whole invocation, so the
                     // continuation polls must keep seeing this instance as a
@@ -1724,9 +1727,40 @@ fn event_bridge(
                     "listener_failed",
                     format!("dylib on_event(event={event_id}) failed"),
                 )),
-                _ => serde_json::from_slice(&reply).map_err(|err| {
-                    Error::transport("payload_codec", format!("decode payload: {err}"))
-                }),
+                // Waterfall: a synchronous OK carries the continuation
+                // payload; an empty reply continues with the original,
+                // mirroring the DEFERRED empty-output rule above.
+                _ if waterfall => {
+                    let value: Value = if reply.is_empty() {
+                        decode_payload(&bytes)?
+                    } else {
+                        decode_payload(&reply)?
+                    };
+                    Ok(value)
+                }
+                // Serial/bail: the reply is the bail-or-continue payload
+                // (the in-process contract: Null continues, anything else
+                // bails), so it stays strict — an empty reply is malformed.
+                _ if mode == DispatchMode::Serial || mode == DispatchMode::Bail => {
+                    decode_payload(&reply)
+                }
+                // Emit/parallel: the kernel discards listener results
+                // (fire-and-forget; failure aggregation only), so a void
+                // reply is legitimate — in-process listeners always
+                // produce a Value (Null when unspecified). Decoding the
+                // empty reply produced a spurious `decode payload: EOF`
+                // listener_failure for every event a dylib listener
+                // consumed (fly-rafter 2026-11-08 real-run finding, one
+                // record per streamed LLM chunk).
+                _ => {
+                    if reply.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        serde_json::from_slice(&reply).map_err(|err| {
+                            Error::transport("payload_codec", format!("decode payload: {err}"))
+                        })
+                    }
+                }
             }
         })
     })
