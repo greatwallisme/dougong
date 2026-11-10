@@ -2195,6 +2195,13 @@ fn open_exports(path: &Path) -> Result<Exports> {
         Error::transport("plugin_load", format!("dlopen {}: {err}", path.display()))
     })?;
     let lib = Arc::new(lib);
+    // R1 (dougong-design.md 6): every mapping is process-lifetime and
+    // teardown-only — dlclose is forbidden, so a version swap needs a
+    // restart. Leaking one strong reference keeps the count above zero,
+    // which stops libloading's `Drop` from ever running dlclose when the
+    // last activation retires (a 0.7.4 fix: retiring the only live slot
+    // used to dlclose mid-teardown and crash the process).
+    std::mem::forget(Arc::clone(&lib));
     // SAFETY: the symbol lives in the just-mapped library, which the
     // `Arc<Library>` kept alongside keeps alive.
     let table: libloading::Symbol<*const PluginExports> =
@@ -2889,5 +2896,58 @@ mod wait_graph_tests {
             "cancellation must clean up the armed edges"
         );
         drop(gate);
+    }
+
+    /// R1 regression pin: images are process-lifetime. Loading a plugin,
+    /// dropping every reference, then reloading the SAME path after the
+    /// file bytes changed must serve the resident image, not the new
+    /// bytes — dlclose never runs, so a version swap needs a restart.
+    #[test]
+    fn image_residency_survives_a_full_drop() {
+        // The probe needs two real dylib artifacts (2026-11-04 artifact
+        // ruling twin: fail loud with the build instruction, never skip).
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(exe) = std::env::current_exe().ok()
+            && let Some(dir) = exe.parent()
+        {
+            // target/debug/deps/<exe> → target/debug → target
+            if let Some(parent) = dir.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+        let find = |slug: &str| -> std::path::PathBuf {
+            let file = format!("lib{slug}.so");
+            dirs.iter()
+                .map(|dir| dir.join(&file))
+                .find(|path| path.exists())
+                .unwrap_or_else(|| {
+                    panic!("artifact {file} missing; run `cargo build --workspace` first")
+                })
+        };
+        let greeter = find("greeter_plugin");
+        let partner = find("grant_partner");
+        let dir = std::env::temp_dir().join(format!("dougong-r1-{}", next_instance_id()));
+        std::fs::create_dir_all(&dir).expect("probe dir created");
+        let probe = dir.join("libprobe.so");
+        std::fs::copy(&greeter, &probe).expect("probe v1 copied");
+        let first = load(&probe).expect("the probe loads");
+        assert_eq!(first.name(), "greeter");
+        drop(first);
+        // Swap the bytes at the same path, then reload: the resident image
+        // must keep serving — dlclose never runs (R1), so the new bytes are
+        // ignored until a process restart. The swap goes through a fresh
+        // inode (stage + rename): rewriting a mapped image in place poisons
+        // it (lazy faults read the new bytes), which would test glibc's
+        // mapped-file hazards instead of dougong's residency.
+        let staged = dir.join("libprobe-staged.so");
+        std::fs::copy(&partner, &staged).expect("probe v2 staged");
+        std::fs::rename(&staged, &probe).expect("probe v2 swapped");
+        let second = load(&probe).expect("the probe reloads");
+        assert_eq!(
+            second.name(),
+            "greeter",
+            "the resident image still serves; the swapped bytes need a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

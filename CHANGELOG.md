@@ -3,6 +3,28 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.7.4] - 2026-11-11
+
+### 修复：dylib 镜像进程级常驻——最后一次 retire 不再 dlclose（R1 兑现）
+
+症状（fly-rafter fr 级钉测 `dylib_images_are_never_unloaded` 证据链）：最后一
+个活跃槽 retire 后 `Arc<Library>` 落到零，libloading 的 `Drop` 执行 `dlclose`
+卸载代码镜像；随后同路径重插会重新 dlopen——磁盘上已换版本的工件字节被静默
+加载（进程内版本热替换，R1 明令禁止），且在镜像被原地覆写污染的场景下 dlclose
+于 glibc 关闭机制内直接 SIGSEGV。
+
+根因：`open_exports` 只把 `Arc<Library>` 存在插件对象的 `Exports._lib` 里，
+没有进程级持有者；设计安全注释写着 "dougong keeps every plugin mapped for
+the process lifetime (D5)"，但兑现缺失。
+
+修复：`open_exports` 泄漏一份强引用（`std::mem::forget`），映射计数永不归零，
+libloading 的 Drop（唯一 dlclose 站点）永不执行——每个 .so 文件进程内仅映射
+一次、teardown-only、换版本即重启进程，与 R1 裁决逐字对齐。泄漏有界（不同
+工件路径数 × 单次映射）。回归钉测
+`image_residency_survives_a_full_drop`（全弃引用 + 同路径换字节重载，仍服务
+旧镜像；换字节经 stage+rename 新 inode——原地覆写已映射镜像会污染懒加载页，
+那是 glibc 映射文件危险面，不是 dougong 的被测语义）。
+
 ## [0.7.3] - 2026-11-09
 
 ### 修复：失败 detail 也走延迟回包（补齐 0.7.2 的单次执行承诺）
