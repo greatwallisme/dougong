@@ -807,6 +807,36 @@ fn drive<T>(rt: &tokio::runtime::Handle, future: impl Future<Output = T>) -> Res
     Ok(block_on(future))
 }
 
+/// Marks the calling thread as a sanctioned kernel lane and returns the
+/// restore guard.
+///
+/// A kernel lane is a host-owned plain thread that drives kernel futures
+/// with its own park loop (the host's equivalent of [`drive`]) while the
+/// runtime thread stays free to service the tokio driver. Blocking drives
+/// on such a thread are safe — its parks own the waits — so the marker
+/// exempts the thread from the [`drive`] `runtime_starvation` refusal for
+/// the guard's lifetime. Drop the guard when the lane exits.
+///
+/// This is the companion of the fly-rafter kernel-lane carrier (the
+/// 2026-11-11 fail-closed contract): a host thread that is neither a
+/// plugin-owned worker nor a marked lane and sits inside a current-thread
+/// runtime context is the one configuration `drive` refuses.
+#[must_use]
+pub fn enter_kernel_lane() -> LaneGuard {
+    DRIVE_ENTERED_CURRENT_THREAD.with(|cell| cell.set(true));
+    LaneGuard
+}
+
+/// Restores the lane marker on drop.
+#[derive(Debug)]
+pub struct LaneGuard;
+
+impl Drop for LaneGuard {
+    fn drop(&mut self) {
+        DRIVE_ENTERED_CURRENT_THREAD.with(|cell| cell.set(false));
+    }
+}
+
 /// Minimal std-only `block_on`: parks the current thread until the future's
 /// waker unparks it; spurious wakeups simply re-poll through the loop.
 fn block_on<F: Future>(future: F) -> F::Output {
