@@ -745,14 +745,66 @@ fn write_detail(
     }
 }
 
+// Whether this thread has already entered a current-thread runtime
+// context through `drive` itself: a nested `drive` on the same thread
+// re-enters that context legally (the outer park owns the wait), so only
+// the first entry on a thread whose runtime context pre-existed — the
+// runtime's own driver thread — is the starvation hazard.
+thread_local! {
+    static DRIVE_ENTERED_CURRENT_THREAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Restores the previous thread-local marker on drop (nested drives keep
+/// the marker set until the outermost drive completes).
+struct DriveMarker(bool);
+
+impl Drop for DriveMarker {
+    fn drop(&mut self) {
+        DRIVE_ENTERED_CURRENT_THREAD.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Drives `future` to completion on the calling thread with the runtime
 /// context entered (D-V3-4 baseline). Polling never leaves the calling
 /// thread, which keeps the reentrancy stack exact on this path, works on
 /// plugin-owned threads and runtime workers alike, and never depends on the
 /// calling thread being inside tokio.
-fn drive<T>(rt: &tokio::runtime::Handle, future: impl Future<Output = T>) -> T {
+///
+/// One configuration is refused (fail-closed, the 2026-11-11 fly-rafter
+/// real-run deadlock): calling `drive` from the driver thread of a
+/// current-thread runtime. The hand-rolled `block_on` below parks that
+/// thread with a bare `std::thread::park`, which starves the runtime's
+/// timer/IO driver and every spawned task — the wakeups the driven future
+/// waits for can then never be serviced, and the caller deadlocks silently
+/// (a host pump task issuing a `require` from the runtime thread is the
+/// canonical shape). Hosts must marshal such calls onto plugin-owned
+/// threads or multi-thread runtime workers; nested `drive`s on a thread
+/// that itself entered the context through `drive` stay legal.
+///
+/// # Errors
+///
+/// Returns the `runtime_starvation` logic error when called on the driver
+/// thread of a current-thread runtime.
+fn drive<T>(rt: &tokio::runtime::Handle, future: impl Future<Output = T>) -> Result<T, Error> {
+    let hazard = tokio::runtime::Handle::try_current().is_ok_and(|current| {
+        current.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread
+    }) && !DRIVE_ENTERED_CURRENT_THREAD.with(std::cell::Cell::get);
+    if hazard {
+        return Err(Error::new(
+            "runtime_starvation",
+            "blocking drive() on the driver thread of a current-thread runtime starves its \
+             timer/IO driver and spawned tasks; marshal the call onto a plugin-owned thread",
+        ));
+    }
+    let flavor = rt.runtime_flavor();
+    let _marker = (flavor == tokio::runtime::RuntimeFlavor::CurrentThread).then(|| {
+        let previous = DRIVE_ENTERED_CURRENT_THREAD.with(std::cell::Cell::get);
+        DRIVE_ENTERED_CURRENT_THREAD.with(|cell| cell.set(true));
+        DriveMarker(previous)
+    });
     let _runtime = rt.enter();
-    block_on(future)
+    Ok(block_on(future))
 }
 
 /// Minimal std-only `block_on`: parks the current thread until the future's
@@ -956,7 +1008,8 @@ fn settle_require(
     // O7: the outbound leg of a cross-boundary call carries the guest
     // fiber's own identity (realm logger, trace id) and the call outcome.
     let started = std::time::Instant::now();
-    let outcome = drive(&activation.rt, invoker.call(method, payload));
+    let outcome: Result<Vec<u8>, Error> =
+        drive(&activation.rt, invoker.call(method, payload)).flatten();
     let duration = started.elapsed();
     let record = match &outcome {
         Ok(bytes) => dougong::LogRecord::new(
@@ -1401,10 +1454,11 @@ fn dispatch_impl(
                     activation
                         .ctx
                         .waterfall(event, value, |value| Box::pin(async move { Ok(value) })),
-                ),
-                MODE_SERIAL => drive(&activation.rt, activation.ctx.serial(event, value)),
-                MODE_BAIL => drive(&activation.rt, activation.ctx.bail(event, value)),
-                _ => drive(&activation.rt, activation.ctx.parallel(event, value)),
+                )
+                .flatten(),
+                MODE_SERIAL => drive(&activation.rt, activation.ctx.serial(event, value)).flatten(),
+                MODE_BAIL => drive(&activation.rt, activation.ctx.bail(event, value)).flatten(),
+                _ => drive(&activation.rt, activation.ctx.parallel(event, value)).flatten(),
             };
             reply.write_settled(key, settled, &reference, payload_bytes)
         }
@@ -2780,7 +2834,8 @@ mod tests {
             })
         })
         .join()
-        .expect("driver thread did not panic");
+        .expect("driver thread did not panic")
+        .expect("drive succeeds off the driver thread");
         assert_eq!(outcome, 42);
     }
 }

@@ -305,13 +305,13 @@ fn spawn_impl(activation: &Activation, realm: u64, path: &[u8], reply: ReplyBuff
             Ok::<_, dougong::Error>((handle, joined, plugin))
         }
     });
-    let (handle, joined, plugin) = match settled {
+    let (handle, joined, plugin) = match settled.flatten() {
         Ok(triple) => triple,
         Err(err) => {
             // `plugin()` itself failed (e.g. the caller is unloading): no
             // fiber was spawned, but the registry runtime record exists and
             // must go.
-            drive(&activation.rt, activation.ctx.uninstall(&plugin));
+            let _ = drive(&activation.rt, activation.ctx.uninstall(&plugin));
             return RealmFailure::from_error(&err).write(reply);
         }
     };
@@ -321,7 +321,7 @@ fn spawn_impl(activation: &Activation, realm: u64, path: &[u8], reply: ReplyBuff
         (joined, _) => {
             // Failed or not settled: dispose the fiber and reclaim the
             // registry record so the failure leaves no residue.
-            drive(&activation.rt, async {
+            let _ = drive(&activation.rt, async {
                 handle.dispose().await;
                 activation.ctx.uninstall(&plugin).await;
             });
@@ -377,7 +377,7 @@ fn retire_impl(activation: &Activation, child: u64) -> Result<(), RealmFailure> 
     };
     // Dispose the fiber, then reclaim the registry runtime record (the Eq. 31
     // cascade covers the fiber only).
-    drive(&activation.rt, async {
+    let _ = drive(&activation.rt, async {
         handle.dispose().await;
         activation.ctx.uninstall(&plugin).await;
     });

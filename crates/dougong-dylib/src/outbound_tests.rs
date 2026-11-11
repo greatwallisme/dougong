@@ -955,6 +955,54 @@ fn bare_activation_with_provide(
 }
 
 /// Drives `host_require` and returns (status, detail-or-payload).
+/// The Send wrapper for a raw activation pointer handed to the scoped
+/// require worker (the pointer targets live test-owned state).
+struct RawHost(*mut std::ffi::c_void);
+// SAFETY: the raw pointer targets an activation that outlives the scoped
+// worker; the worker only passes it back into `host_require`.
+unsafe impl Send for RawHost {}
+
+/// Issues one require from a plugin-owned scoped thread: the outbound
+/// contract refuses blocking drives on a current-thread runtime's driver
+/// thread (the `#[tokio::test]` harness thread is exactly that), so the
+/// harness calls ride a worker thread like real plugin threads do.
+unsafe fn off_driver_require(
+    host: *mut std::ffi::c_void,
+    service: &[u8],
+    method: u32,
+    payload: &[u8],
+    buf: &mut [u8],
+) -> (i32, usize) {
+    let shared = RawHost(host);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            // A whole-struct move capture: a bare `shared.0` reference
+            // would capture the raw pointer field alone (disjoint
+            // capture) and lose the Send wrapper.
+            let shared = shared;
+            let mut len = 0_usize;
+            // SAFETY: `host` names a live activation built by
+            // `bare_activation`; the buffers are caller-owned and the
+            // scoped worker joins before any of them drop.
+            let status = unsafe {
+                host_require(
+                    shared.0,
+                    service.as_ptr(),
+                    service.len(),
+                    method,
+                    payload.as_ptr(),
+                    payload.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &raw mut len,
+                )
+            };
+            (status, len)
+        });
+        worker.join().expect("the require worker joins")
+    })
+}
+
 unsafe fn raw_require(
     host: *mut std::ffi::c_void,
     service: &[u8],
@@ -962,22 +1010,9 @@ unsafe fn raw_require(
     payload: &[u8],
 ) -> (i32, Vec<u8>) {
     let mut buf = vec![0_u8; 4096];
-    let mut len = 0_usize;
     // SAFETY: `host` names a live activation built by `bare_activation`;
     // buffers are caller-owned.
-    let status = unsafe {
-        host_require(
-            host,
-            service.as_ptr(),
-            service.len(),
-            method,
-            payload.as_ptr(),
-            payload.len(),
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut len,
-        )
-    };
+    let (status, len) = unsafe { off_driver_require(host, service, method, payload, &mut buf) };
     buf.truncate(len);
     (status, buf)
 }
@@ -1105,13 +1140,53 @@ async fn same_thread_self_reentry_is_a_deterministic_error() {
     // Simulate executing inside instance 42 on this thread, then requiring
     // the service that resolves to instance 42: the entry check must reject
     // before the (non-reentrant) instance lock self-deadlocks.
-    let entry = EntryGuard::enter(42);
-    // SAFETY: `raw` names the live activation above.
-    let (status, detail) = unsafe { raw_require(raw, b"svc-a", 0, b"") };
-    assert_eq!(status, STATUS_REENTRANCY);
+    // The entry guard and the require share ONE plain thread (the
+    // reentrancy marker is thread-local): the outbound contract refuses
+    // blocking drives on a current-thread runtime's driver thread, so the
+    // pair runs on a scoped worker instead of the harness thread.
+    let shared = RawHost(raw);
+    let outcome = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let shared = shared;
+                let entry = EntryGuard::enter(42);
+                // The guard and the require share this one worker thread
+                // (the reentrancy marker is thread-local), so the call goes
+                // through `host_require` directly: `raw_require` would
+                // spawn its own grandchild thread without the marker.
+                let mut buf = vec![0_u8; 4096];
+                let mut len = 0_usize;
+                // SAFETY: `raw` names the live activation above; buffers
+                // are caller-owned.
+                let status = unsafe {
+                    host_require(
+                        shared.0,
+                        b"svc-a".as_ptr(),
+                        b"svc-a".len(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                        &raw mut len,
+                    )
+                };
+                buf.truncate(len);
+                drop(entry);
+                (status, buf)
+            })
+            .join()
+            .expect("the reentry worker joins")
+    });
+    let (status, detail) = outcome;
+    assert_eq!(
+        status,
+        STATUS_REENTRANCY,
+        "detail: {}",
+        String::from_utf8_lossy(&detail)
+    );
     let detail: Value = serde_json::from_slice(&detail).expect("detail is JSON");
     assert_eq!(detail["code"], "reentrancy_cycle");
-    drop(entry);
 
     // SAFETY: unique reclaim; no further vtable calls.
     drop(unsafe { Arc::from_raw(raw.cast::<super::Activation>()) });
@@ -2668,34 +2743,6 @@ static LARGE_TABLE: PluginExports = PluginExports {
 };
 
 /// One `host_require` with an explicit caller-buffer size.
-unsafe fn raw_require_cap(
-    host: *mut std::ffi::c_void,
-    service: &[u8],
-    method: u32,
-    payload: &[u8],
-    cap: usize,
-) -> (i32, Vec<u8>) {
-    let mut buf = vec![0_u8; cap];
-    let mut len = 0_usize;
-    // SAFETY: `host` names a live activation built by `bare_activation`;
-    // buffers are caller-owned.
-    let status = unsafe {
-        host_require(
-            host,
-            service.as_ptr(),
-            service.len(),
-            method,
-            payload.as_ptr(),
-            payload.len(),
-            buf.as_mut_ptr(),
-            buf.len(),
-            &raw mut len,
-        )
-    };
-    buf.truncate(len);
-    (status, buf)
-}
-
 /// The host calls a side-effecting provider method exactly once even when
 /// its 10 KiB reply exceeds the first buffer: the provider-side buffer
 /// starts at the ABI reply ceiling.
@@ -2738,12 +2785,14 @@ async fn require_capacity_retry_reuses_the_reply() {
     }));
     ctx.provide("svc-large", invoker).await.expect("provide");
     let raw = bare_activation(&ctx, &["svc-large"]);
-    // SAFETY: `raw` names the live activation above.
-    let (status, _) = unsafe { raw_require_cap(raw, b"svc-large", 0, b"", 4096) };
+    // The original call and its CAPACITY retry ride ONE worker thread: the
+    // deferred reply is thread-local to the caller, so the retry must come
+    // from the same thread (the outbound caller contract).
+    let outcomes = two_step_require(raw, "svc-large", 4096, 16 * 1024);
+    let (status, _) = outcomes.0;
     assert_eq!(status, STATUS_CAPACITY);
     assert_eq!(LARGE_CALLS.load(Ordering::SeqCst), 1);
-    // SAFETY: same live activation; the retry fits the full reply.
-    let (status, reply) = unsafe { raw_require_cap(raw, b"svc-large", 0, b"", 16 * 1024) };
+    let (status, reply) = outcomes.1;
     assert_eq!(status, STATUS_OK);
     assert_eq!(reply.len(), LARGE_REPLY_LEN);
     assert_eq!(
@@ -2757,8 +2806,102 @@ async fn require_capacity_retry_reuses_the_reply() {
 }
 
 // ---------------------------------------------------------------------------
+/// The fail-closed starvation guard: a require issued from the driver
+/// thread of a current-thread runtime refuses with the `runtime_starvation`
+/// error instead of silently starving the timer/IO driver (the 2026-11-11
+/// fly-rafter real-run deadlock).
+#[tokio::test]
+async fn require_from_a_current_thread_driver_refuses_fail_closed() {
+    let ctx = Context::new();
+    let invoker = Invoker::new(Arc::new(DylibInvoke {
+        exports: Exports {
+            table: &raw const TARGET_TABLE,
+            _lib: None,
+        },
+        handle: Handle(std::ptr::null_mut()),
+        lock: InstanceLock::default(),
+        instance_id: 7,
+        alive: Arc::new(AtomicBool::new(true)),
+    }));
+    ctx.provide("svc-a", invoker).await.expect("provide");
+    let raw = bare_activation(&ctx, &["svc-a"]);
+    // The harness thread IS the current-thread runtime's driver thread:
+    // the call goes through `host_require` directly (a `raw_require` worker
+    // would carry no runtime context and dodge the guard). The refusal
+    // fires inside `drive`, before the provider export runs.
+    let mut buf = vec![0_u8; 4096];
+    let mut len = 0_usize;
+    // SAFETY: `raw` names the live activation above; buffers are
+    // caller-owned.
+    let status = unsafe {
+        host_require(
+            raw,
+            b"svc-a".as_ptr(),
+            b"svc-a".len(),
+            0,
+            b"".as_ptr(),
+            0,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &raw mut len,
+        )
+    };
+    buf.truncate(len);
+    assert_eq!(status, STATUS_FAILED);
+    let detail: Value = serde_json::from_slice(&buf).expect("detail is JSON");
+    assert_eq!(detail["code"], "runtime_starvation");
+    // SAFETY: unique reclaim; the target export never ran.
+    drop(unsafe { Arc::from_raw(raw.cast::<super::Activation>()) });
+    ctx.stop().await;
+}
+
 // Failure details are deferred too: a failed method runs exactly once
 // ---------------------------------------------------------------------------
+
+/// Runs the original call and its CAPACITY retry on ONE worker thread
+/// (the deferred reply is thread-local to the caller) and returns both
+/// outcomes.
+fn two_step_require(
+    host: *mut std::ffi::c_void,
+    service: &str,
+    first_cap: usize,
+    retry_cap: usize,
+) -> ((i32, Vec<u8>), (i32, Vec<u8>)) {
+    let shared = RawHost(host);
+    let service = service.to_owned();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let shared = shared;
+                let step = |cap: usize| {
+                    let mut buf = vec![0_u8; cap];
+                    let mut len = 0_usize;
+                    // SAFETY: the activation is live and buffers are
+                    // caller-owned.
+                    let status = unsafe {
+                        host_require(
+                            shared.0,
+                            service.as_ptr(),
+                            service.len(),
+                            0,
+                            b"".as_ptr(),
+                            0,
+                            buf.as_mut_ptr(),
+                            buf.len(),
+                            &raw mut len,
+                        )
+                    };
+                    buf.truncate(len);
+                    (status, buf)
+                };
+                let first = step(first_cap);
+                let retry = step(retry_cap);
+                (first, retry)
+            })
+            .join()
+            .expect("the retry worker joins")
+    })
+}
 
 /// Invocations of [`large_failure_call`].
 static LARGE_FAILURES: AtomicUsize = AtomicUsize::new(0);
@@ -2818,12 +2961,13 @@ async fn require_capacity_retry_keeps_the_failure_detail() {
         .await
         .expect("provide");
     let raw = bare_activation(&ctx, &["svc-large-fail"]);
-    // SAFETY: `raw` names the live activation above.
-    let (status, _) = unsafe { raw_require_cap(raw, b"svc-large-fail", 0, b"", 4096) };
+    // The original call and its retry ride ONE worker thread (the deferred
+    // failure reply is thread-local to the caller).
+    let outcomes = two_step_require(raw, "svc-large-fail", 4096, 32 * 1024);
+    let (status, _) = outcomes.0;
     assert_eq!(status, STATUS_CAPACITY);
     assert_eq!(LARGE_FAILURES.load(Ordering::SeqCst), 1);
-    // SAFETY: same live activation; the retry fits the full detail.
-    let (status, detail) = unsafe { raw_require_cap(raw, b"svc-large-fail", 0, b"", 32 * 1024) };
+    let (status, detail) = outcomes.1;
     assert_eq!(status, STATUS_FAILED);
     assert!(detail.len() > LARGE_DETAIL_LEN);
     assert_eq!(
