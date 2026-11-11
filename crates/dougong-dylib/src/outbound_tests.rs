@@ -962,6 +962,15 @@ struct RawHost(*mut std::ffi::c_void);
 // worker; the worker only passes it back into `host_require`.
 unsafe impl Send for RawHost {}
 
+/// Spawns a throwaway lane for a hand-built `DylibInvoke` fixture. The
+/// acknowledgement is detached: the invoker's lane clone closes the
+/// channel when the test drops it, ending the thread.
+fn test_lane() -> crate::lane::Lane {
+    let (lane, ack) = crate::lane::spawn(9000).expect("lane spawns under test");
+    std::mem::forget(ack);
+    lane
+}
+
 /// Issues one require from a plugin-owned scoped thread: the outbound
 /// contract refuses blocking drives on a current-thread runtime's driver
 /// thread (the `#[tokio::test]` harness thread is exactly that), so the
@@ -1133,6 +1142,7 @@ async fn same_thread_self_reentry_is_a_deterministic_error() {
         lock: InstanceLock::default(),
         instance_id: 42,
         alive: Arc::new(AtomicBool::new(true)),
+        lane: test_lane(),
     }));
     ctx.provide("svc-a", invoker).await.expect("provide");
     let raw = bare_activation(&ctx, &["svc-a"]);
@@ -2782,6 +2792,7 @@ async fn require_capacity_retry_reuses_the_reply() {
         lock: InstanceLock::default(),
         instance_id: 99,
         alive: Arc::new(AtomicBool::new(true)),
+        lane: test_lane(),
     }));
     ctx.provide("svc-large", invoker).await.expect("provide");
     let raw = bare_activation(&ctx, &["svc-large"]);
@@ -2822,6 +2833,7 @@ async fn require_from_a_current_thread_driver_refuses_fail_closed() {
         lock: InstanceLock::default(),
         instance_id: 7,
         alive: Arc::new(AtomicBool::new(true)),
+        lane: test_lane(),
     }));
     ctx.provide("svc-a", invoker).await.expect("provide");
     let raw = bare_activation(&ctx, &["svc-a"]);
@@ -2956,6 +2968,7 @@ async fn require_capacity_retry_keeps_the_failure_detail() {
         lock: InstanceLock::default(),
         instance_id: 100,
         alive: Arc::new(AtomicBool::new(true)),
+        lane: test_lane(),
     }));
     ctx.provide("svc-large-fail", invoker)
         .await

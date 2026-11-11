@@ -90,6 +90,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
+mod lane;
 mod realm;
 
 /// Serializes every foreign call into one plugin instance (see the crate
@@ -314,9 +315,13 @@ fn chain_held() -> Vec<u64> {
 /// RAII guard: pushes `id` on creation, pops it on drop. Like
 /// [`EntryGuard`], it must never span an `.await` — task migration breaks
 /// the thread-local push/pop pairing; [`ChainPoll`] carries the chain across
-/// the one await-spanning lock hold instead.
+/// the one await-spanning lock hold instead. Test-only since the 2026-11-12
+/// lane root fix: production segments restore the chain explicitly
+/// ([`ChainRestore`]).
+#[cfg(test)]
 struct ChainGuard(u64);
 
+#[cfg(test)]
 impl ChainGuard {
     fn hold(id: u64) -> Self {
         LOCK_CHAIN.with(|chain| chain.borrow_mut().push(id));
@@ -324,8 +329,17 @@ impl ChainGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for ChainGuard {
     fn drop(&mut self) {
+        if std::env::var_os("FR_KERNEL_DEBUG").is_some() {
+            kdebug_log(&format!(
+                "[kdebug] lock-released instance={} thread={:?}#{:?}",
+                self.0,
+                std::thread::current().name(),
+                std::thread::current().id(),
+            ));
+        }
         LOCK_CHAIN.with(|chain| {
             let popped = chain.borrow_mut().pop();
             debug_assert_eq!(popped, Some(self.0), "lock chain pairing broken");
@@ -431,24 +445,160 @@ fn arm_wait_edges(held: Vec<u64>, target: u64) -> Result<WaitToken, Error> {
     ))
 }
 
-/// Lock guard paired with its lock-chain guard. The tuple drops fields in
-/// order, so the chain pops *before* the lock releases — the graph never
-/// names a released lock. Field order is load-bearing.
-type InstanceHold = (ChainGuard, OwnedMutexGuard<()>);
+/// Lock guard of one instance hold. The held-instance chain is a lane
+/// concept since the 2026-11-12 lane root fix: FFI segments restore it
+/// explicitly ([`ChainRestore`]), so the awaiting caller carries no
+/// thread-local chain across `.await` points.
+type InstanceHold = OwnedMutexGuard<()>;
 
-/// Acquires one instance lock under the full cross-instance discipline: wait
-/// edges armed while parking, the instance pushed on the lock chain while
-/// held. A fresh execution context pays only the empty-chain fast path.
+/// Acquires one instance lock under the full cross-instance discipline:
+/// wait edges armed while parking. The held-instance chain is restored by
+/// the marshaled FFI segment on the lane ([`ChainRestore`]); the awaiting
+/// caller carries no thread-local chain.
 ///
 /// # Errors
 ///
 /// `reentrancy_cycle` when the wait graph shows the parking would close a
 /// cycle (the caller's held locks loop back into `target`).
+/// Temporary stall diagnostics (`FR_KERNEL_DEBUG`, diagnostic only): proxy
+/// waker that records whether the acquisition waker actually fired.
+struct StallProxyWaker {
+    real: std::task::Waker,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::task::Wake for StallProxyWaker {
+    fn wake(self: Arc<Self>) {
+        self.fired.store(true, std::sync::atomic::Ordering::Release);
+        self.real.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.fired.store(true, std::sync::atomic::Ordering::Release);
+        self.real.wake_by_ref();
+    }
+}
+
+/// Temporary stall diagnostics (`FR_KERNEL_DEBUG`, diagnostic only): future
+/// wrapper installing the proxy waker and flagging grant completion.
+struct ObservedAcquire<F> {
+    fut: F,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    granted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<F: Future + Unpin> Future for ObservedAcquire<F> {
+    type Output = F::Output;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
+        // SAFETY: structural pinning; `fut` is the only pinned field and
+        // `F: Unpin` keeps the projection trivially sound.
+        let this = unsafe { self.get_unchecked_mut() };
+        let proxy = Arc::new(StallProxyWaker {
+            real: cx.waker().clone(),
+            fired: Arc::clone(&this.fired),
+        });
+        let waker = std::task::Waker::from(proxy);
+        let mut observed = std::task::Context::from_waker(&waker);
+        match std::pin::Pin::new(&mut this.fut).poll(&mut observed) {
+            Poll::Ready(out) => {
+                this.granted
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Poll::Ready(out)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Wall-clock stall bound for the diagnostic acquisition watchdog.
+const LOCK_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Temporary stall diagnostics (`FR_KERNEL_DEBUG`, diagnostic only): acquire
+/// the instance lock with the proxy-waker recorder and a wall-clock bound
+/// (std timer thread + oneshot, so no time driver is required). A stall
+/// past [`LOCK_STALL_BOUND`] logs `lock-stall` with the `waker_fired`
+/// verdict and fails deterministically instead of parking forever.
+async fn lock_with_stall_watch(
+    lock: InstanceLock,
+    instance_id: u64,
+) -> Result<OwnedMutexGuard<()>, Error> {
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let granted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (stall_tx, stall_rx) = tokio::sync::oneshot::channel::<()>();
+    let watch = std::thread::Builder::new()
+        .name("kdebug-stall-watch".to_string())
+        .spawn({
+            let fired = Arc::clone(&fired);
+            let granted = Arc::clone(&granted);
+            move || {
+                std::thread::sleep(LOCK_STALL_BOUND);
+                if granted.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                kdebug_log(&format!(
+                    "[kdebug] lock-stall instance={instance_id} waker_fired={} bound_s={}",
+                    fired.load(std::sync::atomic::Ordering::Acquire),
+                    LOCK_STALL_BOUND.as_secs(),
+                ));
+                let _ = stall_tx.send(());
+            }
+        });
+    let Ok(_watch) = watch else {
+        return Err(Error::transport(
+            "stall_watch",
+            "failed to spawn the diagnostic stall watchdog thread",
+        ));
+    };
+    let mut acquire = ObservedAcquire {
+        fut: Box::pin(lock.lock_owned()),
+        fired,
+        granted,
+    };
+    tokio::select! {
+        guard = &mut acquire => Ok(guard),
+        _ = stall_rx => Err(Error::new(
+            "lock_stall",
+            format!(
+                "instance {instance_id} lock grant stalled past {LOCK_STALL_BOUND:?} \
+                 (diagnostic watchdog; waker_fired recorded in the ledger)"
+            ),
+        )),
+    }
+}
+
 async fn enter_exclusive(lock: &InstanceLock, instance_id: u64) -> Result<InstanceHold, Error> {
-    let token = arm_wait_edges(chain_held(), instance_id)?;
-    let guard = Arc::clone(lock).lock_owned().await;
+    let held = chain_held();
+    let debug = std::env::var_os("FR_KERNEL_DEBUG").is_some();
+    if debug {
+        kdebug_log(&format!(
+            "[kdebug] lock-wait instance={instance_id} held={held:?} thread={:?}#{:?}",
+            std::thread::current().name(),
+            std::thread::current().id(),
+        ));
+    }
+    let token = arm_wait_edges(held, instance_id)?;
+    let guard = if debug {
+        match lock_with_stall_watch(Arc::clone(lock), instance_id).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                drop(token);
+                return Err(err);
+            }
+        }
+    } else {
+        Arc::clone(lock).lock_owned().await
+    };
     drop(token);
-    Ok((ChainGuard::hold(instance_id), guard))
+    if debug {
+        kdebug_log(&format!(
+            "[kdebug] lock-acquired instance={instance_id} thread={:?}#{:?}",
+            std::thread::current().name(),
+            std::thread::current().id(),
+        ));
+    }
+    let _ = instance_id;
+    Ok(guard)
 }
 
 /// Re-establishes a lock chain on every poll of `fut`. A deferred waterfall
@@ -481,6 +631,30 @@ impl<F: Future + Unpin> Future for ChainPoll<F> {
         LOCK_CHAIN.with(|chain| chain.borrow_mut().extend_from_slice(held));
         let _release = Release(held);
         std::pin::Pin::new(fut).poll(cx)
+    }
+}
+
+/// Re-establishes a captured held-instance chain on the execution thread
+/// of one marshaled FFI segment: nested `require`s issued inside the
+/// handler must arm wait edges against the same held set as before the
+/// segment crossed to the activation lane.
+struct ChainRestore(Vec<u64>);
+
+impl ChainRestore {
+    fn hold(held: Vec<u64>) -> Self {
+        LOCK_CHAIN.with(|chain| chain.borrow_mut().extend_from_slice(&held));
+        Self(held)
+    }
+}
+
+impl Drop for ChainRestore {
+    fn drop(&mut self) {
+        LOCK_CHAIN.with(|chain| {
+            let mut chain = chain.borrow_mut();
+            let keep = chain.len().saturating_sub(self.0.len());
+            debug_assert_eq!(&chain[keep..], &self.0, "lane chain pairing broken");
+            chain.truncate(keep);
+        });
     }
 }
 
@@ -551,6 +725,65 @@ std::thread_local! {
 /// empty-table gate must keep a grant-free process at zero).
 #[cfg(test)]
 static GRANT_LOCKS: AtomicU64 = AtomicU64::new(0);
+
+fn kdebug_log(msg: &str) {
+    use std::io::Write as _;
+    let path = format!("/tmp/kdebug_{}.log", std::process::id());
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{millis} {msg}");
+    }
+}
+
+/// One-time cached file-ledger gate: the environment cannot change under a
+/// running process, so the per-call lookups only need to pay once.
+fn kdebug_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FR_KERNEL_DEBUG").is_some())
+}
+
+/// Logs the closure-built line to the file ledger only when the gate is on;
+/// the format work must stay inside the closure so a gated-off run pays
+/// nothing.
+fn kdebug_maybe_log(build: impl FnOnce() -> String) {
+    if kdebug_on() {
+        kdebug_log(&build());
+    }
+}
+
+/// Scope guard for the file ledger: one `-end` line with elapsed
+/// microseconds when the gate is on. Create it behind
+/// `kdebug_on().then(..)` so a gated-off run never allocates the label.
+struct KScope {
+    label: String,
+    started: std::time::Instant,
+}
+
+impl Drop for KScope {
+    fn drop(&mut self) {
+        let label = &self.label;
+        kdebug_maybe_log(|| {
+            format!(
+                "[kdebug] {label}-end us={}",
+                self.started.elapsed().as_micros()
+            )
+        });
+    }
+}
+
+/// Lazy-label form: the label only allocates when the gate is on.
+fn kscope_if(build: impl FnOnce() -> String) -> Option<KScope> {
+    kdebug_on().then_some(KScope {
+        label: build(),
+        started: std::time::Instant::now(),
+    })
+}
 
 /// Converts a wedged test into a hard failure: a synchronous foreign call
 /// that deadlocks parks its polling thread, so `tokio::time::timeout` can
@@ -1039,6 +1272,18 @@ fn settle_require(
     // O7: the outbound leg of a cross-boundary call carries the guest
     // fiber's own identity (realm logger, trace id) and the call outcome.
     let started = std::time::Instant::now();
+    // Temporary file-ledger instrumentation (FR_KERNEL_DEBUG, diagnostic
+    // only): the require-issue line and its paired -end (KScope) — a missing
+    // -end pins the park site of a wedged require.
+    kdebug_maybe_log(|| {
+        format!(
+            "[kdebug] require-start caller={} svc={service} m={method} in={bytes_in} chain={:?} thread={:?}",
+            activation.instance_id,
+            chain_held(),
+            std::thread::current().name(),
+        )
+    });
+    let _scope = kscope_if(|| format!("require-end svc={service} m={method}"));
     let outcome: Result<Vec<u8>, Error> =
         drive(&activation.rt, invoker.call(method, payload)).flatten();
     let duration = started.elapsed();
@@ -1459,6 +1704,25 @@ fn dispatch_impl(
     let Ok(value) = serde_json::from_slice::<Value>(payload_bytes) else {
         return STATUS_INVALID_PAYLOAD;
     };
+    // Temporary file-ledger instrumentation (FR_KERNEL_DEBUG, diagnostic
+    // only): one start line per dispatch settlement leg; the paired -end
+    // (KScope) pins a wedged await-mode dispatch.
+    kdebug_maybe_log(|| {
+        let ev = String::from_utf8_lossy(event_bytes);
+        format!(
+            "[kdebug] dispatch-start caller={} ev={ev} mode={mode} chain={:?} thread={:?}",
+            activation.instance_id,
+            chain_held(),
+            std::thread::current().name(),
+        )
+    });
+    let _scope = kscope_if(|| {
+        format!(
+            "dispatch-end caller={} ev={}",
+            activation.instance_id,
+            String::from_utf8_lossy(event_bytes)
+        )
+    });
     match mode {
         MODE_EMIT => {
             // `Context::emit` spawns the dispatch; entering the captured
@@ -1806,6 +2070,9 @@ struct DylibInvoke {
     /// Liveness gate cleared by this activation's teardown arms; see
     /// [`Activation::alive`].
     alive: Arc<AtomicBool>,
+    /// The activation's lane: FFI segments marshal here so runtime worker
+    /// threads never execute plugin code inline (2026-11-12 root fix).
+    lane: lane::Lane,
 }
 
 // SAFETY: the raw handle targets plugin-private state; every access is
@@ -1826,7 +2093,22 @@ impl dougong::Invoke for DylibInvoke {
         let lock = Arc::clone(&self.lock);
         let instance_id = self.instance_id;
         let alive = Arc::clone(&self.alive);
+        let lane = self.lane.clone();
         Box::pin(async move {
+            // Temporary file-ledger instrumentation (FR_KERNEL_DEBUG,
+            // diagnostic only): provider-side entry line covering every
+            // caller path (dylib require, in-process host call, realm
+            // require); the paired -end (KScope) pins a call that never
+            // returns.
+            kdebug_maybe_log(|| {
+                format!(
+                    "[kdebug] call-start target={instance_id} chain={:?} thread={:?}#{:?}",
+                    chain_held(),
+                    std::thread::current().name(),
+                    std::thread::current().id(),
+                )
+            });
+            let _scope = kscope_if(|| format!("call-end target={instance_id}"));
             // Reentrancy check before touching the lock (D-V3-3 b'): firing
             // means this thread is already executing inside this instance, so
             // awaiting its non-reentrant mutex would self-deadlock. On the
@@ -1861,8 +2143,22 @@ impl dougong::Invoke for DylibInvoke {
                 let (code, message) = provider_gone_detail();
                 return Err(Error::transport(code, message));
             }
-            let _entry = EntryGuard::enter(instance_id);
-            exports.call_full(&handle, method, &payload)
+            // FFI on the activation lane (the 2026-11-12 LIFO-slot wedge
+            // root fix): worker polls never block on plugin code; the
+            // caller-held instance lock and chain travel with the segment.
+            let mut lane_held = chain_held();
+            lane_held.push(instance_id);
+            let lane_reply = lane.execute(move || {
+                let _restore = ChainRestore::hold(lane_held);
+                let _entry = EntryGuard::enter(instance_id);
+                exports.call_full(&handle, method, &payload)
+            });
+            lane_reply.await.unwrap_or_else(|_| {
+                Err(Error::transport(
+                    "lane_closed",
+                    "activation lane dropped the call reply",
+                ))
+            })
         })
     }
 }
@@ -1881,6 +2177,10 @@ fn decode_payload(bytes: &[u8]) -> Result<Value> {
 /// reentrancy guard covers each synchronous FFI segment separately, since a
 /// guard must never cross an `.await` (task migration would break the
 /// thread-local push/pop pairing).
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bridge spans lock discipline, lane marshaling, and the deferred CPS continuation; splitting would hide the ordering"
+)]
 fn event_bridge(
     exports: Exports,
     handle: Handle,
@@ -1888,12 +2188,14 @@ fn event_bridge(
     event_id: u32,
     instance_id: u64,
     alive: Arc<std::sync::atomic::AtomicBool>,
+    lane: lane::Lane,
 ) -> DispatchListener {
     Arc::new(move |_ctx, payload, next, mode| {
         let exports = exports.clone();
         let handle = handle.clone();
         let lock = Arc::clone(&lock);
         let alive = Arc::clone(&alive);
+        let lane = lane.clone();
         Box::pin(async move {
             // Teardown-quiescence pre-lock gate (teardown_requirements.md
             // R3): same rationale as the require path — post-flip arrivals
@@ -1905,7 +2207,13 @@ fn event_bridge(
             // The bridge takes the instance lock under the full
             // cross-instance discipline (same as `call`): wait edges while
             // parking, the instance on the lock chain while held.
-            let hold = enter_exclusive(&lock, instance_id).await?;
+            let tid = std::thread::current().id();
+            kdebug_maybe_log(|| {
+                format!("[kdebug] bridge-start ev={event_id} inst={instance_id} #{tid:?}")
+            });
+            // The lock guard stays alive across the marshaled segments and
+            // the continuation: one instance invocation at a time.
+            let _instance_lock = enter_exclusive(&lock, instance_id).await?;
             // Under-lock liveness gate (teardown_requirements.md R4): the
             // 0.5.0 bridge had no gate here, so a listener queued on this
             // lock during teardown would enter the freed vtable after the
@@ -1919,15 +2227,34 @@ fn event_bridge(
                 Error::transport("payload_codec", format!("encode payload: {err}"))
             })?;
             let waterfall = mode == DispatchMode::Waterfall;
-            let (status, reply) = {
+            // FFI on the activation lane (2026-11-12 LIFO-slot wedge root
+            // fix): the bridge's lock hold and chain travel with the
+            // segment; the dispatch task only awaits the reply. The job
+            // gets its own clones of the shared captures.
+            let job_bytes = bytes.clone();
+            let job_handle = handle.clone();
+            let job_exports = exports.clone();
+            let mut lane_held = chain_held();
+            lane_held.push(instance_id);
+            let on_event_reply = lane.execute(move || {
+                let _restore = ChainRestore::hold(lane_held);
                 let _entry = EntryGuard::enter(instance_id);
-                exports.dispatch_event(
-                    &handle,
+                job_exports.dispatch_event(
+                    &job_handle,
                     event_id,
                     abi_mode(mode),
-                    &bytes,
+                    &job_bytes,
                     u32::from(waterfall),
-                )?
+                )
+            });
+            let (status, reply) = match on_event_reply.await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(Error::transport(
+                        "lane_closed",
+                        "activation lane dropped the on_event reply",
+                    ));
+                }
             };
             match status {
                 dougong_abi::STATUS_DEFERRED => {
@@ -1949,26 +2276,50 @@ fn event_bridge(
                     // continuation polls must keep seeing this instance as a
                     // held lock — a guard cannot span the `.await`, so
                     // `ChainPoll` re-establishes the chain per poll.
-                    drop(hold.0);
                     let mut chain = chain_held();
                     chain.push(instance_id);
-                    let continued = ChainPoll {
-                        held: chain,
-                        fut: next.call(value),
-                    }
-                    .await?;
-                    let _chain = ChainGuard::hold(instance_id);
+                    // Temporary file-ledger instrumentation (FR_KERNEL_DEBUG,
+                    // diagnostic only): the continuation span is the one
+                    // await-spanning lock hold; its -start without an -end
+                    // pins a wedged continuation.
+                    kdebug_maybe_log(|| {
+                        format!(
+                            "[kdebug] continuation-start ev={event_id} inst={instance_id} thread={:?}",
+                            std::thread::current().name()
+                        )
+                    });
+                    let continued = {
+                        let _scope = kscope_if(|| format!("continuation-end ev={event_id}"));
+                        ChainPoll {
+                            held: chain,
+                            fut: next.call(value),
+                        }
+                        .await?
+                    };
                     let chain_bytes = serde_json::to_vec(&continued).map_err(|err| {
                         Error::transport("payload_codec", format!("encode payload: {err}"))
                     })?;
-                    let processed = {
+                    let deliver_handle = handle.clone();
+                    let mut lane_held = chain_held();
+                    lane_held.push(instance_id);
+                    let deliver_reply = lane.execute(move || {
+                        let _restore = ChainRestore::hold(lane_held);
                         let _entry = EntryGuard::enter(instance_id);
                         exports.deliver_next(
-                            &handle,
+                            &deliver_handle,
                             event_id,
                             dougong_abi::STATUS_OK,
                             &chain_bytes,
-                        )?
+                        )
+                    });
+                    let processed = match deliver_reply.await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(Error::transport(
+                                "lane_closed",
+                                "activation lane dropped the deliver_next reply",
+                            ));
+                        }
                     };
                     serde_json::from_slice(&processed).map_err(|err| {
                         Error::transport("payload_codec", format!("decode payload: {err}"))
@@ -2079,6 +2430,13 @@ impl Plugin for DynPlugin {
             })?;
             let instance: InstanceLock = Arc::new(AsyncMutex::new(()));
             let instance_id = next_instance_id();
+            // Per-activation lane: every FFI segment marshals here so
+            // runtime workers never execute plugin code inline — the
+            // 2026-11-12 LIFO-slot wedge root fix. A spawn failure fails
+            // the activation; a dropped Lane drops the channel, the loop
+            // ends, and the thread exits, so error paths need no explicit
+            // cleanup.
+            let (lane, lane_ack) = lane::spawn(instance_id)?;
             // Liveness gate shared by every DylibInvoke and both teardown
             // arms of this activation: cleared under the instance lock before
             // the teardown export runs, so a require that resolved an
@@ -2121,6 +2479,8 @@ impl Plugin for DynPlugin {
             let teardown_exports = exports.clone();
             let teardown_lock = Arc::clone(&instance);
             let teardown_alive = Arc::clone(&alive);
+            let teardown_lane = lane.clone();
+            let lane_ack = lane_ack;
             let disposer: dougong::Disposer = Box::new(move || {
                 Box::pin(async move {
                     {
@@ -2137,15 +2497,62 @@ impl Plugin for DynPlugin {
                         let slot = disposer_slot.lock().take();
                         if let Some(handle) = slot {
                             // Teardown acquires exactly one lock and holds
-                            // nothing else while parking, so it can never
-                            // close a wait cycle — plain parking is safe; the
-                            // chain push still exposes this lock to nested
-                            // `require` arms.
+                            // nothing else while parking, no wait edges are
+                            // armed, so it can never close a wait cycle —
+                            // plain parking is safe; the chain push still
+                            // exposes this lock to nested `require` arms.
+                            // Temporary file-ledger instrumentation
+                            // (FR_KERNEL_DEBUG, diagnostic only): wait and
+                            // acquired lines for the one lock acquisition
+                            // that bypasses `enter_exclusive`; a missing
+                            // lock-released (ChainGuard drop) pins a wedged
+                            // teardown.
+                            kdebug_maybe_log(|| {
+                                format!(
+                                    "[kdebug] teardown-lock-wait instance={instance_id} thread={:?}",
+                                    std::thread::current().name(),
+                                )
+                            });
                             let _instance = teardown_lock.lock().await;
-                            let _chain = ChainGuard::hold(instance_id);
-                            let _entry = EntryGuard::enter(instance_id);
-                            teardown_exports.teardown(&handle);
+                            kdebug_maybe_log(|| {
+                                format!(
+                                    "[kdebug] teardown-lock-acquired instance={instance_id} thread={:?}",
+                                    std::thread::current().name(),
+                                )
+                            });
+                            let mut lane_held = chain_held();
+                            lane_held.push(instance_id);
+                            let teardown_reply = teardown_lane.execute(move || {
+                                let _restore = ChainRestore::hold(lane_held);
+                                let _entry = EntryGuard::enter(instance_id);
+                                let _scope =
+                                    kscope_if(|| format!("teardown-export instance={instance_id}"));
+                                teardown_exports.teardown(&handle);
+                            });
+                            // The channel is FIFO: queued segments drain
+                            // ahead of the teardown export inside the lane.
+                            // A dropped reply means the lane thread died —
+                            // recorded, not swallowed (the reclaim below
+                            // proceeds; the export never ran).
+                            if teardown_reply.await.is_err() {
+                                kdebug_maybe_log(|| {
+                                    format!(
+                                        "[kdebug] teardown lane died before the export inst={instance_id}"
+                                    )
+                                });
+                            }
                         }
+                    }
+                    // Close the lane: every kernel-held clone (bridges,
+                    // invoker) dropped with their disposers ahead of this
+                    // effect (LIFO), so the pill ends the loop right after
+                    // the teardown export. The exit acknowledgement keeps
+                    // this disposer asynchronous — no blocking join on a
+                    // runtime worker.
+                    if let Err(err) = lane::close(teardown_lane, lane_ack).await {
+                        kdebug_maybe_log(|| {
+                            format!("[kdebug] lane close fault inst={instance_id}: {err}")
+                        });
                     }
                     // The Eq. 31 cascade has already disposed any realm
                     // children (they registered after this effect); reclaim
@@ -2188,18 +2595,49 @@ impl Plugin for DynPlugin {
             // and must not be held across the `await` in a local.
             let setup = {
                 let _hold = enter_exclusive(&instance, instance_id).await?;
-                let _entry = EntryGuard::enter(instance_id);
-                let host_exports = HostExports {
-                    host_handle: activation.0,
-                    require: host_require,
-                    emit: host_emit,
-                    grant: host_grant,
-                    dispatch: host_dispatch,
-                    realm_spawn: realm::host_realm_spawn,
-                    realm_retire: realm::host_realm_retire,
-                    realm_require: realm::host_realm_require,
-                };
-                exports.setup(&host_exports, &config_bytes)
+                // Setup FFI on the activation lane (2026-11-12 root fix):
+                // the HostExports vtable is built inside the job — raw
+                // pointers are not `Send` and must not cross to the lane in
+                // a struct; the `Send` wrapper carries the pointer. The
+                // lock chain travels so nested `require`s inside `setup`
+                // arm wait edges against the same held set.
+                let mut lane_held = chain_held();
+                lane_held.push(instance_id);
+                // Edition-2021 disjoint capture would take the raw `*mut
+                // c_void` field alone (no Send); the address crosses as
+                // usize and the wrapper-bound pointer is rebuilt on the
+                // lane. The pointer targets the activation allocation,
+                // alive until the disposer's reclaim — the same contract
+                // the vtable already documents.
+                let host_handle_addr = activation.0 as usize;
+                let setup_bytes = config_bytes;
+                let setup_exports = exports.clone();
+                let setup_reply = lane.execute(move || {
+                    let _restore = ChainRestore::hold(lane_held);
+                    let _entry = EntryGuard::enter(instance_id);
+                    // The address resolves to the activation allocation
+                    // the vtable contract already scopes.
+                    let host_exports = HostExports {
+                        host_handle: host_handle_addr as *mut std::ffi::c_void,
+                        require: host_require,
+                        emit: host_emit,
+                        grant: host_grant,
+                        dispatch: host_dispatch,
+                        realm_spawn: realm::host_realm_spawn,
+                        realm_retire: realm::host_realm_retire,
+                        realm_require: realm::host_realm_require,
+                    };
+                    setup_exports.setup(&host_exports, &setup_bytes)
+                });
+                match setup_reply.await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(Error::transport(
+                            "lane_closed",
+                            "activation lane dropped the setup reply",
+                        ));
+                    }
+                }
             };
             let Some(handle) = setup else {
                 // Setup failed: return without filling the slot. The effect
@@ -2212,6 +2650,12 @@ impl Plugin for DynPlugin {
                 ));
             };
             *teardown_slot.lock() = Some(Handle(handle.0));
+            // Temporary file-ledger instrumentation (FR_KERNEL_DEBUG,
+            // diagnostic only): pins the instance-id to provide-names mapping
+            // so the ledger reads self-describing.
+            kdebug_maybe_log(|| {
+                format!("[kdebug] activation instance={instance_id} provides={provide:?}")
+            });
 
             // Liveness-gate flip registered LAST so it drains FIRST: from
             // this point until the teardown disposer runs, late outbound
@@ -2236,6 +2680,7 @@ impl Plugin for DynPlugin {
                     *event_id,
                     instance_id,
                     Arc::clone(&alive),
+                    lane.clone(),
                 );
                 ctx.on_dispatch(event_name, bridge).await?;
             }
@@ -2249,6 +2694,7 @@ impl Plugin for DynPlugin {
                     lock: Arc::clone(&instance),
                     instance_id,
                     alive: Arc::clone(&alive),
+                    lane: lane.clone(),
                 }));
                 ctx.provide(service, invoker).await?;
             }
