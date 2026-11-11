@@ -811,11 +811,12 @@ fn drive<T>(rt: &tokio::runtime::Handle, future: impl Future<Output = T>) -> Res
 /// restore guard.
 ///
 /// A kernel lane is a host-owned plain thread that drives kernel futures
-/// with its own park loop (the host's equivalent of [`drive`]) while the
-/// runtime thread stays free to service the tokio driver. Blocking drives
-/// on such a thread are safe — its parks own the waits — so the marker
-/// exempts the thread from the [`drive`] `runtime_starvation` refusal for
-/// the guard's lifetime. Drop the guard when the lane exits.
+/// with its own park loop (the host's equivalent of the internal `drive`)
+/// while the runtime thread stays free to service the tokio driver.
+/// Blocking drives on such a thread are safe — its parks own the waits —
+/// so the marker exempts the thread from the internal `drive`
+/// `runtime_starvation` refusal for the guard's lifetime. Drop the guard
+/// when the lane exits.
 ///
 /// This is the companion of the fly-rafter kernel-lane carrier (the
 /// 2026-11-11 fail-closed contract): a host thread that is neither a

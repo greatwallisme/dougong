@@ -208,6 +208,9 @@ pub struct Fiber {
         tokio::sync::watch::Receiver<u64>,
     ),
     state_cache: AtomicU8,
+    /// Wakes `wait_active` watchers on every real state transition (the
+    /// bounded boot-convergence carrier; see [`FiberHandle::wait_active`]).
+    state_notify: tokio::sync::Notify,
     /// Trace id (O3): the uid as captured at construction. Unlike `uid` it
     /// is never retracted, so teardown records stay joinable to the fiber's
     /// whole lifecycle chain ("start to fail to teardown").
@@ -263,6 +266,7 @@ impl Fiber {
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Active as u8),
+            state_notify: tokio::sync::Notify::new(),
             trace: 0,
             state_since: Mutex::new(Instant::now()),
             last_state_ms: AtomicU64::new(0),
@@ -307,6 +311,7 @@ impl Fiber {
             task_scope: Mutex::new(Arc::new(CancelScope::new())),
             settle: tokio::sync::watch::channel(0),
             state_cache: AtomicU8::new(FiberState::Pending as u8),
+            state_notify: tokio::sync::Notify::new(),
             trace: uid,
             state_since: Mutex::new(Instant::now()),
             last_state_ms: AtomicU64::new(0),
@@ -501,6 +506,7 @@ impl Fiber {
         let state = self.compute_state();
         let previous = self.state_cache.swap(state as u8, Ordering::AcqRel);
         if previous != state as u8 {
+            self.state_notify.notify_waiters();
             // O3 span: on a real transition, record how long the exited
             // state was held; the next `log_transition` attaches it.
             let since = std::mem::replace(&mut *self.state_since.lock(), Instant::now());
@@ -1631,6 +1637,42 @@ impl FiberHandle {
 
     /// Current lifecycle state (lock-free read).
     #[must_use]
+    /// Waits until the fiber reaches a terminal-for-boot state (`Active`,
+    /// `Failed`, `Disposed`) or the deadline passes, then returns the
+    /// observed state.
+    ///
+    /// The wake rides the fiber's own state transitions: a fiber parked
+    /// `Pending` while its injects commit is woken by the commit's state
+    /// change, so a bounded convergence wait needs no polling. This is the
+    /// boot liveness carrier for concurrent hosts (multi-thread runtime
+    /// fibers commit while others are still spawning; a drive-task join
+    /// alone returns the moment a parked fiber's driver settles).
+    pub async fn wait_active(&self, deadline: tokio::time::Instant) -> FiberState {
+        loop {
+            if let done @ (FiberState::Active | FiberState::Failed | FiberState::Disposed) =
+                self.state()
+            {
+                return done;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return self.state();
+            }
+            let notified = self.0.state_notify.notified();
+            // Register-then-recheck: the transition may land between the
+            // first read and the notify registration.
+            if let done @ (FiberState::Active | FiberState::Failed | FiberState::Disposed) =
+                self.state()
+            {
+                return done;
+            }
+            let _ = tokio::time::timeout(remaining, notified).await;
+        }
+    }
+
+    /// The fiber's current lifecycle state (the mirrored atomic; see
+    /// [`Fiber::state`]).
+    #[must_use]
     pub fn state(&self) -> FiberState {
         self.0.state()
     }
@@ -1762,6 +1804,41 @@ impl EffectGuard {
 mod tests {
     use super::*;
     use crate::plugin::plugin;
+
+    /// The commit-wake contract for the boot liveness carrier: a fiber
+    /// spawned BEFORE its provider exists parks Pending, and
+    /// `wait_active` resolves the moment the provider commits — the
+    /// bounded boot-convergence wait needs no polling and no re-arm
+    /// sweep (the 2026-11-11 multi-thread boot finding).
+    #[tokio::test]
+    async fn wait_active_wakes_when_the_provider_commits() {
+        let ctx = Context::new();
+        // The consumer declares the inject at spawn time; the provider
+        // does not exist yet, so the fiber parks Pending.
+        let consumer = plugin(
+            "late-consumer",
+            vec![crate::plugin::Injection::new("svc-late")],
+            move |_ctx: Context, _config: Value| {
+                Box::pin(async move { Ok(()) }) as BoxFuture<Result<()>>
+            },
+        );
+        let handle = ctx.plugin(consumer, None).expect("spawn");
+        assert_eq!(handle.state(), FiberState::Pending);
+
+        // Commit the service afterwards; the commit must wake the parked
+        // fiber through its state change. The effect guard stays alive for
+        // the rest of the test.
+        let _effect = ctx.provide("svc-late", 42_u32).await.expect("provide");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let state = handle.wait_active(deadline).await;
+        assert_eq!(
+            state,
+            FiberState::Active,
+            "the commit wakes the parked fiber"
+        );
+        handle.dispose().await;
+    }
 
     /// The S4 choke-point guard: a disposed fiber must never converge on an
     /// activatable epoch again, no matter who re-requests one.
