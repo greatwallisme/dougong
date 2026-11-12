@@ -3,7 +3,7 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
-## [0.8.0] - 2026-11-13
+## [0.9.0] - 2026-11-13
 
 ### 修复：每激活内核 lane——FFI 段全部移出 runtime worker poll（LIFO 槽自死锁根修）
 
@@ -26,6 +26,10 @@ marshal 到 lane 执行，调用方异步等回包——worker poll 永不执行
 `ChainGuard` 退役为测试专用。副产品：等待图空链盲区消失——所有持锁
 等待者都带恢复链，跨实例 reentrancy 环从此确定性检出。
 
+## [0.8.0] - 2026-11-12（补记：crates.io 已发，变更随 0.7.4..0.8.0 三提交）
+
+补记此前未入账的 0.8.0（五件已发 crates.io）。变更三节：
+
 ### 修复：drive() 对 current-thread runtime 驱动线程 fail-closed
 
 `drive()` 的手写 `block_on` park 驱动线程会饿死该 runtime 的
@@ -44,6 +48,8 @@ Result 化。
 多线程并发 boot 的有界收敛等待：真迁移唤醒（`state_notify`）+
 注册-复检封竞窗 + 钉测（先 spawn 泊 Pending→后 commit→即时收敛），
 替代轮询/超时 band-aid。
+
+（补记完）
 
 ## [0.7.4] - 2026-11-11
 
