@@ -3,6 +3,48 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.8.0] - 2026-11-13
+
+### 修复：每激活内核 lane——FFI 段全部移出 runtime worker poll（LIFO 槽自死锁根修）
+
+症状（fly-rafter 实战 wedge，gdb+文件账双铁证）：multi-thread 宿主下，
+tokio 的 `schedule_task` 按唤醒发生线程路由任务（`worker.rs` 的
+`with_current` 路径）——释放方是持核 worker 时，被唤醒任务落入其私有
+LIFO 槽（不可偷取，仅属主 run loop 可取）；而 dylib 的 `drive()`（手写
+`block_on`）恰在该 worker 的 task poll 内 park 线程——run loop 冻结在
+poll 之下，已划出的 grant 永不可达，自死锁。跨实例等待图只见单向边，
+无环可检。
+
+根修（新模块 `lane.rs`）：每激活一条内核 lane 线程（plain 线程，
+`enter_kernel_lane` 标记；Job/Close 双消息通道；`catch_unwind` 保
+lane；oneshot 回包；close=pill+ack 异步收尾）。五处 FFI 段（`setup`、
+`call_full`、`dispatch_event`、`deliver_next`、`teardown`）全部
+marshal 到 lane 执行，调用方异步等回包——worker poll 永不执行插件
+代码，LIFO 自锁结构性不可能。伴随锁契约收缩：`InstanceHold` 退化为
+`OwnedMutexGuard`；异步持锁上下文不再持线程本地链（跨 `.await` 任务
+迁移即断裂），held-instance 链改为 lane 侧 `ChainRestore` 显式传递，
+`ChainGuard` 退役为测试专用。副产品：等待图空链盲区消失——所有持锁
+等待者都带恢复链，跨实例 reentrancy 环从此确定性检出。
+
+### 修复：drive() 对 current-thread runtime 驱动线程 fail-closed
+
+`drive()` 的手写 `block_on` park 驱动线程会饿死该 runtime 的
+timer/IO driver 与全部 spawn 任务（fly-rafter 2026-11-11 实战死锁）。
+现以线程本地标记区分"嵌套 drive（合法）"与"驱动线程首次进入（拒绝）"，
+违规调用确定性报 `runtime_starvation`；settle/dispatch/realm 调用点
+Result 化。
+
+### 新增：enter_kernel_lane——宿主内核 lane 线程的核准载体
+
+宿主自有 plain 线程标记为核准阻塞上下文（其 park 自持等待），豁免
+`drive()` 的 `runtime_starvation` 拒绝；守卫 drop 恢复标记。
+
+### 新增：wait_active 状态变迁等待原语
+
+多线程并发 boot 的有界收敛等待：真迁移唤醒（`state_notify`）+
+注册-复检封竞窗 + 钉测（先 spawn 泊 Pending→后 commit→即时收敛），
+替代轮询/超时 band-aid。
+
 ## [0.7.4] - 2026-11-11
 
 ### 修复：dylib 镜像进程级常驻——最后一次 retire 不再 dlclose（R1 兑现）
