@@ -296,6 +296,32 @@ impl Drop for EntryGuard {
 }
 
 std::thread_local! {
+    /// Caller activation of the inbound service call this thread is
+    /// dispatching (`ownership_requirements.md` §3.2). Set only inside the
+    /// `call` export's lane segment; every other kernel entry leaves it unset.
+    static INBOUND_CALLER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// RAII guard: names the inbound caller on creation, restores the previous
+/// value on drop. Opened inside the lane segment that runs the callee's
+/// `call` export; lane threads are one-per-activation and run one foreign
+/// entry at a time, so the value never crosses activations.
+struct InboundCallerGuard(Option<u64>);
+
+impl InboundCallerGuard {
+    fn enter(caller: Option<u64>) -> Self {
+        let previous = INBOUND_CALLER.with(|cell| cell.replace(caller));
+        Self(previous)
+    }
+}
+
+impl Drop for InboundCallerGuard {
+    fn drop(&mut self) {
+        INBOUND_CALLER.with(|cell| cell.set(self.0));
+    }
+}
+
+std::thread_local! {
     /// Instances whose per-instance locks the current execution context holds
     /// right now, outermost first. This is the held side of the cross-instance
     /// reentrancy policy (D-V3-3, 2026-10-25 amendment): a foreign entry pushes
@@ -726,6 +752,94 @@ std::thread_local! {
 #[cfg(test)]
 static GRANT_LOCKS: AtomicU64 = AtomicU64::new(0);
 
+/// One registered teardown delivery (ABI v8, `ownership_requirements.md`
+/// §3.3): the provider activation resolved at registration, the bound
+/// method, and the invoker the kernel calls at disposal. Holding the invoker
+/// keeps the bound target callable without a delivery-time name lookup, so a
+/// replacement provider never receives the record.
+struct WatchEntry {
+    provider: u64,
+    service: String,
+    method: u32,
+    invoker: Arc<Invoker>,
+}
+
+/// Process-wide teardown deliveries keyed by owner activation id. Entries
+/// die with the owner: delivered at teardown, cleared at reclaim.
+static WATCHES: LazyLock<Mutex<HashMap<u64, Vec<WatchEntry>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Fast gate over a provably empty [`WATCHES`] table (the F9 shape): a
+/// watch-free process runs no table lock on the teardown path. Set under the
+/// table lock before an insertion completes, cleared under the same lock
+/// when the table drains.
+static WATCHES_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Live activations: id -> liveness gate (ABI v8 `activation_alive`).
+/// Registered at creation, dropped at reclaim; ids never repeat, so a
+/// missing key is the "never issued or reclaimed" arm.
+static LIVE_ACTIVATIONS: LazyLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Registers one activation in the liveness set (before `setup`).
+fn register_live(id: u64, alive: &Arc<AtomicBool>) {
+    LIVE_ACTIVATIONS.lock().insert(id, Arc::clone(alive));
+}
+
+/// Drops one activation from the liveness set (at reclaim).
+fn unregister_live(id: u64) {
+    LIVE_ACTIVATIONS.lock().remove(&id);
+}
+
+/// Answers whether `id` is live: registered and its gate still open. The
+/// gate flip precedes reclaim, so a tearing-down activation already reads
+/// as not live (the pruning backstop's intended answer).
+fn activation_is_live(id: u64) -> bool {
+    let flag = LIVE_ACTIVATIONS.lock().get(&id).map(Arc::clone);
+    flag.is_some_and(|alive| alive.load(Ordering::Acquire))
+}
+
+/// Takes one owner's watch records for delivery. Applies the empty-table
+/// gate transition under the table lock.
+fn take_watches(owner: u64) -> Vec<WatchEntry> {
+    let mut watches = WATCHES.lock();
+    let entries = watches.remove(&owner).unwrap_or_default();
+    if watches.is_empty() {
+        WATCHES_LIVE.store(false, Ordering::Release);
+    }
+    drop(watches);
+    entries
+}
+
+/// Removes one owner's undelivered watch records (reclaim sweep). A new
+/// activation never inherits them.
+fn clear_watches(activation: &Activation) {
+    let removed = {
+        let mut watches = WATCHES.lock();
+        let removed = watches
+            .remove(&activation.instance_id)
+            .map_or(0, |entries| entries.len());
+        if watches.is_empty() {
+            WATCHES_LIVE.store(false, Ordering::Release);
+        }
+        drop(watches);
+        removed
+    };
+    if removed == 0 {
+        return;
+    }
+    activation.ctx.logger().log_record(
+        &dougong::LogRecord::new(
+            dougong::LogLevel::Info,
+            "dylib",
+            "outbound_watch",
+            format!("cleared {removed} watch record(s)"),
+        )
+        .with_trace(Some(activation.ctx.trace_id()))
+        .with_boundary(Some("dylib")),
+    );
+}
+
 fn kdebug_log(msg: &str) {
     use std::io::Write as _;
     let path = format!("/tmp/kdebug_{}.log", std::process::id());
@@ -926,6 +1040,8 @@ impl ActivationPtr {
         // reference produced by the single `Arc::into_raw` at construction.
         let activation = unsafe { Arc::from_raw(self.0.cast::<Activation>()) };
         clear_grants(&activation);
+        clear_watches(&activation);
+        unregister_live(activation.instance_id);
         realm::unlink_child(&activation);
         drop(activation);
     }
@@ -1284,8 +1400,13 @@ fn settle_require(
         )
     });
     let _scope = kscope_if(|| format!("require-end svc={service} m={method}"));
-    let outcome: Result<Vec<u8>, Error> =
-        drive(&activation.rt, invoker.call(method, payload)).flatten();
+    // ABI v8: the callee's `caller_activation` answers this activation's id
+    // (`ownership_requirements.md` §3.2); the call itself is unchanged.
+    let outcome: Result<Vec<u8>, Error> = drive(
+        &activation.rt,
+        invoker.call_from(Some(activation.instance_id), method, payload),
+    )
+    .flatten();
     let duration = started.elapsed();
     let record = match &outcome {
         Ok(bytes) => dougong::LogRecord::new(
@@ -1526,6 +1647,257 @@ unsafe extern "C" fn host_grant(
             }
         }
     }))
+    .unwrap_or(STATUS_HOST_ERROR)
+}
+
+/// One rejected watch registration (mirrors the grant failure carrier).
+struct WatchFailure {
+    code: &'static str,
+    message: String,
+    status: i32,
+}
+
+/// Registers one teardown delivery bound to the resolved provider
+/// activation (`ownership_requirements.md` §3.3).
+fn watch_impl(
+    activation: &Activation,
+    service: &[u8],
+    method: u32,
+) -> std::result::Result<(), WatchFailure> {
+    let Ok(service) = std::str::from_utf8(service) else {
+        return Err(WatchFailure {
+            code: "invalid_watch_name",
+            message: "watch service names must be valid UTF-8".to_string(),
+            status: STATUS_FAILED,
+        });
+    };
+    if service.is_empty() {
+        return Err(WatchFailure {
+            code: "invalid_watch_name",
+            message: "watch service names must be non-empty".to_string(),
+            status: STATUS_FAILED,
+        });
+    }
+    // Resolution is fail-closed and uses the same realm path as require. It
+    // happens outside the watch lock and never invokes the target.
+    let Some(target) = activation.ctx.get::<Invoker>(service) else {
+        return Err(WatchFailure {
+            code: "inactive_dependency",
+            message: format!("cannot get required service \"{service}\" in inactive context"),
+            status: STATUS_INACTIVE,
+        });
+    };
+    let Some(provider) = target.inner.activation_id() else {
+        return Err(WatchFailure {
+            code: "watch_target_unsupported",
+            message: format!("cannot watch target service \"{service}\" without an activation id"),
+            status: STATUS_FAILED,
+        });
+    };
+    if provider == activation.instance_id {
+        // The owner's own gate is already false when deliveries run, so a
+        // self delivery is a structural no-op; refuse at registration.
+        return Err(WatchFailure {
+            code: "watch_target_self",
+            message: format!("cannot watch service \"{service}\" provided by the same activation"),
+            status: STATUS_FAILED,
+        });
+    }
+    let mut watches = WATCHES.lock();
+    let entries = watches.entry(activation.instance_id).or_default();
+    let duplicate = entries.iter().any(|entry| {
+        entry.provider == provider && entry.service == service && entry.method == method
+    });
+    if !duplicate {
+        entries.push(WatchEntry {
+            provider,
+            service: service.to_string(),
+            method,
+            invoker: target,
+        });
+        // Under the table lock, before the release: a visible entry always
+        // implies a visible `true` gate (F9 shape).
+        WATCHES_LIVE.store(true, Ordering::Release);
+    }
+    drop(watches);
+    // Every successful watch, including an idempotent re-watch, is audited
+    // after unlocking.
+    activation.ctx.logger().log_record(
+        &dougong::LogRecord::new(
+            dougong::LogLevel::Info,
+            "dylib",
+            "outbound_watch",
+            format!("watch {service}#{method} ok"),
+        )
+        .with_service(service)
+        .with_trace(Some(activation.ctx.trace_id()))
+        .with_boundary(Some("dylib")),
+    );
+    Ok(())
+}
+
+/// vtable entry: registers one teardown delivery.
+///
+/// # Safety
+///
+/// Per the [`HostExports`] contract: `host` names a live activation and the
+/// service name is readable for its length.
+unsafe extern "C" fn host_watch(
+    host: *mut std::ffi::c_void,
+    service: *const u8,
+    service_len: usize,
+    method: u32,
+) -> i32 {
+    // SAFETY: the vtable contract keeps `host` valid until teardown returns.
+    let activation = unsafe { &*host.cast::<Activation>() };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: vtable input contract (null pairs with length 0).
+        let service = unsafe { input_slice(service, service_len) };
+        match watch_impl(activation, service, method) {
+            Ok(()) => STATUS_OK,
+            Err(err) => {
+                activation.ctx.logger().log_record(
+                    &dougong::LogRecord::new(
+                        dougong::LogLevel::Error,
+                        "dylib",
+                        "outbound_watch",
+                        format!("watch rejected: {}", err.message),
+                    )
+                    .with_trace(Some(activation.ctx.trace_id()))
+                    .with_boundary(Some("dylib"))
+                    .with_cause(err.code),
+                );
+                err.status
+            }
+        }
+    }))
+    .unwrap_or(STATUS_HOST_ERROR)
+}
+
+/// Delivers one activation's watch records at disposal
+/// (`ownership_requirements.md` §3.3): the liveness gate is already false,
+/// so in-flight inbound calls from the callee fail fast and the delivery
+/// does not queue behind them. Reverse registration order; every failure is
+/// logged and never fails the disposal. Delivery rides the disposer's S3
+/// cleanup budget: an orphaned disposer keeps running detached, and the
+/// callee's `activation_alive` prune covers that residue.
+async fn deliver_watches(activation: &Activation) {
+    let entries = take_watches(activation.instance_id);
+    for entry in entries.into_iter().rev() {
+        let payload = serde_json::json!({ "owner": activation.instance_id })
+            .to_string()
+            .into_bytes();
+        let outcome = entry.invoker.call(entry.method, payload).await;
+        let mut record = match &outcome {
+            Ok(_) => dougong::LogRecord::new(
+                dougong::LogLevel::Info,
+                "dylib",
+                "outbound_watch",
+                format!("watch delivery {}#{} ok", entry.service, entry.method),
+            ),
+            Err(err) => dougong::LogRecord::new(
+                dougong::LogLevel::Error,
+                "dylib",
+                "outbound_watch",
+                format!(
+                    "watch delivery {}#{} failed: {err}",
+                    entry.service, entry.method
+                ),
+            )
+            .with_cause(err.to_string()),
+        };
+        record = record
+            .with_service(entry.service.as_str())
+            .with_trace(Some(activation.ctx.trace_id()))
+            .with_boundary(Some("dylib"));
+        activation.ctx.logger().log_record(&record);
+    }
+}
+
+/// vtable entry: answers this activation's process-unique id.
+///
+/// # Safety
+///
+/// Per the [`HostExports`] contract: `host` names a live activation and the
+/// out buffer is caller-owned for `cap` bytes.
+unsafe extern "C" fn host_self_activation(
+    host: *mut std::ffi::c_void,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    // SAFETY: the vtable contract keeps `host` valid until teardown returns.
+    let activation = unsafe { &*host.cast::<Activation>() };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let bytes = serde_json::json!({ "activation": activation.instance_id }).to_string();
+        // SAFETY: caller-owned buffer contract; the answer is pure, so a
+        // CAPACITY retry is harmless.
+        if unsafe { write_out(bytes.as_bytes(), out_buf, cap, out_len) } {
+            STATUS_OK
+        } else {
+            STATUS_CAPACITY
+        }
+    }))
+    .unwrap_or(STATUS_HOST_ERROR)
+}
+
+/// vtable entry: answers the caller of the inbound call frame this thread is
+/// dispatching.
+///
+/// # Safety
+///
+/// Same buffer contract as [`host_self_activation`].
+unsafe extern "C" fn host_caller_activation(
+    host: *mut std::ffi::c_void,
+    out_buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    // The caller names the requester, not this activation.
+    let _ = host;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        INBOUND_CALLER.with(std::cell::Cell::get).map_or_else(
+            || {
+                write_detail(
+                    out_buf,
+                    cap,
+                    out_len,
+                    "no_caller_activation",
+                    dougong::ErrorClass::Logic.as_str(),
+                    "caller_activation requires an inbound service call frame",
+                    STATUS_FAILED,
+                )
+            },
+            |id| {
+                let bytes = serde_json::json!({ "activation": id }).to_string();
+                // SAFETY: caller-owned buffer contract; the answer is pure.
+                if unsafe { write_out(bytes.as_bytes(), out_buf, cap, out_len) } {
+                    STATUS_OK
+                } else {
+                    STATUS_CAPACITY
+                }
+            },
+        )
+    }))
+    .unwrap_or(STATUS_HOST_ERROR)
+}
+
+/// vtable entry: answers whether one activation id is live.
+///
+/// # Safety
+///
+/// Per the [`HostExports`] contract `host` names a live activation; the
+/// probe itself reads only the liveness set.
+unsafe extern "C" fn host_activation_alive(host: *mut std::ffi::c_void, activation: u64) -> i32 {
+    // The probe answers about any id, not this activation.
+    let _ = host;
+    std::panic::catch_unwind(|| {
+        if activation_is_live(activation) {
+            STATUS_OK
+        } else {
+            STATUS_INACTIVE
+        }
+    })
     .unwrap_or(STATUS_HOST_ERROR)
 }
 
@@ -2088,6 +2460,29 @@ impl dougong::Invoke for DylibInvoke {
     }
 
     fn call(&self, method: u32, payload: Vec<u8>) -> BoxFuture<Result<Vec<u8>>> {
+        self.call_with_caller(None, method, payload)
+    }
+
+    fn call_from(
+        &self,
+        caller: Option<u64>,
+        method: u32,
+        payload: Vec<u8>,
+    ) -> BoxFuture<Result<Vec<u8>>> {
+        self.call_with_caller(caller, method, payload)
+    }
+}
+
+impl DylibInvoke {
+    /// Shared body of `call`/`call_from`: marshals the FFI segment to the
+    /// activation lane and names `caller` to the callee for that segment
+    /// (`caller_activation`, ABI v8).
+    fn call_with_caller(
+        &self,
+        caller: Option<u64>,
+        method: u32,
+        payload: Vec<u8>,
+    ) -> BoxFuture<Result<Vec<u8>>> {
         let exports = self.exports.clone();
         let handle = self.handle.clone();
         let lock = Arc::clone(&self.lock);
@@ -2151,6 +2546,7 @@ impl dougong::Invoke for DylibInvoke {
             let lane_reply = lane.execute(move || {
                 let _restore = ChainRestore::hold(lane_held);
                 let _entry = EntryGuard::enter(instance_id);
+                let _caller = InboundCallerGuard::enter(caller);
                 exports.call_full(&handle, method, &payload)
             });
             lane_reply.await.unwrap_or_else(|_| {
@@ -2464,6 +2860,12 @@ impl Plugin for DynPlugin {
                 .cast_mut()
                 .cast::<std::ffi::c_void>(),
             );
+            // ABI v8: the activation joins the liveness set before `setup`
+            // (a `caller_activation`/`watch` registration from inside setup
+            // must observe a consistent answer). Every failure arm past this
+            // point funnels through `ActivationPtr::reclaim`, which removes
+            // the entry.
+            register_live(instance_id, &alive);
             // The teardown effect is registered BEFORE `setup` runs so that
             // everything registered later — provide disposers, event bridges,
             // and realm children spawned from plugin-owned threads started
@@ -2494,6 +2896,18 @@ impl Plugin for DynPlugin {
                         // the teardown export can never race a thread parked
                         // on this lock (the 0.5.0 lock-order inversion).
                         teardown_alive.store(false, Ordering::Release);
+                        // ABI v8 watch delivery (`ownership_requirements.md`
+                        // §3.3): the gate is already false, so in-flight
+                        // inbound calls from the delivery targets fail fast
+                        // instead of parking behind this disposer. Delivery
+                        // runs before the teardown export and its instance
+                        // lock; failures are logged inside and never fail
+                        // the disposal.
+                        // SAFETY: the disposer runs before the reclaim
+                        // below, while the activation reference is still
+                        // owned by this pointer.
+                        let activation = unsafe { &*disposer_activation.0.cast::<Activation>() };
+                        deliver_watches(activation).await;
                         let slot = disposer_slot.lock().take();
                         if let Some(handle) = slot {
                             // Teardown acquires exactly one lock and holds
@@ -2626,6 +3040,10 @@ impl Plugin for DynPlugin {
                         realm_spawn: realm::host_realm_spawn,
                         realm_retire: realm::host_realm_retire,
                         realm_require: realm::host_realm_require,
+                        self_activation: host_self_activation,
+                        caller_activation: host_caller_activation,
+                        watch: host_watch,
+                        activation_alive: host_activation_alive,
                     };
                     setup_exports.setup(&host_exports, &setup_bytes)
                 });

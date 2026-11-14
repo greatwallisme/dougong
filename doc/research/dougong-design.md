@@ -626,7 +626,40 @@ cordis 的 `ctx.waterfall` 对全部插件可用，dougong 中对应物 `Context
   两激活顺序钉字节序列）、`abi_version_is_stable` 钉 7、全工件/示例
   `setup` 形参编译面。
 
-## 附录 A：语义等价表（in-process vs dylib-v7，D16/D31/D32/D33/D34）
+### D35 dylib 跨激活注册所有权 = ABI v8 `self_activation`/`caller_activation`/`watch`/`activation_alive`
+
+2026-11-14，维护者六裁（需求文档
+`doc/maintenance/ownership_requirements.md`，§2 G1-G9 全采纳）：
+
+- **缘起**：fly-rafter 的 LSP 切片（fr-lsp 注册表服务 + fr-lsp-stdio
+  提供者插件 + fr-tool-lsp 工具插件）需要在 setup 中把 provider 注册进
+  另一插件的服务面，并在贡献激活处置时自动回收（dsh `registerProvider`
+  的 `ctx.effect` 语义：`lsp.spec.ts`「disposes provider registrations
+  when the contributing fiber is disposed」）。边界形态此前没有 effect
+  面：插件自身无法登记 teardown 回调，注册方手写 unregister 与「注册即
+  效果、内核派生反转」的主旨相悖，且挂死 teardown 的残留无解。
+- **裁决（watch + activation_alive 双面）**：`watch(service, method)` 登记
+  「本激活处置时内核向该服务投递 `{"owner": <本激活 id>}`」——目标在登记
+  时按 realm 解析并绑定提供方激活（D31 F1 同型 fail-closed），重复登记
+  幂等；投递时点 = 活性门翻转之后、teardown export 之前，登记逆序
+  （LIFO），内核发起（不经登记方 inject/grant），失败只记日志继续
+  （cleanup 预算内，孤儿化后由 alive 兜底）。`activation_alive(id)` 只读
+  判活（`STATUS_OK`/`STATUS_INACTIVE`），是挂死/孤儿化 teardown 残留的
+  自清兜底。
+- **身份双面**：`self_activation` 恒答本激活 id；`caller_activation` 仅在
+  请求语义 `call` 帧内有值（入站 lane 段置线程本地），setup/teardown/
+  事件桥/插件自有线程确定性拒绝 `no_caller_activation`。
+- **非对称注记**：`ABI_VERSION` 7 → 8，`HostExports` 尾追四字段，既有
+  八字段偏移与全部状态码/详情文案逐字节不变；`Invoke::call_from` 以默认
+  实现扩展内核 trait（in-process/wasm 实现零改动）；grant 表与
+  D31-amended F3 的既有受理不变。
+- **验证锚**：`outbound_tests` E2 族五测（身份三态、跨插件 caller 命名、
+  watch 登记五拒/幂等、投递先于 teardown export 且无 caller、目标消亡
+  fail-soft）+ `outbound_demo` watch 臂（登记 → 目标收 `{owner}` → 登记方
+  处置 → 目标断言收到）；`abi_version_is_stable` 钉 8；四关与四 demo
+  全绿。
+
+## 附录 A：语义等价表（in-process vs dylib-v8，D16/D31/D32/D33/D34/D35）
 
 | 面 | in-process | dylib v4 | 锚 |
 |---|---|---|---|
@@ -642,6 +675,8 @@ cordis 的 `ctx.waterfall` 对全部插件可用，dougong 中对应物 `Context
 | teardown 后在途派发 | 监听方集随其 fiber 回滚自然收缩 | 发射方 teardown 不撤销已入队派发（内核任务独立于发射方寿命完成） | C7 |
 | 监听方卸载时在途调用 | in-process 监听器在 yield 点中止（cancel scope） | 桥调用只跟踪不中止，卸载等其完成（wasm store 禁弃在途 `call_async`；dylib 续链持实例锁，teardown 取锁本就隐式等待） | D17 / S2；C7 发射方语义不变 |
 | require 执行器 | fiber 任务上 await | 调用线程本地 `block_on`（`rt.enter` 供 tokio 上下文） | D-V3-4 |
+| 身份面 | 无对应物（fiber 即激活） | `self_activation` 恒答；`caller_activation` 仅在入站 `call` 帧内（lane 线程本地），其余 `no_caller_activation` | D35 |
+| 注册所有权回收 | `ctx.effect`：贡献 fiber 处置即反转 | `watch`：内核在处置时投递 `{"owner": id}`（门后、export 前、LIFO、失败 fail-soft）；`activation_alive` 惰性兜底 | D35 |
 | 错误形态 | `Error { code, message }`（undeclared_dependency / inactive_dependency） | 状态码 + `{"code","message"}` JSON 详情（同名 code 对齐） | D-V3-5 |
 | 解析作用域 | fiber 激活 realm（D15 候选链） | 激活 realm（vtable 闭包捕获同一 ctx，同源） | B3 / A3 |
 | realm 内激活 | `ctx.isolate_realm(l).plugin(Arc<dyn Plugin>, config)` | `realm_spawn(realm, path)`：来源 = dylib 路径（`load`），无 config；子 fiber 为 spawner fiber 的 effect；同步至稳定（active/pending，failed 自动卸载） | D33；姿态同 dispatch（自有线程） |

@@ -120,6 +120,78 @@ fn plugin_grant(host: &HostExports, target: &[u8], granted: &[u8]) -> i32 {
     }
 }
 
+/// Plugin-side `watch`: the v8 registration primitive has no out buffer.
+fn plugin_watch(host: &HostExports, service: &[u8], method: u32) -> i32 {
+    // SAFETY: the vtable is live and the name is a readable byte string.
+    unsafe { (host.watch)(host.host_handle, service.as_ptr(), service.len(), method) }
+}
+
+/// Plugin-side `self_activation` (growable out-buffer protocol).
+fn plugin_self_activation(host: &HostExports) -> (i32, Vec<u8>) {
+    let mut cap = 4096_usize;
+    loop {
+        let mut buf = vec![0_u8; cap];
+        let mut len = 0_usize;
+        // SAFETY: the vtable is live; buffers are caller-owned.
+        let status = unsafe {
+            (host.self_activation)(host.host_handle, buf.as_mut_ptr(), buf.len(), &raw mut len)
+        };
+        if status == STATUS_CAPACITY {
+            cap = cap.saturating_mul(2);
+            continue;
+        }
+        buf.truncate(len);
+        return (status, buf);
+    }
+}
+
+/// Plugin-side `caller_activation` (growable out-buffer protocol).
+fn plugin_caller_activation(host: &HostExports) -> (i32, Vec<u8>) {
+    let mut cap = 4096_usize;
+    loop {
+        let mut buf = vec![0_u8; cap];
+        let mut len = 0_usize;
+        // SAFETY: the vtable is live; buffers are caller-owned.
+        let status = unsafe {
+            (host.caller_activation)(host.host_handle, buf.as_mut_ptr(), buf.len(), &raw mut len)
+        };
+        if status == STATUS_CAPACITY {
+            cap = cap.saturating_mul(2);
+            continue;
+        }
+        buf.truncate(len);
+        return (status, buf);
+    }
+}
+
+/// Plugin-side `activation_alive` (status-only).
+fn plugin_activation_alive(host: &HostExports, id: u64) -> i32 {
+    // SAFETY: the vtable is live; the probe is read-only.
+    unsafe { (host.activation_alive)(host.host_handle, id) }
+}
+
+/// Test-side invocation of one out-buffer host entry against a bare
+/// activation pointer (growable protocol).
+fn call_out_entry(
+    entry: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, usize, *mut usize) -> i32,
+    raw: *mut std::ffi::c_void,
+) -> (i32, Vec<u8>) {
+    let mut cap = 256_usize;
+    loop {
+        let mut buf = vec![0_u8; cap];
+        let mut len = 0_usize;
+        // SAFETY: the raw activation is test-owned and live; the buffer is
+        // caller-owned.
+        let status = unsafe { entry(raw, buf.as_mut_ptr(), buf.len(), &raw mut len) };
+        if status == STATUS_CAPACITY {
+            cap = cap.saturating_mul(2);
+            continue;
+        }
+        buf.truncate(len);
+        return (status, buf);
+    }
+}
+
 /// Plugin-side growable `require`: retries with a doubled buffer whenever
 /// the host asks for more room (the v2 caller-owned buffer protocol).
 fn plugin_require(
@@ -172,6 +244,10 @@ const CONSUMER_SPAWN_HAMMER: u32 = 8;
 const CONSUMER_GRANT: u32 = 9;
 const CONSUMER_SETUP_GRANT: u32 = 10;
 const CONSUMER_GRANT_HAMMER: u32 = 11;
+/// ABI v8 identity probes: the consumer is the caller in the caller-probe
+/// test; `CONSUMER_SELF` reports its own activation id.
+const CONSUMER_CALLER_PROBE: u32 = 12;
+const CONSUMER_SELF: u32 = 13;
 
 static CONSUMER_ACTIVATIONS: AtomicU64 = AtomicU64::new(0);
 
@@ -372,6 +448,14 @@ unsafe extern "C" fn consumer_call(
             let (status, payload) = consumer_grant_hammer(state.host);
             pack(status, payload, out, cap, out_len)
         }
+        CONSUMER_CALLER_PROBE => {
+            let (status, reply) = plugin_require(&state.host, b"svc-b", TARGET_CALLER_PROBE, b"");
+            pack(status, &reply, out, cap, out_len)
+        }
+        CONSUMER_SELF => {
+            let (status, reply) = plugin_self_activation(&state.host);
+            pack(status, &reply, out, cap, out_len)
+        }
         CONSUMER_SPAWN_HAMMER => {
             // Four plugin-owned threads concurrently requiring the slow
             // target method: the target's per-instance lock must serialize
@@ -474,12 +558,20 @@ static GRANT_CONSUMER_TABLE: PluginExports = PluginExports {
 const TARGET_REQUIRE_GRANTED: u32 = 3;
 const TARGET_REQUIRE_GRANTED_HAMMER: u32 = 4;
 const TARGET_REQUIRE_NAMED: u32 = 5;
+/// ABI v8 probes and the watch-delivery log.
+const TARGET_WATCH_RECORD: u32 = 6;
+const TARGET_WATCH_LOG: u32 = 7;
+const TARGET_CALLER_PROBE: u32 = 8;
+const TARGET_TEARDOWN_MARK: u32 = 9;
 
 struct TargetState {
     host: HostExports,
     in_call: u32,
     max_seen: u32,
     calls: u32,
+    /// Everything the kernel delivered (and the teardown export's own
+    /// marker), in arrival order — the delivery-ordering probe.
+    watch_log: Vec<Vec<u8>>,
 }
 
 unsafe extern "C" fn target_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
@@ -522,6 +614,7 @@ unsafe extern "C" fn target_setup(
         in_call: 0,
         max_seen: 0,
         calls: 0,
+        watch_log: Vec::new(),
     }))
     .cast::<std::ffi::c_void>()
 }
@@ -592,6 +685,37 @@ unsafe extern "C" fn target_call(
             let (status, reply) = plugin_require(&state.host, input, CONSUMER_ECHO, b"probe");
             return pack(status, &reply, out, cap, out_len);
         }
+        TARGET_WATCH_RECORD => {
+            // `{"owner": N}` arrives from the kernel at the owner's
+            // teardown; the delivery frame carries no caller (the kernel
+            // initiates it), which the record pins too.
+            let caller = plugin_caller_activation(&state.host);
+            let entry = format!(
+                "watch:{}:caller={}",
+                String::from_utf8_lossy(input),
+                caller.0
+            )
+            .into_bytes();
+            state.watch_log.push(entry);
+            return pack(STATUS_OK, b"", out, cap, out_len);
+        }
+        TARGET_WATCH_LOG => {
+            let entries: Vec<String> = state
+                .watch_log
+                .iter()
+                .map(|entry| String::from_utf8_lossy(entry).into_owned())
+                .collect();
+            let bytes = serde_json::to_vec(&entries).expect("serialize watch log");
+            return pack(STATUS_OK, &bytes, out, cap, out_len);
+        }
+        TARGET_CALLER_PROBE => {
+            let (status, reply) = plugin_caller_activation(&state.host);
+            return pack(status, &reply, out, cap, out_len);
+        }
+        TARGET_TEARDOWN_MARK => {
+            state.watch_log.push(b"export".to_vec());
+            return pack(STATUS_OK, b"", out, cap, out_len);
+        }
         _ => return STATUS_FAILED,
     };
     // SAFETY: host buffer contract.
@@ -630,6 +754,151 @@ static TARGET_TABLE: PluginExports = PluginExports {
     on_event: consumer_on_event,
     on_next: consumer_on_next,
     teardown: target_teardown,
+};
+
+// ---------------------------------------------------------------------------
+// Watch fixture: provides svc-watcher; registers one teardown delivery into
+// svc-b during setup and probes the identity/liveness entries (ABI v8,
+// ownership_requirements.md)
+// ---------------------------------------------------------------------------
+
+const WATCHER_REPORT: u32 = 0;
+const WATCHER_CALLER: u32 = 1;
+const WATCHER_WATCH: u32 = 2;
+const WATCHER_ALIVE: u32 = 3;
+
+struct WatcherState {
+    host: HostExports,
+    self_status: i32,
+    self_bytes: Vec<u8>,
+    setup_watch: i32,
+    setup_caller: i32,
+}
+
+unsafe extern "C" fn watcher_name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe { write_out(b"fake-watcher", out, cap, len) } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn watcher_descriptor(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
+    // SAFETY: host buffer contract.
+    if unsafe {
+        write_out(
+            br#"{"name":"fake-watcher","provide":["svc-watcher"],"inject":["svc-b"]}"#,
+            out,
+            cap,
+            len,
+        )
+    } {
+        STATUS_OK
+    } else {
+        STATUS_CAPACITY
+    }
+}
+
+unsafe extern "C" fn watcher_setup(
+    host: *const HostExports,
+    _config: *const u8,
+    _config_len: usize,
+) -> *mut std::ffi::c_void {
+    if host.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: valid for the duration of `setup`; copied by value.
+    let host = unsafe { *host };
+    let (self_status, self_bytes) = plugin_self_activation(&host);
+    // The registration this slice exists for: the target must already be
+    // committed (start order); `svc-watcher` self-watches are refused.
+    let setup_watch = plugin_watch(&host, b"svc-b", TARGET_WATCH_RECORD);
+    // `setup` is not an inbound call frame: no caller.
+    let setup_caller = plugin_caller_activation(&host).0;
+    Box::into_raw(Box::new(WatcherState {
+        host,
+        self_status,
+        self_bytes,
+        setup_watch,
+        setup_caller,
+    }))
+    .cast::<std::ffi::c_void>()
+}
+
+unsafe extern "C" fn watcher_call(
+    handle: *mut std::ffi::c_void,
+    method: u32,
+    data: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if handle.is_null() {
+        return STATUS_FAILED;
+    }
+    // SAFETY: live handle; serialized by the host per-instance lock.
+    let state = unsafe { &mut *handle.cast::<WatcherState>() };
+    // SAFETY: vtable input contract.
+    let input = unsafe { super::input_slice(data, len) };
+    match method {
+        WATCHER_REPORT => {
+            let report = serde_json::json!({
+                "self_status": state.self_status,
+                "self": serde_json::from_slice::<Value>(&state.self_bytes)
+                    .unwrap_or(Value::Null),
+                "setup_watch": state.setup_watch,
+                "setup_caller": state.setup_caller,
+            });
+            pack(STATUS_OK, report.to_string().as_bytes(), out, cap, out_len)
+        }
+        WATCHER_CALLER => {
+            let (status, reply) = plugin_caller_activation(&state.host);
+            pack(status, &reply, out, cap, out_len)
+        }
+        WATCHER_WATCH => {
+            let status = plugin_watch(&state.host, input, TARGET_WATCH_RECORD);
+            pack(status, b"", out, cap, out_len)
+        }
+        WATCHER_ALIVE => {
+            let Ok(bytes) = <[u8; 8]>::try_from(input) else {
+                return STATUS_FAILED;
+            };
+            let id = u64::from_le_bytes(bytes);
+            pack(
+                plugin_activation_alive(&state.host, id),
+                b"",
+                out,
+                cap,
+                out_len,
+            )
+        }
+        _ => STATUS_FAILED,
+    }
+}
+
+unsafe extern "C" fn watcher_teardown(handle: *mut std::ffi::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: handle from `watcher_setup`, torn down once.
+    let state = unsafe { Box::from_raw(handle.cast::<WatcherState>()) };
+    // Ordering probe: the kernel's watch delivery must have reached the
+    // target before this export runs, so the target's log reads
+    // [watch…, export].
+    let _ = plugin_require(&state.host, b"svc-b", TARGET_TEARDOWN_MARK, b"");
+}
+
+static WATCHER_TABLE: PluginExports = PluginExports {
+    abi_version: dougong_abi::ABI_VERSION,
+    name: watcher_name,
+    descriptor: watcher_descriptor,
+    setup: watcher_setup,
+    call: watcher_call,
+    on_event: consumer_on_event,
+    on_next: consumer_on_next,
+    teardown: watcher_teardown,
 };
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1369,10 @@ async fn require_enforces_capability_and_liveness() {
         realm_spawn: super::realm::host_realm_spawn,
         realm_retire: super::realm::host_realm_retire,
         realm_require: super::realm::host_realm_require,
+        self_activation: super::host_self_activation,
+        caller_activation: super::host_caller_activation,
+        watch: super::host_watch,
+        activation_alive: super::host_activation_alive,
     });
     let outcome = std::thread::spawn(move || shared.require(b"svc-host", 0, b"t"))
         .join()
@@ -2990,5 +3263,188 @@ async fn require_capacity_retry_keeps_the_failure_detail() {
     );
     // SAFETY: unique reclaim; no further vtable calls.
     drop(unsafe { Arc::from_raw(raw.cast::<super::Activation>()) });
+    ctx.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// E2 (ABI v8): registration ownership — identity, watch delivery, liveness
+// ---------------------------------------------------------------------------
+
+/// The watch topology: the dylib target boots first (the watcher's setup
+/// registration resolves a committed provider), then the watcher.
+struct WatchWorld {
+    target: FiberHandle,
+    watcher: FiberHandle,
+    _plugins: Vec<Arc<dyn Plugin>>,
+}
+
+async fn boot_watch_world(ctx: &Context) -> WatchWorld {
+    let target_plugin: Arc<dyn Plugin> =
+        Arc::new(from_static(&TARGET_TABLE).expect("target table"));
+    let target = start(ctx, Arc::clone(&target_plugin)).await;
+    let watcher_plugin: Arc<dyn Plugin> =
+        Arc::new(from_static(&WATCHER_TABLE).expect("watcher table"));
+    let watcher = start(ctx, Arc::clone(&watcher_plugin)).await;
+    WatchWorld {
+        target,
+        watcher,
+        _plugins: vec![target_plugin, watcher_plugin],
+    }
+}
+
+/// Reads the watcher's `WATCHER_REPORT` document.
+async fn watcher_report(ctx: &Context) -> Value {
+    let (status, bytes) = call_framed(ctx, "svc-watcher", WATCHER_REPORT, b"").await;
+    assert_eq!(status, STATUS_OK);
+    serde_json::from_slice(&bytes).expect("watcher report json")
+}
+
+/// `self_activation` names this activation on every path; `caller_activation`
+/// refuses outside an inbound call frame; `activation_alive` follows the
+/// live set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_entries_answer_their_provenance() {
+    let ctx = Context::new();
+    let raw = bare_activation(&ctx, &[]);
+    // SAFETY: test-owned activation, live for the whole test; the entries
+    // read only activation state.
+    let activation = unsafe { &*raw.cast::<super::Activation>() };
+    let id = activation.instance_id;
+    let (status, bytes) = call_out_entry(super::host_self_activation, raw);
+    assert_eq!(status, STATUS_OK);
+    let doc: Value = serde_json::from_slice(&bytes).expect("self json");
+    assert_eq!(doc["activation"], serde_json::json!(id));
+    // No inbound call frame on this thread: the caller entry refuses with
+    // the stable detail code.
+    let (status, bytes) = call_out_entry(super::host_caller_activation, raw);
+    assert_eq!(status, STATUS_FAILED);
+    let doc: Value = serde_json::from_slice(&bytes).expect("caller detail");
+    assert_eq!(doc["code"], serde_json::json!("no_caller_activation"));
+    // Liveness follows the live set (bare activations opt in explicitly).
+    // SAFETY: the raw activation is live for the whole test.
+    let alive = |id| unsafe { super::host_activation_alive(raw, id) };
+    assert_eq!(alive(id), STATUS_INACTIVE);
+    super::register_live(id, &activation.alive);
+    assert_eq!(alive(id), STATUS_OK);
+    super::unregister_live(id);
+    assert_eq!(alive(id), STATUS_INACTIVE);
+    // SAFETY: unique reclaim; no vtable calls afterwards.
+    drop(unsafe { Arc::from_raw(raw.cast::<super::Activation>()) });
+    ctx.stop().await;
+}
+
+/// A dylib caller's id reaches the callee's `caller_activation`; a host-side
+/// call names no caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn caller_activation_names_the_inbound_caller() {
+    let ctx = Context::new();
+    let world = boot_world(&ctx).await;
+    // The consumer's own kernel id (outside any inbound frame; self always
+    // answers).
+    let (status, bytes) = call_framed(&ctx, "svc-a", CONSUMER_SELF, b"").await;
+    assert_eq!(status, STATUS_OK);
+    let self_doc: Value = serde_json::from_slice(&bytes).expect("self json");
+    let self_id = self_doc["activation"].as_u64().expect("activation id");
+    // The target answers `caller_activation`; the consumer is the caller.
+    let (status, bytes) = call_framed(&ctx, "svc-a", CONSUMER_CALLER_PROBE, b"").await;
+    assert_eq!(status, STATUS_OK);
+    let (inner_status, inner) = unpack(&bytes);
+    assert_eq!(inner_status, STATUS_OK);
+    let doc: Value = serde_json::from_slice(inner).expect("caller json");
+    assert_eq!(doc["activation"], serde_json::json!(self_id));
+    world.consumer.dispose().await;
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+/// watch refusals (empty name, uncommitted target, self target), the
+/// setup-frame caller refusal, idempotent re-registration, and the single
+/// surviving record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_registration_refusals_and_idempotence() {
+    let ctx = Context::new();
+    let world = boot_watch_world(&ctx).await;
+    let report = watcher_report(&ctx).await;
+    assert_eq!(report["self_status"], serde_json::json!(STATUS_OK));
+    assert_eq!(report["setup_watch"], serde_json::json!(STATUS_OK));
+    // `setup` is not an inbound call frame.
+    assert_eq!(report["setup_caller"], serde_json::json!(STATUS_FAILED));
+    let (status, _) = call_framed(&ctx, "svc-watcher", WATCHER_WATCH, b"").await;
+    assert_eq!(status, STATUS_FAILED, "empty service name refused");
+    let (status, _) = call_framed(&ctx, "svc-watcher", WATCHER_WATCH, b"svc-none").await;
+    assert_eq!(status, STATUS_INACTIVE, "uncommitted target refused");
+    let (status, _) = call_framed(&ctx, "svc-watcher", WATCHER_WATCH, b"svc-watcher").await;
+    assert_eq!(status, STATUS_FAILED, "self target refused");
+    let (status, _) = call_framed(&ctx, "svc-watcher", WATCHER_WATCH, b"svc-b").await;
+    assert_eq!(
+        status, STATUS_OK,
+        "same-record re-registration is idempotent"
+    );
+    world.watcher.dispose().await;
+    let (status, bytes) = call_framed(&ctx, "svc-b", TARGET_WATCH_LOG, b"").await;
+    assert_eq!(status, STATUS_OK);
+    let entries: Vec<String> = serde_json::from_slice(&bytes).expect("watch log");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.starts_with("watch:"))
+            .count(),
+        1,
+        "the duplicate registration must not deliver twice: {entries:?}"
+    );
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+/// The kernel delivers `{"owner": <id>}` before the teardown export runs,
+/// and the delivery frame carries no caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_delivers_the_owner_before_the_teardown_export() {
+    let ctx = Context::new();
+    let world = boot_watch_world(&ctx).await;
+    let report = watcher_report(&ctx).await;
+    let self_id = report["self"]["activation"]
+        .as_u64()
+        .expect("activation id");
+    // Liveness entry: self is live, an unissued id is not.
+    let (status, _) = call_framed(&ctx, "svc-watcher", WATCHER_ALIVE, &self_id.to_le_bytes()).await;
+    assert_eq!(status, STATUS_OK);
+    let (status, _) = call_framed(
+        &ctx,
+        "svc-watcher",
+        WATCHER_ALIVE,
+        &999_999_u64.to_le_bytes(),
+    )
+    .await;
+    assert_eq!(status, STATUS_INACTIVE);
+    world.watcher.dispose().await;
+    let (status, bytes) = call_framed(&ctx, "svc-b", TARGET_WATCH_LOG, b"").await;
+    assert_eq!(status, STATUS_OK);
+    let entries: Vec<String> = serde_json::from_slice(&bytes).expect("watch log");
+    assert_eq!(
+        entries,
+        vec![
+            format!("watch:{{\"owner\":{self_id}}}:caller={STATUS_FAILED}"),
+            "export".to_string(),
+        ],
+        "the kernel delivers the owner record before the teardown export runs"
+    );
+    world.target.dispose().await;
+    ctx.stop().await;
+}
+
+/// A failed delivery (the target is already gone) never fails the owner's
+/// disposal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_delivery_failure_never_fails_disposal() {
+    let ctx = Context::new();
+    let world = boot_watch_world(&ctx).await;
+    world.target.dispose().await;
+    // The delivery target is gone; the disposer logs and completes.
+    let outcome = tokio::time::timeout(Duration::from_secs(10), world.watcher.dispose()).await;
+    assert!(
+        outcome.is_ok(),
+        "disposal completes despite the failed delivery"
+    );
     ctx.stop().await;
 }

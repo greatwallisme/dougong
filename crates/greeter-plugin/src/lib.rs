@@ -58,6 +58,13 @@ pub const GREETER_GRANT: u32 = 3;
 /// ruling (empty while the worker has not completed).
 pub const GREETER_WORKER_DISPATCH: u32 = 4;
 
+/// Method selector: records one kernel teardown delivery (`{"owner": N}`)
+/// in arrival order (ABI v8 watch arm of the outbound demo).
+pub const GREETER_WATCH_RECORD: u32 = 5;
+
+/// Method selector: returns the recorded teardown deliveries, one per line.
+pub const GREETER_WATCH_LOG: u32 = 6;
+
 /// Event id: `ping` — echo a pong.
 pub const GREETER_EV_PING: u32 = 1;
 
@@ -229,6 +236,10 @@ struct State {
     worker_reply: Arc<Mutex<Option<Vec<u8>>>>,
     /// The worker's parked `dispatch` ruling: `status || chain value`.
     worker_dispatch: DispatchRuling,
+    /// Kernel teardown deliveries recorded by [`GREETER_WATCH_RECORD`], in
+    /// arrival order. The host serializes every foreign entry per instance,
+    /// so a plain vector is safe here (the worker never touches it).
+    watch_log: Vec<String>,
 }
 
 unsafe extern "C" fn name(out: *mut u8, cap: usize, len: *mut usize) -> i32 {
@@ -285,6 +296,7 @@ unsafe extern "C" fn setup(
         worker: Some(worker),
         worker_reply,
         worker_dispatch,
+        watch_log: Vec::new(),
     }))
     .cast::<std::ffi::c_void>()
 }
@@ -369,6 +381,26 @@ unsafe extern "C" fn call(
                 )
             };
             pack_out(status, b"", out, cap, out_len)
+        }
+        GREETER_WATCH_RECORD => {
+            state
+                .watch_log
+                .push(String::from_utf8_lossy(input).into_owned());
+            // SAFETY: host buffer contract.
+            if unsafe { write_out(b"", out, cap, out_len) } {
+                dougong_abi::STATUS_OK
+            } else {
+                dougong_abi::STATUS_CAPACITY
+            }
+        }
+        GREETER_WATCH_LOG => {
+            let joined = state.watch_log.join("\n");
+            // SAFETY: host buffer contract.
+            if unsafe { write_out(joined.as_bytes(), out, cap, out_len) } {
+                dougong_abi::STATUS_OK
+            } else {
+                dougong_abi::STATUS_CAPACITY
+            }
         }
         _ => dougong_abi::STATUS_FAILED,
     }

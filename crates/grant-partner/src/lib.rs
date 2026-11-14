@@ -14,6 +14,18 @@ use dougong_abi::{ABI_VERSION, HostExports, PluginExports, STATUS_CAPACITY, STAT
 /// the call payload and returns the framed outbound result.
 pub const PARTNER_CALLBACK: u32 = 0;
 
+/// Method selector: registers a kernel-driven teardown delivery.
+///
+/// Input is the watched service name; output frames `watch status ||
+/// self_activation document` so the caller can match the owner the kernel
+/// will deliver (ABI v8 watch arm).
+pub const PARTNER_WATCH: u32 = 1;
+
+/// The method the greeter's `greeting` service records deliveries with
+/// (greeter-plugin `GREETER_WATCH_RECORD`; the demo's artifact pair
+/// contract).
+const GREETER_WATCH_RECORD: u32 = 5;
+
 /// The granted service this plugin requires through the dynamic channel, and
 /// the method the greeter's `greeting` service answers with its hello bytes.
 const GREETING_SERVICE: &[u8] = b"greeting";
@@ -76,17 +88,58 @@ unsafe extern "C" fn partner_call(
     }
     // SAFETY: live handle; the host serializes foreign entries per instance.
     let state = unsafe { &mut *handle.cast::<PartnerState>() };
-    if method != PARTNER_CALLBACK {
-        return dougong_abi::STATUS_FAILED;
-    }
     let payload = if data.is_null() {
         &[]
     } else {
         // SAFETY: the vtable contract makes data readable for len bytes here.
         unsafe { std::slice::from_raw_parts(data, len) }
     };
+    if method == PARTNER_WATCH {
+        let (status, reply) = partner_watch(state, payload);
+        return pack_framed(status, &reply, out, cap, out_len);
+    }
+    if method != PARTNER_CALLBACK {
+        return dougong_abi::STATUS_FAILED;
+    }
     let (status, reply) = require_greeting(&state.host, payload);
     pack_framed(status, &reply, out, cap, out_len)
+}
+
+/// ABI v8 watch arm: registers the teardown delivery and frames
+/// `watch status || self_activation document`.
+fn partner_watch(state: &PartnerState, service: &[u8]) -> (i32, Vec<u8>) {
+    let mut cap = 256usize;
+    let self_bytes = loop {
+        let mut buf = vec![0u8; cap];
+        let mut written = 0usize;
+        // SAFETY: the vtable is live until this activation's teardown
+        // returns; the buffer is caller-owned.
+        let status = unsafe {
+            (state.host.self_activation)(
+                state.host.host_handle,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut written,
+            )
+        };
+        if status == dougong_abi::STATUS_CAPACITY {
+            cap = cap.saturating_mul(2);
+            continue;
+        }
+        buf.truncate(written);
+        break buf;
+    };
+    // SAFETY: the vtable is live and the service name is readable for its
+    // length.
+    let status = unsafe {
+        (state.host.watch)(
+            state.host.host_handle,
+            service.as_ptr(),
+            service.len(),
+            GREETER_WATCH_RECORD,
+        )
+    };
+    (status, self_bytes)
 }
 
 /// The descriptor listens to no events, so these entries are never invoked;

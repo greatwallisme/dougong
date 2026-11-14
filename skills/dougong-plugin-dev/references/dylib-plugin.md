@@ -44,9 +44,11 @@ pub static DOUGONG_PLUGIN_EXPORTS: PluginExports = PluginExports {
 };
 ```
 
-`ABI_VERSION` is 6 (v2 = CPS event protocol, D14; v3 = outbound
+`ABI_VERSION` is 8 (v2 = CPS event protocol, D14; v3 = outbound
 `HostExports` vtable, D16; v4 = activation-scoped grants, D31; v5 = outbound
-synchronous `dispatch`, D32; v6 = outbound realm activation, D33). Any change to
+synchronous `dispatch`, D32; v6 = outbound realm activation, D33; v7 =
+activation config bytes on `setup`, D34; v8 = registration ownership and
+identity, D35). Any change to
 `PluginExports`, `HostExports`, or the constants breaks the ABI: bump it and
 update every duplicate table in the same commit.
 
@@ -152,7 +154,7 @@ MODE_WATERFALL(4)` - chosen at dispatch by the host, never at registration.
   host guarantees no other foreign call interleaves between your deferred
   `on_event` and its `on_next`.
 
-## Outbound calls, grants, dispatch, and realms (ABI v3-v6, D16/D31/D32/D33)
+## Outbound calls, grants, dispatch, realms, and ownership (ABI v3-v8, D16/D31/D32/D33/D35)
 
 `setup` receives a `HostExports` vtable, valid only for that call - copy it
 by value. The copy stays callable until **this activation's** `teardown`
@@ -183,6 +185,16 @@ pub struct HostExports {
     pub realm_require: unsafe extern "C" fn(
         host, realm, service, service_len, method, in_data, in_len, out_buf, cap, out_len,
     ) -> i32,                     // require addressed to a realm, children only
+    pub self_activation: unsafe extern "C" fn(
+        host, out_buf, cap, out_len,
+    ) -> i32,                     // {"activation": N} of this activation
+    pub caller_activation: unsafe extern "C" fn(
+        host, out_buf, cap, out_len,
+    ) -> i32,                     // caller of the inbound call frame, else no_caller_activation
+    pub watch: unsafe extern "C" fn(
+        host, service, service_len, method,
+    ) -> i32,                     // teardown delivery registration (no out buffer)
+    pub activation_alive: unsafe extern "C" fn(host, activation) -> i32,  // liveness probe
 }
 ```
 
@@ -246,6 +258,29 @@ pub struct HostExports {
   fails with `STATUS_REENTRANCY` on the thread completing the cycle.
 - `setup`-time `require` against already-committed providers is legal and is
   the canonical way to probe the environment at activation.
+
+- **`self_activation` / `caller_activation`** (ABI v8) name this activation
+  and the caller of the inbound `call` frame being dispatched
+  (`{"activation": N}`). The caller value is only present inside a
+  request-semantics `call` frame; `setup`, teardown, event bridges, and
+  plugin-owned threads answer `STATUS_FAILED` with the
+  `no_caller_activation` detail.
+- **`watch(service, method)`** (ABI v8) registers "when this activation is
+  disposed, the kernel calls `method` on `service` with
+  `{"owner": <this id>}`". It is a pure registration primitive like
+  `grant`: the target resolves in this activation's realm at registration
+  and is bound to the provider activation it resolved to, repeats of the
+  same (provider, service, method) are idempotent, self targets and
+  non-dylib targets are refused (`watch_target_self`,
+  `watch_target_unsupported`), and no output buffer is written. Delivery
+  runs at teardown after the liveness gate flips and before the teardown
+  export, in reverse registration order, kernel-initiated (your `inject`
+  and grant tables are not consulted); a failed delivery is logged and
+  never fails the disposal. Records die with the activation.
+- **`activation_alive(id)`** (ABI v8) is the read-only liveness probe:
+  `STATUS_OK` while the id is live, `STATUS_INACTIVE` for a never-issued or
+  reclaimed id. Services that key registrations by owner id use it to prune
+  residue whose owner's teardown was orphaned by the cleanup budget.
 
 See `crates/greeter-plugin` for the reference shape (worker thread spawned in
 `setup`, joined in `teardown`) and `examples/outbound_demo.rs` for the

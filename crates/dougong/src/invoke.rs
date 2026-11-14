@@ -41,6 +41,22 @@ pub trait Invoke: Send + Sync {
     /// non-blocking enough for the host's driver: long work belongs on the
     /// plugin side of the boundary.
     fn call(&self, method: u32, payload: Vec<u8>) -> BoxFuture<Result<Vec<u8>>>;
+
+    /// Invokes one method naming the caller activation of the call.
+    ///
+    /// Boundary adapters override this so the provider's `caller_activation`
+    /// entry can answer the caller (ABI v8, `ownership_requirements.md`).
+    /// The default forwards to [`Invoke::call`]: in-process and wasm
+    /// implementations carry no activation identity, so naming a caller
+    /// through them is structurally meaningless.
+    fn call_from(
+        &self,
+        _caller: Option<u64>,
+        method: u32,
+        payload: Vec<u8>,
+    ) -> BoxFuture<Result<Vec<u8>>> {
+        self.call(method, payload)
+    }
 }
 
 /// Sized handle stored in the service store for dynamic services.
@@ -68,6 +84,20 @@ impl Invoker {
     /// Propagates the implementation's failure.
     pub fn call(&self, method: u32, payload: Vec<u8>) -> BoxFuture<Result<Vec<u8>>> {
         self.inner.call(method, payload)
+    }
+
+    /// Forwards one method invocation naming the caller activation.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the implementation's failure.
+    pub fn call_from(
+        &self,
+        caller: Option<u64>,
+        method: u32,
+        payload: Vec<u8>,
+    ) -> BoxFuture<Result<Vec<u8>>> {
+        self.inner.call_from(caller, method, payload)
     }
 }
 

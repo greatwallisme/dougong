@@ -273,7 +273,14 @@ pub const STATUS_INVALID_EVENT: i32 = -8;
 /// through their `apply` payload. Earlier revisions dropped the config at
 /// the dylib boundary, forcing per-plugin config baking (design decision
 /// D34; `config_requirements.md` §2).
-pub const ABI_VERSION: u32 = 7;
+///
+/// v8 (2026-11-14): cross-activation registration ownership —
+/// [`HostExports`] gains `self_activation` / `caller_activation` / `watch` /
+/// `activation_alive`: a plugin can name itself and its inbound callers, and
+/// register a kernel-driven teardown delivery so registrations it made into
+/// another plugin's service are reclaimed with its activation
+/// (`ownership_requirements.md`; the boundary form's effect face).
+pub const ABI_VERSION: u32 = 8;
 
 /// Minimum `out_buf` capacity `realm_spawn` accepts.
 ///
@@ -325,7 +332,7 @@ pub unsafe fn write_out(src: &[u8], out_buf: *mut u8, cap: usize, out_len: *mut 
     true
 }
 
-/// Host-provided outbound vtable handed to `setup` (ABI v6).
+/// Host-provided outbound vtable handed to `setup` (ABI v8).
 ///
 /// The pointer passed to `setup` is valid for the duration of that call
 /// only; the plugin copies this struct by value. `host_handle` is an opaque
@@ -372,11 +379,22 @@ pub unsafe fn write_out(src: &[u8], out_buf: *mut u8, cap: usize, out_len: *mut 
 ///   service in the named realm and authorizes the call only when the
 ///   provider is a child this activation spawned (no `inject` declaration is
 ///   needed or consulted).
+/// - `self_activation` answers this activation's process-unique id and
+///   `caller_activation` the caller activation of the inbound `call` frame
+///   being dispatched (ABI v8); the latter fails with `no_caller_activation`
+///   outside such a frame.
+/// - `watch` registers a kernel-driven teardown delivery to another service
+///   (ABI v8): when this activation is disposed the kernel calls the bound
+///   method with `{"owner": <this id>}`. Delivery survives registration
+///   failures and never fails the disposal; records die with the activation.
+/// - `activation_alive` is the read-only liveness probe (ABI v8): the
+///   backstop a callee uses to prune registrations whose owner's teardown was
+///   orphaned by the cleanup budget.
 ///
 /// All callable entries are implemented by the host with full panic
 /// containment and are safe to call concurrently from arbitrary plugin
-/// threads. `grant` only registers capability: it neither invokes a plugin
-/// nor participates in reentrancy detection.
+/// threads. `grant` and `watch` only register: they neither invoke a plugin
+/// nor participate in reentrancy detection.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HostExports {
@@ -496,6 +514,56 @@ pub struct HostExports {
         cap: usize,
         out_len: *mut usize,
     ) -> i32,
+    /// Answers this activation's process-unique id as `{"activation": N}`.
+    ///
+    /// Valid on every thread of the plugin: `setup`, plugin-owned threads,
+    /// and inside any inbound frame. The id is minted once per activation and
+    /// never reused (`ownership_requirements.md` §3.2).
+    pub self_activation: unsafe extern "C" fn(
+        host: *mut std::os::raw::c_void,
+        out_buf: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32,
+    /// Answers the caller activation's id of the inbound service call this
+    /// thread is dispatching, as `{"activation": N}`.
+    ///
+    /// Only a request-semantics `call` frame carries a caller: the value is
+    /// unset in `setup`, the teardown export, event-bridge frames, and on
+    /// plugin-owned threads, where the entry fails with [`STATUS_FAILED`] and
+    /// the `no_caller_activation` detail document.
+    pub caller_activation: unsafe extern "C" fn(
+        host: *mut std::os::raw::c_void,
+        out_buf: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> i32,
+    /// Registers one teardown delivery: when THIS activation is disposed the
+    /// kernel calls `method` on `service` with `{"owner": <this id>}`.
+    ///
+    /// Pure registration primitive (status-only like `grant`): it initiates
+    /// no call and writes no output buffer. The target resolves in the
+    /// caller's realm at registration and is bound to the provider activation
+    /// it resolved to; delivery is kernel-initiated (the caller's `inject`
+    /// and grant tables are not consulted). Records die with the activation
+    /// even when the delivery fails.
+    pub watch: unsafe extern "C" fn(
+        host: *mut std::os::raw::c_void,
+        service: *const u8,
+        service_len: usize,
+        method: u32,
+    ) -> i32,
+    /// Read-only liveness probe: [`STATUS_OK`] while `activation` is live,
+    /// [`STATUS_INACTIVE`] for an id that was never issued or has been
+    /// reclaimed.
+    ///
+    /// The backstop for callees that keep registration tables keyed by owner
+    /// activation id: an activation whose teardown was orphaned by the
+    /// cleanup budget is already "not live" (its liveness gate flipped),
+    /// so the callee can prune the residue without waiting for the `watch`
+    /// delivery.
+    pub activation_alive:
+        unsafe extern "C" fn(host: *mut std::os::raw::c_void, activation: u64) -> i32,
 }
 
 impl std::fmt::Debug for HostExports {
@@ -659,7 +727,7 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(ABI_VERSION, 7);
+        assert_eq!(ABI_VERSION, 8);
         assert_eq!(STATUS_DEFERRED, 2);
     }
 

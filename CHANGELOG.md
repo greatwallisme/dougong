@@ -3,6 +3,34 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.10.0] - 2026-11-14
+
+### 特性：跨激活注册所有权——ABI v8 `self_activation` / `caller_activation` / `watch` / `activation_alive`
+
+需求文档 `doc/maintenance/ownership_requirements.md`（维护者六裁全采纳；
+设计决定 D35）。dylib 边界此前没有 effect 面，插件无法把「我在别的插件
+服务里登记了状态，我处置时请代我回收」交给内核；fly-rafter 的 LSP 切片
+（provider 注册表 + 提供者插件）需要 dsh `ctx.effect` 的等价语义。
+
+- `HostExports` 尾追四字段（既有八字段偏移不变，`ABI_VERSION` 7 → 8，
+  v7 工件由既有版本门拒载）：
+  - `self_activation`：本激活进程唯一 id（`{"activation": N}`）；
+  - `caller_activation`：入站 `call` 帧内的调用方 id（lane 线程本地），
+    其余场合 `STATUS_FAILED` + `no_caller_activation` 详情；
+  - `watch(service, method)`：登记处置投递（纯登记原语）——目标在登记时
+    按 realm 解析并绑定提供方激活（fail-closed，D31 F1 同型），重复登记
+    幂等；投递在活性门翻转后、teardown export 前按登记逆序进行，负载
+    `{"owner": <id>}`，内核发起（不经 inject/grant），失败只记日志
+    （cleanup 预算内，孤儿化后由 alive 兜底）；
+  - `activation_alive(id)`：只读判活（`STATUS_OK`/`STATUS_INACTIVE`）。
+- 内核 trait 扩展：`Invoke::call_from(caller, method, payload)` 默认转发
+  `call`（in-process/wasm 实现零改动），`DylibInvoke` 覆写并在 lane 段
+  命名调用方。
+- 零回归：全部既有状态码/详情文案、五模式、realm、wasm、loader 语义与
+  `abi_version_is_stable` 以外的既有测试逐字节不变。
+- 验证锚：`outbound_tests` E2 族五测 + `outbound_demo` watch 臂；本地四关
+  （build/clippy -D warnings/test/doc）+ 四 demo 全绿。
+
 ## [0.9.0] - 2026-11-13
 
 ### 修复：每激活内核 lane——FFI 段全部移出 runtime worker poll（LIFO 槽自死锁根修）

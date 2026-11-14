@@ -33,9 +33,13 @@ use dougong_abi::{
 };
 use dougong_dylib::{from_static, load};
 use greeter_plugin::{
-    GREETER_GRANT, GREETER_HELLO, GREETER_REQUIRE, GREETER_WORKER_DISPATCH, GREETER_WORKER_REPLY,
+    GREETER_GRANT, GREETER_HELLO, GREETER_REQUIRE, GREETER_WATCH_LOG, GREETER_WORKER_DISPATCH,
+    GREETER_WORKER_REPLY,
 };
 use serde_json::Value;
+
+/// Method selector of the grant-partner artifact's watch arm (ABI v8).
+const GRANT_PARTNER_WATCH: u32 = 1;
 
 fn plugin_path() -> PathBuf {
     // The cdylib lands next to the other workspace artifacts.
@@ -572,6 +576,40 @@ async fn wait_for(check: impl Fn() -> bool) -> dougong::Result<()> {
     Err(Error::msg("arm did not settle within the poll budget"))
 }
 
+/// Watch arm (ABI v8, `ownership_requirements.md`): the partner registers a
+/// kernel-driven teardown delivery onto greeter's recording method, reports
+/// its own activation id, and the kernel must deliver `{"owner": <id>}` at
+/// its disposal — after the liveness gate flips, before its teardown export.
+async fn watch_arm(
+    ctx: &Context,
+    greeting: &Invoker,
+    partner_fiber: dougong::FiberHandle,
+    log: &(dyn Fn(String) + Sync),
+) -> dougong::Result<()> {
+    let watch_reply = ctx
+        .get::<Invoker>("grant-callback")
+        .ok_or_else(|| Error::msg("grant-callback is not committed"))?
+        .call(GRANT_PARTNER_WATCH, b"greeting".to_vec())
+        .await?;
+    let (status, owner_doc) = unpack_framed(&watch_reply)?;
+    assert_eq!(status, STATUS_OK);
+    let owner: Value = serde_json::from_slice(owner_doc)
+        .map_err(|err| Error::msg(format!("watch arm: self document: {err}")))?;
+    let owner_id = owner["activation"]
+        .as_u64()
+        .ok_or_else(|| Error::msg("watch arm: self_activation id missing"))?;
+    partner_fiber.dispose().await;
+    let watch_log = greeting.call(GREETER_WATCH_LOG, Vec::new()).await?;
+    let records = String::from_utf8_lossy(&watch_log).into_owned();
+    assert_eq!(
+        records,
+        format!("{{\"owner\":{owner_id}}}"),
+        "the kernel must deliver exactly one owner record at the partner's teardown"
+    );
+    log("-- watch arm: registration and teardown delivery verified --".to_string());
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = plugin_path();
     let greeter: Arc<dyn dougong::Plugin> = load(&path)?;
@@ -670,8 +708,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (status, payload) = unpack_framed(&callback_reply)?;
         assert_eq!(status, STATUS_OK);
         assert_eq!(payload, b"hello from a dougong dylib");
-        partner_fiber.dispose().await;
         log("-- grant arm: authorized callback round trip verified --".to_string());
+
+        watch_arm(&ctx, &greeting, partner_fiber, &log).await?;
+        log("-- watch arm: teardown delivery verified --".to_string());
 
         // Reentrancy arm: the `GREETER_REQUIRE` handler runs inside a greeter
         // export, so the oracle's `loop` callback into `greeting` would

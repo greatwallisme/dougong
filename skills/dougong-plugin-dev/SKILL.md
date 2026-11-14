@@ -12,10 +12,12 @@ providers come and go). A plugin never hand-writes teardown - it declares and
 registers, and the kernel derives reversal from registration.
 
 All plugin forms implement **one semantic contract**. Version anchors for the
-current code: ABI_VERSION 6 (`dougong-abi`: v2 CPS event protocol per D14,
+current code: ABI_VERSION 8 (`dougong-abi`: v2 CPS event protocol per D14,
 v3 outbound `HostExports` per D16, the v4 `grant` entry per D31, the v5
-`dispatch` entry per D32, plus the v6 realm entries `realm_spawn` /
-`realm_retire` / `realm_require` per D33), WIT world
+`dispatch` entry per D32, the v6 realm entries `realm_spawn` /
+`realm_retire` / `realm_require` per D33, the v7 `setup` config bytes per
+D34, and the v8 ownership entries `self_activation` / `caller_activation` /
+`watch` / `activation_alive` per D35), WIT world
 `dougong:kernel@0.1.0` (`wit/dougong-plugin.wit`), contract hash
 `dougong-dynamic-channel-v1`, wasmtime 48 / wit-bindgen 0.61, toolchain pinned
 in `rust-toolchain.toml`.
@@ -193,5 +195,12 @@ compile them as empty libraries - see [wasm-plugin.md](references/wasm-plugin.md
   `STATUS_FAILED` (`provider_gone`, transport class): granted callers are
   not kernel dependency edges, so the liveness gate under the per-instance
   lock is the only teardown ordering - never retry into a stale handle.
+- `watch` records die with the activation: delivery is kernel-initiated at
+  teardown (gate flipped, before the export), LIFO, fail-soft, and bounded by
+  the cleanup budget; a callee that keys registrations by owner id should
+  also prune with `activation_alive` for orphaned-teardown residue.
+- `caller_activation` only answers inside an inbound `call` frame: `setup`,
+  teardown, event bridges, and plugin-owned threads get
+  `no_caller_activation`.
 - Teardown code that must run last goes first in `apply` (LIFO reversal).
 - Teardown-time worker joins are safe against plugin-owned threads mid-`require`: the host flips the activation's liveness gate before taking the instance lock, so queued outbound calls unwind with `STATUS_FAILED` (`provider_gone`) instead of parking on the disposer-held lock (0.5.1 teardown quiescence; `doc/maintenance/teardown_requirements.md` in the dougong repo). Keep the join discipline itself: every plugin-owned thread joined before `teardown` returns.
