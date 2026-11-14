@@ -504,6 +504,23 @@ impl Fiber {
     /// the previous mirror value so the caller can log the transition (O1).
     fn cache_state(&self) -> FiberState {
         let state = self.compute_state();
+        let root = &self.ctx().root;
+        let uid = self.uid_value();
+        // Strict-resolution liveness is published BEFORE the completion state
+        // and revoked AFTER the non-active state: `wait_active` wakes on the
+        // mirror flip and the woken boot host performs a strict read
+        // immediately, so "mirror says Active" must imply "every provided
+        // service resolves". With the mark after the wake, a waiter observed
+        // Active while the provider was still invisible to strict resolution
+        // (2026-11-14 fly-rafter 36h: the entry-facts relay missed and healed
+        // in ~200us). The reverse edge keeps the set a conservative superset:
+        // a provider stays resolvable while its withdrawal is announced and
+        // until the provide slots are drained.
+        if state == FiberState::Active
+            && let Some(uid) = uid
+        {
+            root.mark_active(uid);
+        }
         let previous = self.state_cache.swap(state as u8, Ordering::AcqRel);
         if previous != state as u8 {
             self.state_notify.notify_waiters();
@@ -515,13 +532,10 @@ impl Fiber {
                 Ordering::Relaxed,
             );
         }
-        let root = &self.ctx().root;
-        if let Some(uid) = self.uid_value() {
-            if state == FiberState::Active {
-                root.mark_active(uid);
-            } else {
-                root.mark_inactive(uid);
-            }
+        if state != FiberState::Active
+            && let Some(uid) = uid
+        {
+            root.mark_inactive(uid);
         }
         Self::mirror_state(previous)
     }
@@ -1838,6 +1852,45 @@ mod tests {
             "the commit wakes the parked fiber"
         );
         handle.dispose().await;
+    }
+
+    /// The boot-liveness publication order: when `wait_active` reports
+    /// `Active`, every service the provider committed must already resolve
+    /// under strict resolution. The active-set membership is published
+    /// before the completion mirror flip that wakes the waiter; with the
+    /// mark after the wake, a woken boot host observed `Active` while the
+    /// provider was still invisible to strict reads (the 2026-11-14
+    /// fly-rafter 36h relay window, healed in ~200us under load).
+    ///
+    /// Race-targeted stress pin: each round races the waiter's immediate
+    /// strict read against the provider's publication tail on a
+    /// multi-thread runtime; the ordered publication makes the race
+    /// unreachable, so the assertion is structural after the fix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wait_active_implies_strict_resolution() {
+        for round in 0..500 {
+            let ctx = Context::new();
+            let provider = plugin(
+                "wake-provider",
+                vec![],
+                move |ctx: Context, _config: Value| {
+                    Box::pin(async move {
+                        ctx.provide("svc-wake", 7_u32).await?;
+                        Ok(())
+                    }) as BoxFuture<Result<()>>
+                },
+            );
+            let handle = ctx.plugin(provider, None).expect("spawn");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let state = handle.wait_active(deadline).await;
+            assert_eq!(state, FiberState::Active, "round {round}");
+            let resolved = ctx.require::<u32>("svc-wake");
+            assert!(
+                resolved.is_ok(),
+                "round {round}: the wake must imply strict resolution"
+            );
+            handle.dispose().await;
+        }
     }
 
     /// The S4 choke-point guard: a disposed fiber must never converge on an

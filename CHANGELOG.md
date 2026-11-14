@@ -3,6 +3,37 @@
 本仓库的显著变更记录。版本语义：0.x 系列的 minor bump 即可含破坏性变更。
 设计裁决全文见 [doc/research/dougong-design.md](doc/research/dougong-design.md)。
 
+## [0.10.1] - 2026-11-14
+
+### 修复：完成态发布次序——wait_active 唤醒即可见（fly-rafter 36h 负载 flake 根修）
+
+症状（fly-rafter 36h 复现战役证据链）：多进程并发 boot 下，`fr headless`
+偶发 fail-closed 拒启——`entry facts relay failed: undeclared_dependency:
+cannot get property "headless-startup" without inject`。清洁载具（16 并发
+真进程 boot）修前 ~12%/boot；失败 boot 内 `pre-relay entry_state=Some(Active)`
+但同一瞬间的 strict `require` 落空，**168.871µs / 467.976µs 后同一次读即命中**
+——不是服务缺失，是可见性发布次序的瞬时窗。
+
+根因：`Fiber::cache_state` 的发布次序是「mirror 置 Active → wake
+`wait_active` 等待者 → 最后 `mark_active`」。strict 解析
+（`get_impl` 的 provider 活性门）查 active set，而 `wait_active` 只观察
+mirror：被唤醒的宿主在 mark 落地前的窗口里读到「fiber Active、服务不可见」。
+`shard.rs` 的 ActiveSet 注释早已承认「mark_active 晚于 store insert」的
+瞬态陈旧读，并按「post-load notify 后 `check_impl` 重解析」自愈假设接受——
+该自愈只覆盖声明式消费者，不覆盖 `wait_active` + 一次性 strict 读的宿主
+（fr 的 boot facts relay 即标准用法）。
+
+修复：`cache_state` 重排为 Active 时 **`mark_active` 先于 mirror swap +
+notify**，非 Active 时 **`mark_inactive` 后于 swap + notify**。不变量：
+mirror=Active ⇒ 全部已提供服务的 strict 解析命中；撤回方向 active set 保持
+保守超集（provide 槽位清除仍是唯一可见性门）。零 API/ABI 变更，既有状态码
+与文案不变。
+
+验证锚：新钉测 `wait_active_implies_strict_resolution`（multi-thread 500 轮
+「唤醒即 strict 命中」压力契约）；fly-rafter 侧同载具修后 160/160 boot 绿、
+`headless_run::sigint` 载具修前 1/16 败 → 修后 24/24 绿；本地四关 + wasip2
+工件 + 四 demo 全绿。
+
 ## [0.10.0] - 2026-11-14
 
 ### 特性：跨激活注册所有权——ABI v8 `self_activation` / `caller_activation` / `watch` / `activation_alive`
